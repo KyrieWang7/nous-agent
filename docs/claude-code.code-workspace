@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "../../claude-code"
+		},
+		{
+			"path": "../../antflow"
+		},
+		{
+			"path": "../../deer-flow"
+		},
+		{
+			"path": "../../nous-ai"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../hermes-agent"
+		}
+	],
+	"settings": {}
+}

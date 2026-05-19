@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="900" viewBox="0 0 1024 900">
+  <g fill="black" fill-rule="nonzero">
+    <!-- Brain outer contour - left half (cyan arc) -->
+    <path d="
+      M 440 60
+      C 340 60, 240 100, 180 170
+      C 120 240, 90 330, 100 410
+      C 105 460, 120 500, 150 540
+      C 170 568, 195 590, 225 608
+      C 250 622, 280 632, 310 638
+      C 340 644, 370 646, 400 646
+      L 440 646
+      L 440 60 Z
+    " />
+    <!-- Brain outer contour - right half -->
+    <path d="
+      M 560 60
+      C 640 60, 720 90, 780 140
+      C 830 185, 865 245, 885 310
+      C 900 360, 900 410, 890 460
+      C 878 520, 850 570, 810 610
+      C 775 645, 730 665, 680 672
+      C 650 676, 620 678, 590 676
+      L 560 672
+      L 560 60 Z
+    " />
+    <!-- Face profile - right side (jaw/chin) -->
+    <path d="
+      M 810 610
+      C 840 620, 870 640, 895 670
+      C 920 700, 935 740, 940 780
+      C 942 800, 938 820, 928 838
+      C 918 855, 900 865, 880 870
+      C 855 875, 830 872, 810 862
+      C 790 852, 775 835, 765 815
+      C 755 795, 750 770, 748 745
+      C 746 720, 748 695, 752 672
+      L 810 610 Z
+    " />
+
+    <!-- Inner N letterform - left diagonal stroke -->
+    <path d="
+      M 300 240
+      L 340 240
+      L 340 560
+      L 300 560
+      Z
+    " />
+    <!-- N - diagonal -->
+    <path d="
+      M 300 240
+      L 340 240
+      L 660 560
+      L 620 560
+      Z
+    " />
+    <!-- N - right vertical -->
+    <path d="
+      M 620 240
+      L 660 240
+      L 660 560
+      L 620 560
+      Z
+    " />
+
+    <!-- Neural network nodes -->
+    <!-- Top-left node -->
+    <circle cx="250" cy="260" r="32" />
+    <!-- Center-top node -->
+    <circle cx="500" cy="140" r="28" />
+    <!-- Top-right node -->
+    <circle cx="740" cy="220" r="32" />
+    <!-- Center node -->
+    <circle cx="500" cy="440" r="36" />
+    <!-- Bottom-left node -->
+    <circle cx="280" cy="580" r="28" />
+    <!-- Right-mid node -->
+    <circle cx="720" cy="480" r="32" />
+
+    <!-- Neural connection lines -->
+    <!-- Top-left to center-top -->
+    <path d="M 275 243 L 480 152 L 486 168 L 280 258 Z" />
+    <!-- Center-top to top-right -->
+    <path d="M 520 148 L 718 207 L 714 225 L 516 164 Z" />
+    <!-- Top-left to center -->
+    <path d="M 270 278 L 478 424 L 468 440 L 258 294 Z" />
+    <!-- Center to top-right -->
+    <path d="M 524 426 L 720 235 L 732 248 L 534 438 Z" />
+    <!-- Center to right-mid -->
+    <path d="M 530 452 L 698 472 L 696 490 L 528 468 Z" />
+    <!-- Center to bottom-left -->
+    <path d="M 478 458 L 298 566 L 290 552 L 472 444 Z" />
+    <!-- Top-right to right-mid -->
+    <path d="M 742 248 L 728 458 L 712 456 L 726 246 Z" />
+
+    <!-- Small accent nodes on connections -->
+    <circle cx="380" cy="195" r="14" />
+    <circle cx="620" cy="178" r="14" />
+    <circle cx="370" cy="360" r="14" />
+    <circle cx="630" cy="340" r="14" />
+    <circle cx="620" cy="462" r="12" />
+    <circle cx="380" cy="510" r="12" />
+  </g>
+</svg>

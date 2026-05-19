@@ -1,0 +1,15 @@
+[project]
+name = "deer-flow-sandbox"
+version = "0.1.0"
+description = "DeerFlow Sandbox - Code execution environment abstraction"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0", "ruff>=0.14.11"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

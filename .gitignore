@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+.turbo/
+
+# Environment / Secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config (user-specific)
+agent/config.yaml
+agent/extensions_config.json
+agent/memory.json
+
+# Skills (custom skills are user-specific)
+agent/skills/custom/*
+!agent/skills/custom/.gitkeep
+
+# Data
+agent/.deer-flow/
+agent/.nous-agent/
+postgres_data/
+minio_data/
+
+# Misc
+*.log
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
