@@ -6,11 +6,18 @@ from src.sandbox.sandbox import Sandbox
 
 
 class SandboxProvider(ABC):
-    """Abstract base class for sandbox providers"""
+    """Abstract base class for sandbox providers.
+
+    Implementations must be thread-safe for use in concurrent gateway
+    environments (FastAPI workers, background tasks, subagent pools).
+    """
 
     @abstractmethod
     def acquire(self, thread_id: str | None = None) -> str:
         """Acquire a sandbox environment and return its ID.
+
+        Args:
+            thread_id: Optional session/thread identifier.
 
         Returns:
             The ID of the acquired sandbox environment.
@@ -22,7 +29,7 @@ class SandboxProvider(ABC):
         """Get a sandbox environment by ID.
 
         Args:
-            sandbox_id: The ID of the sandbox environment to retain.
+            sandbox_id: The ID of the sandbox environment to retrieve.
         """
         pass
 
@@ -30,9 +37,23 @@ class SandboxProvider(ABC):
     def release(self, sandbox_id: str) -> None:
         """Release a sandbox environment.
 
+        Semantics are implementation-defined: may destroy immediately
+        or mark for lazy eviction (e.g., LRU).
+
         Args:
-            sandbox_id: The ID of the sandbox environment to destroy.
+            sandbox_id: The ID of the sandbox environment to release.
         """
+        pass
+
+    def reset(self) -> None:
+        """Clear cached state so configuration changes take effect.
+
+        Implementations should drop all cached instances.
+        """
+        pass
+
+    def shutdown(self) -> None:
+        """Shutdown the provider, releasing all resources."""
         pass
 
 
@@ -63,10 +84,15 @@ def reset_sandbox_provider() -> None:
     The next call to `get_sandbox_provider()` will create a new instance.
     Useful for testing or when switching configurations.
 
+    Providers can override `reset()` to clear any module-level state they keep
+    alive across instances (e.g., LocalSandboxProvider's cached singleton).
+
     Note: If the provider has active sandboxes, they will be orphaned.
     Use `shutdown_sandbox_provider()` for proper cleanup.
     """
     global _default_sandbox_provider
+    if _default_sandbox_provider is not None:
+        _default_sandbox_provider.reset()
     _default_sandbox_provider = None
 
 

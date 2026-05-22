@@ -63,6 +63,10 @@ async def get_checkpointer() -> AsyncPostgresSaver:
         from src.storage.history import setup_history_tables
         await setup_history_tables()
 
+        from src.runtime.event_store import PostgresRunEventStore
+        _run_event_store = PostgresRunEventStore()
+        await _run_event_store.setup()
+
         from src.config.swarm_config import get_swarm_config
         if get_swarm_config().enabled:
             from src.swarm.schema import setup_swarm_tables

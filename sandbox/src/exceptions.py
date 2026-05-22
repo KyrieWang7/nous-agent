@@ -32,16 +32,12 @@ class SandboxNotFoundError(SandboxError):
         self.sandbox_id = sandbox_id
 
 
-class SandboxRuntimeError(SandboxError):
-    """Raised when sandbox runtime is not available or misconfigured."""
-
-    pass
-
-
 class SandboxCommandError(SandboxError):
     """Raised when a command execution fails in the sandbox."""
 
-    def __init__(self, message: str, command: str | None = None, exit_code: int | None = None):
+    def __init__(
+        self, message: str, command: str | None = None, exit_code: int | None = None
+    ):
         details: dict = {}
         if command:
             details["command"] = command[:100] + "..." if len(command) > 100 else command
@@ -55,7 +51,9 @@ class SandboxCommandError(SandboxError):
 class SandboxFileError(SandboxError):
     """Raised when a file operation fails in the sandbox."""
 
-    def __init__(self, message: str, path: str | None = None, operation: str | None = None):
+    def __init__(
+        self, message: str, path: str | None = None, operation: str | None = None
+    ):
         details: dict = {}
         if path:
             details["path"] = path
@@ -96,7 +94,7 @@ class SandboxReadOnlyError(SandboxPermissionError):
 
 
 class SandboxPathTraversalError(SandboxPermissionError):
-    """Raised when a path traversal attack is detected (.. escape)."""
+    """Raised when a path traversal attack is detected."""
 
     def __init__(self, path: str | None = None):
         super().__init__(
@@ -105,9 +103,3 @@ class SandboxPathTraversalError(SandboxPermissionError):
             operation="resolve",
             err_code=errno.EACCES,
         )
-
-
-class SandboxFileNotFoundError(SandboxFileError):
-    """Raised when a file or directory is not found."""
-
-    pass
