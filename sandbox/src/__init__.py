@@ -1,4 +1,4 @@
-"""DeerFlow Sandbox - Code execution environment abstraction.
+"""Nous Agent Sandbox - Code execution environment abstraction.
 
 Production-grade sandbox with:
 - Thread-safe LRU caching for high-concurrency scenarios
