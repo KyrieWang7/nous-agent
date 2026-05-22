@@ -16,6 +16,8 @@ services:
       - ./agent/config.yaml:/app/config.yaml
       - ./agent/extensions_config.json:/app/extensions_config.json
       - ./agent/skills:/app/skills
+      # Shared data directory (threads, artifacts, uploads)
+      - agent_data:/app/.deer-flow
     env_file:
       - .env
     environment:
@@ -42,6 +44,8 @@ services:
       - ./agent/config.yaml:/app/config.yaml
       - ./agent/extensions_config.json:/app/extensions_config.json
       - ./agent/skills:/app/skills
+      # Shared data directory (same volume as agent — artifacts visible to both)
+      - agent_data:/app/.deer-flow
     env_file:
       - .env
     environment:
@@ -91,3 +95,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  agent_data:

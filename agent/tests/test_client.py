@@ -93,6 +93,7 @@ class TestConfigQueries:
         # Verify Gateway-aligned fields are present
         assert "display_name" in result["models"][0]
         assert "supports_thinking" in result["models"][0]
+        assert "supports_reasoning_effort" in result["models"][0]
 
     def test_list_skills(self, client):
         skill = MagicMock()
@@ -379,6 +380,7 @@ class TestGetModel:
         model_cfg.display_name = "Test Model"
         model_cfg.description = "A test model"
         model_cfg.supports_thinking = True
+        model_cfg.supports_reasoning_effort = True
         client._app_config.get_model_config.return_value = model_cfg
 
         result = client.get_model("test-model")
@@ -387,6 +389,7 @@ class TestGetModel:
             "display_name": "Test Model",
             "description": "A test model",
             "supports_thinking": True,
+            "supports_reasoning_effort": True,
         }
 
     def test_not_found(self, client):
@@ -928,6 +931,7 @@ class TestScenarioConfigManagement:
         model_cfg.display_name = None
         model_cfg.description = None
         model_cfg.supports_thinking = False
+        model_cfg.supports_reasoning_effort = False
         client._app_config.get_model_config.return_value = model_cfg
         detail = client.get_model(model_name)
         assert detail["name"] == model_name
@@ -1376,6 +1380,7 @@ class TestGatewayConformance:
         model.display_name = "Test Model"
         model.description = "A test model"
         model.supports_thinking = False
+        model.supports_reasoning_effort = False
         mock_app_config.models = [model]
 
         with patch("src.client.get_app_config", return_value=mock_app_config):
@@ -1392,6 +1397,7 @@ class TestGatewayConformance:
         model.display_name = "Test Model"
         model.description = "A test model"
         model.supports_thinking = True
+        model.supports_reasoning_effort = True
         mock_app_config.models = [model]
         mock_app_config.get_model_config.return_value = model
 

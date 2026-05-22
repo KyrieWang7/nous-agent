@@ -244,6 +244,14 @@ export default function ChatPage() {
       subagent_enabled:
         settings.context.mode === "ultra" || swarmEnabled,
       swarm_enabled: swarmEnabled,
+      reasoning_effort:
+        settings.context.mode === "ultra"
+          ? "high"
+          : settings.context.mode === "pro"
+            ? "medium"
+            : settings.context.mode === "thinking"
+              ? "low"
+              : undefined,
     },
     afterSubmit() {
       if (isNewThreadFromPath && threadId) {
