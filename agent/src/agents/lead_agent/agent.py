@@ -360,7 +360,7 @@ def _maybe_add_compaction_middleware(chain: list) -> None:
 # MemoryMiddleware queues conversation for memory update (after TitleMiddleware)
 # ViewImageMiddleware should be before ClarificationMiddleware to inject image details before LLM
 # ClarificationMiddleware should be last to intercept clarification requests after model calls
-def _build_middlewares(config: RunnableConfig, model_name: str | None):
+def _build_middlewares(config: RunnableConfig, model_name: str | None, extra_middleware: list | None = None):
     """Build middleware chain based on runtime configuration.
 
     Args:
@@ -397,6 +397,11 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None):
     from src.agents.middlewares.tool_error_handling_middleware import ToolErrorHandlingMiddleware
     middlewares.append(ToolErrorHandlingMiddleware())
 
+    # Add ToolOutputBudgetMiddleware (externalize/truncate oversized tool outputs so a
+    # single large tool return can't blow the model context). Ported from deer-flow.
+    from src.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware
+    middlewares.append(ToolOutputBudgetMiddleware.from_app_config(app_config))
+
     # Add summarization middleware (+ optional compact_conversation tool middleware)
     summ_pair = _create_summarization_middlewares()
     if summ_pair is not None:
@@ -427,6 +432,14 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None):
     if model_config is not None and model_config.supports_vision:
         middlewares.append(ViewImageMiddleware())
 
+    # Add SkillActivationMiddleware: when the user types `/skill-name <task>`,
+    # inject the full SKILL.md as a hidden message so the model follows that skill.
+    # Placed after context-shaping middlewares so the injected content is not
+    # summarized/compacted away within the same turn. Ported from deer-flow.
+    if getattr(app_config.skills, "slash_activation_enabled", True):
+        from src.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
+        middlewares.append(SkillActivationMiddleware())
+
     # Add DeferredToolFilterMiddleware (filters deferred tool schemas from model binding)
     from src.agents.middlewares.deferred_tool_filter_middleware import DeferredToolFilterMiddleware
     middlewares.append(DeferredToolFilterMiddleware())
@@ -443,15 +456,36 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None):
     from src.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
     middlewares.append(LoopDetectionMiddleware())
 
+    # Add SafetyFinishReasonMiddleware (suppress tool calls when the provider
+    # safety-terminated the response with truncated tool args). Ported from deer-flow.
+    # Registered AFTER LoopDetectionMiddleware: LangChain wires after_model edges in
+    # reverse list order, so the later-registered middleware observes the raw model
+    # output first, clears unsafe tool calls, then Loop accounts the cleaned message.
+    safety_cfg = getattr(app_config, "safety_finish_reason", None)
+    if safety_cfg is None or safety_cfg.enabled:
+        from src.agents.middlewares.safety_finish_reason_middleware import SafetyFinishReasonMiddleware
+        if safety_cfg is None:
+            middlewares.append(SafetyFinishReasonMiddleware())
+        else:
+            middlewares.append(SafetyFinishReasonMiddleware.from_config(safety_cfg))
+
     # Add InboxPollerMiddleware if swarm mode is enabled (runtime or YAML)
     _maybe_add_inbox_poller_middleware(middlewares, config)
+
+    # Insert plugin / SDK-supplied extra middlewares at their declared positions
+    # (@Next / @Prev anchors), or before ClarificationMiddleware if unanchored.
+    # Done before appending Clarification so unanchored extras land ahead of it.
+    if extra_middleware:
+        from src.agents.middleware_ordering import insert_extra_middlewares
+
+        insert_extra_middlewares(middlewares, list(extra_middleware))
 
     # ClarificationMiddleware should always be last
     middlewares.append(ClarificationMiddleware())
     return middlewares
 
 
-def make_lead_agent(config: RunnableConfig, checkpointer=None):
+def make_lead_agent(config: RunnableConfig, checkpointer=None, extra_middleware: list | None = None):
     # Lazy import to avoid circular dependency
     from src.tools import get_available_tools
 
@@ -505,7 +539,7 @@ def make_lead_agent(config: RunnableConfig, checkpointer=None):
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort),
         tools=get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled, swarm_enabled=swarm_enabled),
-        middleware=_build_middlewares(config, model_name=model_name),
+        middleware=_build_middlewares(config, model_name=model_name, extra_middleware=extra_middleware),
         system_prompt=apply_prompt_template(
             subagent_enabled=subagent_enabled,
             max_concurrent_subagents=max_concurrent_subagents,

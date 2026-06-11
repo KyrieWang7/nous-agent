@@ -204,11 +204,17 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
 
         logger.info(f"Original message content: {original_content[:100] if original_content else '(empty)'}")
 
-        # Create new message with combined content
+        # Create new message with combined content. Preserve the pre-rewrite user
+        # text under ORIGINAL_USER_CONTENT_KEY so downstream middlewares (e.g. slash
+        # skill activation) can still read the original ``/skill-name ...`` command.
+        from src.utils.messages import ORIGINAL_USER_CONTENT_KEY
+
+        merged_kwargs = dict(last_message.additional_kwargs or {})
+        merged_kwargs.setdefault(ORIGINAL_USER_CONTENT_KEY, original_content)
         updated_message = HumanMessage(
             content=f"{files_message}\n\n{original_content}",
             id=last_message.id,
-            additional_kwargs=last_message.additional_kwargs,
+            additional_kwargs=merged_kwargs,
         )
 
         # Replace the last message

@@ -156,4 +156,27 @@ def get_available_tools(
             [t.name for t in all_tools],
         )
 
+    # Skill-declared tool policy: when any enabled skill declares ``allowed-tools``
+    # in its frontmatter, restrict the bound tools to the union of those
+    # declarations. Skills without the field contribute nothing (legacy allow-all
+    # only applies when NO skill declares the field), so this is a no-op until a
+    # skill opts in. Ported from deer-flow.
+    if getattr(config.skills, "tool_policy_enabled", True):
+        try:
+            from src.skills.loader import load_skills
+            from src.skills.tool_policy import filter_tools_by_skill_allowed_tools
+
+            enabled_skills = load_skills(enabled_only=True)
+            before = len(all_tools)
+            all_tools = filter_tools_by_skill_allowed_tools(all_tools, enabled_skills)
+            if len(all_tools) != before:
+                logger.info(
+                    "Skill tool policy applied: %d -> %d tools (allowlist=%s)",
+                    before,
+                    len(all_tools),
+                    sorted(t.name for t in all_tools),
+                )
+        except Exception:
+            logger.exception("Skill tool policy filtering failed; leaving tools unfiltered")
+
     return all_tools

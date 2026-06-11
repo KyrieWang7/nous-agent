@@ -37,6 +37,7 @@ dependencies = [
     "minio>=7.2.20",
     "docker>=7.1.0",
     "redis>=5.0.0",
+    "alembic>=1.14.0",
 ]
 
 [dependency-groups]

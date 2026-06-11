@@ -1,7 +1,7 @@
 # Nous Agent — Development Commands
 # Usage: make <target>
 
-.PHONY: install dev stop build clean agent gateway frontend infra
+.PHONY: install dev stop build clean agent gateway frontend infra migrate migrate-new migrate-down migrate-current
 
 # ============================================================================
 # Quick Start
@@ -52,6 +52,22 @@ infra: ## Start PostgreSQL and MinIO via Docker Compose
 
 infra-down: ## Stop infrastructure
 	docker compose down
+
+# ============================================================================
+# Database Migrations (Alembic, raw-SQL migrations over asyncpg schema)
+# ============================================================================
+
+migrate: ## Apply all pending DB migrations (alembic upgrade head)
+	cd agent && uv run alembic upgrade head
+
+migrate-current: ## Show the current DB migration revision
+	cd agent && uv run alembic current
+
+migrate-down: ## Roll back one migration (alembic downgrade -1)
+	cd agent && uv run alembic downgrade -1
+
+migrate-new: ## Create a new empty migration: make migrate-new m="add foo table"
+	cd agent && uv run alembic revision -m "$(m)"
 
 # ============================================================================
 # Build

@@ -1,12 +1,10 @@
 import json
 import logging
-import re
 import shutil
 import tempfile
 import zipfile
 from pathlib import Path
 
-import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -56,81 +54,9 @@ class SkillInstallResponse(BaseModel):
     message: str = Field(..., description="Installation result message")
 
 
-# Allowed properties in SKILL.md frontmatter
-ALLOWED_FRONTMATTER_PROPERTIES = {"name", "description", "license", "allowed-tools", "metadata"}
-
-
-def _validate_skill_frontmatter(skill_dir: Path) -> tuple[bool, str, str | None]:
-    """Validate a skill directory's SKILL.md frontmatter.
-
-    Args:
-        skill_dir: Path to the skill directory containing SKILL.md.
-
-    Returns:
-        Tuple of (is_valid, message, skill_name).
-    """
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_md.exists():
-        return False, "SKILL.md not found", None
-
-    content = skill_md.read_text()
-    if not content.startswith("---"):
-        return False, "No YAML frontmatter found", None
-
-    # Extract frontmatter
-    match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-    if not match:
-        return False, "Invalid frontmatter format", None
-
-    frontmatter_text = match.group(1)
-
-    # Parse YAML frontmatter
-    try:
-        frontmatter = yaml.safe_load(frontmatter_text)
-        if not isinstance(frontmatter, dict):
-            return False, "Frontmatter must be a YAML dictionary", None
-    except yaml.YAMLError as e:
-        return False, f"Invalid YAML in frontmatter: {e}", None
-
-    # Check for unexpected properties
-    unexpected_keys = set(frontmatter.keys()) - ALLOWED_FRONTMATTER_PROPERTIES
-    if unexpected_keys:
-        return False, f"Unexpected key(s) in SKILL.md frontmatter: {', '.join(sorted(unexpected_keys))}", None
-
-    # Check required fields
-    if "name" not in frontmatter:
-        return False, "Missing 'name' in frontmatter", None
-    if "description" not in frontmatter:
-        return False, "Missing 'description' in frontmatter", None
-
-    # Validate name
-    name = frontmatter.get("name", "")
-    if not isinstance(name, str):
-        return False, f"Name must be a string, got {type(name).__name__}", None
-    name = name.strip()
-    if not name:
-        return False, "Name cannot be empty", None
-
-    # Check naming convention (hyphen-case: lowercase with hyphens)
-    if not re.match(r"^[a-z0-9-]+$", name):
-        return False, f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)", None
-    if name.startswith("-") or name.endswith("-") or "--" in name:
-        return False, f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens", None
-    if len(name) > 64:
-        return False, f"Name is too long ({len(name)} characters). Maximum is 64 characters.", None
-
-    # Validate description
-    description = frontmatter.get("description", "")
-    if not isinstance(description, str):
-        return False, f"Description must be a string, got {type(description).__name__}", None
-    description = description.strip()
-    if description:
-        if "<" in description or ">" in description:
-            return False, "Description cannot contain angle brackets (< or >)", None
-        if len(description) > 1024:
-            return False, f"Description is too long ({len(description)} characters). Maximum is 1024 characters.", None
-
-    return True, "Skill is valid!", name
+# Frontmatter validation is provided by the shared skills module so the gateway,
+# the embedded client, and the installer all enforce the same contract.
+from src.skills.validation import _validate_skill_frontmatter  # noqa: E402
 
 
 def _skill_to_response(skill: Skill) -> SkillResponse:
@@ -385,10 +311,6 @@ async def install_skill(request: SkillInstallRequest) -> SkillInstallResponse:
         if not skill_file_path.suffix == ".skill":
             raise HTTPException(status_code=400, detail="File must have .skill extension")
 
-        # Verify it's a valid ZIP file
-        if not zipfile.is_zipfile(skill_file_path):
-            raise HTTPException(status_code=400, detail="File is not a valid ZIP archive")
-
         # Get the custom skills directory
         skills_root = get_skills_root_path()
         custom_skills_dir = skills_root / "custom"
@@ -396,25 +318,33 @@ async def install_skill(request: SkillInstallRequest) -> SkillInstallResponse:
         # Create custom directory if it doesn't exist
         custom_skills_dir.mkdir(parents=True, exist_ok=True)
 
+        # Hardened install via the shared installer (zip-bomb defence, traversal /
+        # symlink rejection, LLM security scan). Single source of truth shared with
+        # DeerFlowClient.install_skill.
+        from src.skills.installer import (
+            SkillAlreadyExistsError,
+            _move_staged_skill_into_reserved_target,
+            _scan_skill_archive_contents_or_raise,
+            resolve_skill_dir_from_archive,
+            safe_extract_skill_archive,
+        )
+
         # Extract to a temporary directory first for validation
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
-            # Extract the .skill file
-            with zipfile.ZipFile(skill_file_path, "r") as zip_ref:
-                zip_ref.extractall(temp_path)
+            try:
+                zf = zipfile.ZipFile(skill_file_path, "r")
+            except (zipfile.BadZipFile, IsADirectoryError):
+                raise HTTPException(status_code=400, detail="File is not a valid ZIP archive") from None
 
-            # Find the skill directory (should be the only top-level directory)
-            extracted_items = list(temp_path.iterdir())
-            if len(extracted_items) == 0:
-                raise HTTPException(status_code=400, detail="Skill archive is empty")
+            with zf:
+                try:
+                    safe_extract_skill_archive(zf, temp_path)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
 
-            # Handle both cases: single directory or files directly in root
-            if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                skill_dir = extracted_items[0]
-            else:
-                # Files are directly in the archive root
-                skill_dir = temp_path
+            skill_dir = resolve_skill_dir_from_archive(temp_path)
 
             # Validate the skill
             is_valid, message, skill_name = _validate_skill_frontmatter(skill_dir)
@@ -429,8 +359,20 @@ async def install_skill(request: SkillInstallRequest) -> SkillInstallResponse:
             if target_dir.exists():
                 raise HTTPException(status_code=409, detail=f"Skill '{skill_name}' already exists. Please remove it first or use a different name.")
 
-            # Move the skill directory to the custom skills directory
-            shutil.copytree(skill_dir, target_dir)
+            # Security scan SKILL.md + support scripts before staging into place.
+            try:
+                await _scan_skill_archive_contents_or_raise(skill_dir, skill_name)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            # Stage + atomically move the skill into the custom skills directory
+            with tempfile.TemporaryDirectory(prefix=f".installing-{skill_name}-", dir=custom_skills_dir) as staging_root:
+                staging_target = Path(staging_root) / skill_name
+                shutil.copytree(skill_dir, staging_target)
+                try:
+                    _move_staged_skill_into_reserved_target(staging_target, target_dir)
+                except SkillAlreadyExistsError:
+                    raise HTTPException(status_code=409, detail=f"Skill '{skill_name}' already exists. Please remove it first or use a different name.") from None
 
         logger.info(f"Skill '{skill_name}' installed successfully to {target_dir}")
         return SkillInstallResponse(success=True, skill_name=skill_name, message=f"Skill '{skill_name}' installed successfully")

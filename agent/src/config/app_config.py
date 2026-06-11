@@ -6,21 +6,24 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.config.extensions_config import ExtensionsConfig
-from src.config.memory_config import load_memory_config_from_dict
-from src.config.model_config import ModelConfig
-from src.config.sandbox_config import SandboxConfig
-from src.config.skills_config import SkillsConfig
 from src.config.acp_config import load_acp_config_from_dict
+from src.config.extensions_config import ExtensionsConfig
 from src.config.guardrails_config import load_guardrails_config_from_dict
 from src.config.hooks_config import load_hooks_config_from_dict
+from src.config.memory_config import load_memory_config_from_dict
+from src.config.model_config import ModelConfig
 from src.config.permissions_config import load_permissions_config_from_dict
 from src.config.plugins_config import load_plugins_config_from_dict
+from src.config.safety_finish_reason_config import SafetyFinishReasonConfig
+from src.config.sandbox_config import SandboxConfig
+from src.config.skill_security_config import SkillSecurityConfig
+from src.config.skills_config import SkillsConfig
 from src.config.subagents_config import load_subagents_config_from_dict
-from src.config.swarm_config import load_swarm_config_from_dict
 from src.config.summarization_config import load_summarization_config_from_dict
+from src.config.swarm_config import load_swarm_config_from_dict
 from src.config.title_config import load_title_config_from_dict
 from src.config.tool_config import ToolConfig, ToolGroupConfig
+from src.config.tool_output_config import ToolOutputConfig
 
 load_dotenv()
 
@@ -33,6 +36,9 @@ class AppConfig(BaseModel):
     tools: list[ToolConfig] = Field(default_factory=list, description="Available tools")
     tool_groups: list[ToolGroupConfig] = Field(default_factory=list, description="Available tool groups")
     skills: SkillsConfig = Field(default_factory=SkillsConfig, description="Skills configuration")
+    skill_security: SkillSecurityConfig = Field(default_factory=SkillSecurityConfig, description="Skill install-time security scanning configuration")
+    tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig, description="Tool output budget enforcement configuration")
+    safety_finish_reason: SafetyFinishReasonConfig = Field(default_factory=SafetyFinishReasonConfig, description="Provider safety-termination suppression configuration")
     extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig, description="Extensions configuration (MCP servers and skills state)")
     model_config = ConfigDict(extra="allow", frozen=False)
 
