@@ -125,9 +125,29 @@ async def _run_agent_task(
 
     This task runs independently of the SSE connection. If the client
     disconnects, the task continues running to completion.
+
+    Integrates RunJournal for token bucketing and telemetry capture.
     """
     bus = get_event_bus()
     runs = get_runs()
+
+    # Initialize telemetry journal
+    journal = None
+    event_store = None
+    try:
+        from src.runtime.event_store import PostgresRunEventStore
+        from src.runtime.journal import RunJournal
+
+        event_store = PostgresRunEventStore()
+        await event_store.setup()
+        journal = RunJournal(run_id, thread_id, event_store)
+
+        # Inject journal as callback into the runnable config
+        existing_callbacks = runnable_config.get("callbacks", [])
+        runnable_config["callbacks"] = existing_callbacks + [journal]
+    except Exception as e:
+        logger.warning("Failed to initialize RunJournal, continuing without telemetry: %s", e)
+        journal = None
 
     try:
         runs[run_id]["status"] = "running"
@@ -162,6 +182,29 @@ async def _run_agent_task(
         await bus.publish(run_id, "error", {"message": str(exc), "type": type(exc).__name__})
 
     finally:
+        # Flush journal and persist completion data
+        if journal:
+            try:
+                await journal.flush()
+                completion_data = journal.get_completion_data()
+                completion_data["status"] = runs[run_id].get("status", "unknown")
+
+                if event_store and hasattr(event_store, "save_completion"):
+                    await event_store.save_completion(run_id, thread_id, completion_data)
+
+                # Publish token usage summary as custom event
+                await bus.publish(run_id, "custom", {
+                    "type": "run_completion",
+                    "total_tokens": completion_data["total_tokens"],
+                    "lead_agent_tokens": completion_data["lead_agent_tokens"],
+                    "subagent_tokens": completion_data["subagent_tokens"],
+                    "middleware_tokens": completion_data["middleware_tokens"],
+                    "llm_call_count": completion_data["llm_call_count"],
+                    "duration_ms": completion_data["duration_ms"],
+                })
+            except Exception as e:
+                logger.warning("Failed to finalize journal for run %s: %s", run_id, e)
+
         # 发送 end 信号并延迟清理
         await bus.publish_end(run_id)
         unregister(run_id)

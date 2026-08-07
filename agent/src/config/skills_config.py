@@ -14,6 +14,14 @@ class SkillsConfig(BaseModel):
         default="/mnt/skills",
         description="Path where skills are mounted in the sandbox container",
     )
+    slash_activation_enabled: bool = Field(
+        default=True,
+        description="Enable explicit /skill-name slash activation (injects SKILL.md for the turn).",
+    )
+    tool_policy_enabled: bool = Field(
+        default=True,
+        description="Restrict bound tools to the union of enabled skills' allowed-tools (no-op unless a skill declares the field).",
+    )
 
     def get_skills_path(self) -> Path:
         """

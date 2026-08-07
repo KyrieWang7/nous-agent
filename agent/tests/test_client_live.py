@@ -237,6 +237,7 @@ class TestLiveConfigQueries:
         for m in result["models"]:
             assert "display_name" in m
             assert "supports_thinking" in m
+            assert "supports_reasoning_effort" in m
         print(f"  models: {names}")
 
     def test_get_model_found(self, client):
@@ -246,6 +247,7 @@ class TestLiveConfigQueries:
         assert model["name"] == "ark-model"
         assert "display_name" in model
         assert "supports_thinking" in model
+        assert "supports_reasoning_effort" in model
         print(f"  model detail: {model}")
 
     def test_get_model_not_found(self, client):

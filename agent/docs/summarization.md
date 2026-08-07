@@ -1,17 +1,17 @@
 # 会话压缩 (Conversation Summarization)
 
-DeerFlow 包含了自动会话压缩功能，以处理接近模型 Token 限制的超长对话。启用后，系统会自动压缩较旧的消息，同时保留最近的上下文。
+Nous Agent 包含了自动会话压缩功能，以处理接近模型 Token 限制的超长对话。启用后，系统会自动压缩较旧的消息，同时保留最近的上下文。
 
 ## 概览 (Overview)
 
-会话压缩功能利用了 `deepagents` 的 `SummarizationMiddleware` 以及自定义的 `PostgresBackend`。与其破坏性地清除旧消息，该系统会在压缩当前对话之前，智能地将历史上下文卸载存入 PostgreSQL 数据库。触发压缩时，它会：
+会话压缩基于 `NousSummarizationMiddleware`（移植自 DeerFlow，继承 LangChain 官方的 `SummarizationMiddleware`）。触发压缩时，它会：
 
 1. 实时监控消息的 Token 数量。
 2. 当达到阈值时触发压缩。
 3. 保持最近的消息原样不变，同时筛选出较旧的对话片段进行压缩。
-4. **安全地将这些较旧的消息卸载（Offload）** 到与当前对话线程关联的专用 `conversation_history` 数据库表中。
-5. 将一条包含总结内容的 HumanMessage 注入回当前对话，并附注数据库存储位置，以确保大语言模型（LLM）知道原始上下文已被安全保留。
-6. 确保 AI 和 Tool 消息对的连贯性不被切断。
+4. 发起一次轻量级 LLM 调用，将较旧消息浓缩为摘要，写入 `summary_text` 状态通道。
+5. 用摘要替换被压缩的历史（`RemoveMessage(REMOVE_ALL_MESSAGES)` + 保留消息），确保 AI 和 Tool 消息对的连贯性不被切断。
+6. 保护动态上下文提醒（DynamicContextReminder）及其 ID-swap 关联消息不被摘要吞掉。
 
 ## 配置 (Configuration)
 
@@ -137,17 +137,16 @@ keep:
 
 ### 压缩流 (Summarization Flow)
 
-1. **监控 (Monitoring)**: 在每次调用大模型前，中间件会计算当前活跃消息历史的 Token 数量。
+1. **监控 (Monitoring)**: 在每次调用大模型前（`before_model`），中间件会计算当前活跃消息历史的 Token 数量（历史摘要 `summary_text` 也计入触发判断）。
 2. **触发检查 (Trigger Check)**: 如果满足任何配置的阈值，将触发压缩逻辑。
 3. **消息分区 (Message Partitioning)**: 消息会被分为两部分：
    - 待压缩消息 (超出 `keep` 阈值的较旧消息)。
    - 待保留消息 (在 `keep` 阈值内的较新消息)。
-4. **数据保存与卸载 (Data Preservation)**: 需要被压缩的旧消息会被整体打包成 Markdown 格式，并由 `PostgresBackend` 安全地保存到 PostgreSQL 中的 `conversation_history` 表里。
-5. **生成总结 (Summary Generation)**: 系统会发起一次轻量级的 LLM 调用，将这些较旧的消息浓缩成一份简明的总结。
-6. **上下文替换 (Context Replacement)**: 发送给 LLM 的活跃消息历史将被更新（该更新仅在单次请求层面生效，不会破坏底层的 LangGraph 状态机）：
-   - 生成一条单独的总结消息，包含总结文本，并声明被卸载的历史文件的位置。
-   - 最近的消息将被原样保留。
-7. **AI与工具配对保护 (AI/Tool Pair Protection)**: 系统在计算截断边界时，确保 AI 消息及其对应的工具调用消息绑定在一起，防止被强行分开。
+4. **动态上下文救援 (Dynamic Context Rescue)**: 被 DynamicContextMiddleware 注入的隐藏提醒消息（携带日期/记忆）及其 ID-swap 关联消息（`__memory`/`__user` 三元组）会从待压缩集合中救出，避免摘要后提醒注入点错位、用户原始提问被压成散文。
+5. **前置钩子 (Before-Summarization Hooks)**: 压缩前触发 `before_summarization` 钩子（可扩展点，例如未来将被压缩消息刷入持久记忆队列）。
+6. **生成总结 (Summary Generation)**: 系统发起一次轻量级 LLM 调用（带 `TAG_NOSTREAM` 标记的专用模型副本，摘要的 token 流不会推送到前端成为幻影消息），将旧消息浓缩成摘要。摘要输入中的 `<existing_summary>`/`<new_messages>` 块内容经过 HTML 转义，防止块逃逸伪造。
+7. **上下文替换 (Context Replacement)**: LangGraph 状态中的消息历史被更新为「移除全部 + 保留消息」，摘要写入 `summary_text` 状态通道并随下一轮触发判断累计。
+8. **AI与工具配对保护 (AI/Tool Pair Protection)**: 系统在计算截断边界时，确保 AI 消息及其对应的工具调用消息绑定在一起，防止被强行分开。
 
 ### Token 计算 (Token Counting)
 
@@ -162,13 +161,7 @@ keep:
 
 - **近期消息 (Recent Messages)**: 始终基于 `keep` 的配置完好保留。
 - **AI/Tool 配对 (AI/Tool Pairs)**: 永不拆开 - 如果计算出的截断点正好落在工具消息序列中间，系统会自动向回调整边界以确保完整块不被切断。
-- **总结格式 (Summary Format)**: 总结会以 HumanMessage 的形式注入，并声明：
-  ```
-  You are in the middle of a conversation that has been summarized.
-  The full conversation history has been saved to [path] should you need to refer back to it for details.
-  A condensed summary follows...
-  ```
-- **存储层 (Storage Layer)**: 数据库底层采用了 `ON DELETE CASCADE` 约束与 `threads(id)` 进行关联。一旦任何一个对话线程被删除，其关联的“卸载历史总结”也会自动被彻底擦除，以保障数据隐私与多租户隔离。
+- **总结格式 (Summary Format)**: 摘要写入 LangGraph 状态的 `summary_text` 通道（`ThreadState.summary_text`），由中间件在后续触发判断时计入 token 总量；`before_summarization` 钩子提供了将被压缩消息外送持久化的扩展点。
 
 ## 最佳实践 (Best Practices)
 
@@ -271,10 +264,10 @@ keep:
 ### 代码结构 (Code Structure)
 
 - **主配置**: `src/config/summarization_config.py`
-- **入口集成**: `src/agents/lead_agent/agent.py`
-- **数据库表结构**: `src/storage/history.py` (定义了 `conversation_history` 表的创建逻辑及交互语句)
-- **底层依赖桥接**: `src/agents/middlewares/postgres_backend.py` (实现了给 deepagents 用的 `BackendProtocol`)
-- **核心引擎引擎**: 调用自开源库 `deepagents.middleware.summarization.SummarizationMiddleware`
+- **核心中间件**: `src/agents/middlewares/compaction/summarization.py`（`NousSummarizationMiddleware` + `create_summarization_middleware` 工厂，移植自 DeerFlow）
+- **入口集成**: `src/agents/lead_agent/agent.py`（`_create_summarization_middlewares` 调工厂）
+- **状态通道**: `src/agents/thread_state.py`（`ThreadState.summary_text`）
+- **核心引擎**: 继承自 LangChain 官方 `langchain.agents.middleware.SummarizationMiddleware`
 
 ### 中间件洋葱模型层级 (Middleware Order)
 
@@ -288,9 +281,9 @@ keep:
 
 ### 状态管理 (State Management)
 
-- **无状态跟踪**: 单次压缩判定仅仅与当次 LangGraph `RunnableConfig` 线程运行时数据挂钩。
-- **原始状态免疫**: 中间件只在请求发往 LLM (`ModelRequest`) 的最后一米进行拦截替换，**绝不会逆向删改 LangGraph 自己名下的任何原生 Checkpoint 数据库日志**。
-- **无损查阅**: 真正超长而被丢弃的对话被无缝路由进了独立的 PostgreSQL 表，前端 UI 依然能完完整整拉取所有聊天记录并进行二次操作，不丢失任何细节。
+- **状态通道**: 摘要保存在 LangGraph state 的 `summary_text` 字段（`ThreadState.summary_text`），随 checkpoint 持久化。
+- **触发累计**: 每轮触发判断时，`summary_text` 会作为一条计数消息并入 token 总量，避免多轮压缩后低估实际上下文规模。
+- **钩子扩展**: `before_summarization` 钩子在消息被移除前触发，收到 `SummarizationEvent`（待压缩消息、保留消息、thread_id、agent_name），是实现「压缩前外送持久记忆」等能力的挂点。
 
 ## 典型配置示例 (Example Configurations)
 
@@ -352,5 +345,5 @@ summarization:
 
 ## 参考文档 (References)
 
-- [DeepAgents Summarization 开源源码](https://github.com/langchain-ai/deepagents/)
-- [LangChain 中间件生态系统](https://docs.langchain.com/oss/python/langchain/middleware)
+- [LangChain SummarizationMiddleware 官方文档](https://docs.langchain.com/oss/python/langchain/middleware)
+- DeerFlow `DeerFlowSummarizationMiddleware`（本实现的移植来源）

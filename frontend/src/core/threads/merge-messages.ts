@@ -35,25 +35,63 @@ export function mergeSSEValuesMessages(
   previousMessages: Message[],
   nextMessages: Message[],
 ): Message[] {
-  const nextMessageIds = new Set(nextMessages.map((m) => m.id).filter(Boolean));
-
-  const preserved: Message[] = [];
-  for (const previousMessage of previousMessages) {
-    if (!previousMessage.id || nextMessageIds.has(previousMessage.id)) {
-      continue;
-    }
-    if (
+  // A values event is an authoritative state snapshot. Only optimistic human
+  // messages can legitimately be newer than it; streamed assistant/tool
+  // messages must be replaced or the completed turn is rendered twice.
+  const preserved = previousMessages.filter(
+    (previousMessage) =>
       previousMessage.type === "human" &&
-      nextMessages.some((nextMessage) =>
+      !nextMessages.some((nextMessage) =>
         isSameHumanMessage(previousMessage, nextMessage),
-      )
-    ) {
-      continue;
-    }
-    preserved.push(previousMessage);
-  }
+      ),
+  );
 
   return preserved.length > 0
     ? [...preserved, ...nextMessages]
     : nextMessages;
+}
+
+export function findEquivalentMessageIndex(
+  messages: Message[],
+  candidate: Message,
+): number {
+  if (candidate.id) {
+    const byId = messages.findIndex((message) => message.id === candidate.id);
+    if (byId >= 0) return byId;
+  }
+
+  if (candidate.type === "human") {
+    return messages.findIndex((message) =>
+      isSameHumanMessage(message, candidate),
+    );
+  }
+
+  if (candidate.type === "tool") {
+    return messages.findIndex(
+      (message) =>
+        message.type === "tool" &&
+        message.tool_call_id === candidate.tool_call_id,
+    );
+  }
+
+  if (candidate.type === "ai" && candidate.tool_calls?.length) {
+    const callIds = new Set(
+      candidate.tool_calls.map((call) => call.id).filter(Boolean),
+    );
+    return messages.findIndex(
+      (message) =>
+        message.type === "ai" &&
+        message.tool_calls?.some((call) => call.id && callIds.has(call.id)),
+    );
+  }
+
+  const signature = contentSignature(candidate);
+  if (signature) {
+    return messages.findIndex(
+      (message) =>
+        message.type === candidate.type &&
+        contentSignature(message) === signature,
+    );
+  }
+  return -1;
 }

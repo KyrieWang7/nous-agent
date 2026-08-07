@@ -66,7 +66,7 @@ make gateway
 ## Project Structure
 
 ```
-backend/src/
+agent/src/
 ├── agents/                  # Agent system
 │   ├── lead_agent/         # Main agent implementation
 │   │   └── agent.py        # Agent factory and creation
@@ -78,15 +78,6 @@ backend/src/
 │   │   ├── view_image_middleware.py
 │   │   └── clarification_middleware.py
 │   └── thread_state.py     # Thread state definition
-│
-├── gateway/                 # FastAPI Gateway
-│   ├── app.py              # FastAPI application
-│   └── routers/            # Route handlers
-│       ├── models.py       # /api/models endpoints
-│       ├── mcp.py          # /api/mcp endpoints
-│       ├── skills.py       # /api/skills endpoints
-│       ├── artifacts.py    # /api/threads/.../artifacts
-│       └── uploads.py      # /api/threads/.../uploads
 │
 ├── sandbox/                 # Sandbox execution
 │   ├── __init__.py         # Sandbox interface
@@ -329,10 +320,11 @@ middlewares = [
 
 ### Adding New API Endpoints
 
-1. Create router in `src/gateway/routers/`:
+Gateway endpoints live in the sibling `gateway/` project. Create the router in
+`gateway/src/nous_gateway/routers/`:
 
 ```python
-# src/gateway/routers/my_router.py
+# gateway/src/nous_gateway/routers/my_router.py
 from fastapi import APIRouter
 
 router = APIRouter(prefix="/my-endpoint", tags=["my-endpoint"])
@@ -348,10 +340,10 @@ async def create_item(data: dict):
     return {"created": data}
 ```
 
-2. Register in `src/gateway/app.py`:
+2. Register in `gateway/src/nous_gateway/app.py`:
 
 ```python
-from src.gateway.routers import my_router
+from nous_gateway.routers import my_router
 
 app.include_router(my_router.router)
 ```

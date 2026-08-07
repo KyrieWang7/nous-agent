@@ -28,7 +28,7 @@
 |---|------|------|------------------------|--------------|
 | 1 | **权限系统** | `src/permissions/` | 7级 PermissionMode → 简化为 5级 | ❌ 不存在 |
 | 2 | **Hook 治理层** | `src/hooks/` | 7种 HookType → 4种 + 外部/Python Hook | ❌ 不存在 |
-| 3 | **零成本上下文压缩** | `src/context/` | 8层压缩的 microcompact 思路 → CompactionMiddleware | ❌ 不存在 |
+| 3 | **~~零成本上下文压缩~~** | ~~`src/context/`~~ | 已移除 — 双层压缩在实践中互相干扰，回退为 DeerFlow 同款单一路径 LLM 摘要 | 已对齐 DeerFlow |
 | 4 | **声明式插件系统** | `src/plugins/` | 无直接对应，借鉴其模块化思想 | ❌ 不存在 |
 | 5 | **Swarm/Team 协作** | `src/swarm/` | Swarm 文件 Mailbox → PostgreSQL Mailbox | ❌ 不存在 |
 | 6 | **自定义 API 服务器** | `src/api/` + `src/server.py` | 替代 `langgraph dev` 的自管理 FastAPI | ❌ 依赖 langgraph CLI |
@@ -43,7 +43,7 @@ DeerFlow 原有 12 个中间件，Nous Agent 扩展至 **22 个**。新增的 10
 |---|--------|------|------|------|
 | 1 | **PermissionMiddleware** | `permissions/middleware.py` | 5级权限检查，工具级覆盖 | Claude Code PermissionMode |
 | 2 | **HookMiddleware** | `hooks/middleware.py` | Pre/Post 工具钩子，阻断能力 | Claude Code Hooks |
-| 3 | **CompactionMiddleware** | `context/middleware.py` | 零成本确定性压缩，无需 LLM | Claude Code microcompact |
+| 3 | **~~CompactionMiddleware~~** | ~~`context/middleware.py`~~ | 已移除（双压缩路径互相干扰），统一为 SummarizationMiddleware 单一路径 | — |
 | 4 | **SandboxAuditMiddleware** | `middlewares/sandbox_audit_middleware.py` | Bash 命令安全审计 | Claude Code 安全层 |
 | 5 | **ToolErrorHandlingMiddleware** | `middlewares/tool_error_handling_middleware.py` | 工具异常转换为错误消息 | Claude Code 容错 |
 | 6 | **TokenUsageMiddleware** | `middlewares/token_usage_middleware.py` | LLM Token 消耗日志追踪 | 独立增强 |
@@ -92,7 +92,7 @@ DeerFlow 仅有 `general-purpose` 和 `bash` 两种 Subagent。Nous Agent 新增
  9. ToolErrorHandlingMiddleware ⭐ — 工具异常处理
 ── 原有中间件（保留或增强）──
 10. SummarizationMiddleware     — LLM 驱动的上下文摘要
-11. CompactionMiddleware    ⭐  — 零成本确定性压缩
+11. ~~CompactionMiddleware~~     — 已移除，统一走 SummarizationMiddleware 单一路径
 12. TodoMiddleware              — 任务管理（Plan 模式）
 13. TokenUsageMiddleware    ⭐  — Token 用量追踪
 14. TitleMiddleware             — 自动生成标题
@@ -123,21 +123,22 @@ Nous Agent: 5级权限模型
             + PolicyEngine: authorize(tool_name, tool_input, prompter)
 ```
 
-### 3.3 上下文压缩：1层 → 2层
+### 3.3 上下文压缩：双层实验 → 对齐 DeerFlow 单一路径
 
 ```
-DeerFlow:   SummarizationMiddleware (LLM 驱动，消耗 API 调用)
+历史方案:   2层压缩（已废弃）
+            Layer 1: SummarizationMiddleware (LLM 摘要)
+            Layer 2: CompactionMiddleware (零成本确定性压缩)
+            → 双层并行触发，行为互相干扰，已移除 Layer 2
 
-Nous Agent: 2层压缩
+当前方案:   NousSummarizationMiddleware（对齐 DeerFlow，单一 LLM 摘要路径）
             ┌──────────────────────────────────────────────────────┐
-            │ Layer 1: SummarizationMiddleware (LLM 摘要)           │
-            │   - Token 阈值触发                                    │
-            │   - 保留最近 10 条 + 前 2 条                          │
-            ├──────────────────────────────────────────────────────┤
-            │ Layer 2: CompactionMiddleware (零成本) ← Claude Code  │
-            │   - 纯结构化提取，无需 LLM 调用                       │
-            │   - 输出: [用户请求], [工具使用], [关键路径], [时间线]  │
-            │   - 可重复压缩（合并而非覆盖）                         │
+            │ - 继承 LangChain 官方 SummarizationMiddleware         │
+            │ - Token/消息数/比例阈值触发（OR 逻辑）                │
+            │ - 摘要写入 state 的 summary_text 通道并计入触发判断   │
+            │ - 动态上下文提醒（DynamicContextReminder）跨摘要救援  │
+            │ - 摘要模型带 TAG_NOSTREAM，不产生前端幻影流式消息     │
+            │ - before_summarization 钩子（压缩前外送的扩展点）     │
             └──────────────────────────────────────────────────────┘
 ```
 
@@ -305,7 +306,7 @@ Nous Agent: 自管理 FastAPI 应用 (src/server.py)
 | 中间件链 | — | 12个 | **22个** | **+10** |
 | 权限系统 | ✅ 7级 | ❌ | ✅ **5级** | **新增** |
 | Hook 治理 | ✅ 7种 | ❌ | ✅ **4种** | **新增** |
-| 零成本压缩 | ✅ | ❌ | ✅ | **新增** |
+| 零成本压缩 | ✅ | ❌ | ❌（已移除，对齐 DeerFlow 单一 LLM 摘要） | **回退** |
 | 插件系统 | ❌ | ❌ | ✅ | **新增** |
 | Swarm/Team | ✅ 文件 Mailbox | ❌ | ✅ **PG Mailbox** | **新增** |
 | 持久化 | 自研 | JSON 文件 | **PostgreSQL** | **升级** |
@@ -349,7 +350,6 @@ Nous Agent (社区, 开源)
     ├─ 新增 (来自 Claude Code):
     │   ├── PermissionMiddleware (5级权限)
     │   ├── HookMiddleware + 外部/Python Hook
-    │   ├── CompactionMiddleware (零成本压缩)
     │   ├── PluginManifest (声明式插件)
     │   ├── SandboxAuditMiddleware
     │   ├── ToolErrorHandlingMiddleware
@@ -383,7 +383,6 @@ nous-agent/
 │   │   ├── api/                    # LangGraph 兼容 REST API ⭐ 新增
 │   │   ├── permissions/            # 5级权限系统 ⭐ 新增
 │   │   ├── hooks/                  # Hook 治理层 ⭐ 新增
-│   │   ├── context/                # 零成本上下文压缩 ⭐ 新增
 │   │   ├── plugins/                # 声明式插件系统 ⭐ 新增
 │   │   ├── swarm/                  # Swarm/Team 协作 ⭐ 新增
 │   │   ├── guardrails/             # 内容安全过滤
@@ -436,7 +435,7 @@ Nous Agent 在 DeerFlow 基础上进行了 **13 项核心改造**：
 **来自 Claude Code 的 8 项架构融合：**
 1. 5级权限系统 (PermissionMiddleware + PolicyEngine)
 2. Hook 治理层 (外部进程 + Python Hook, 阻断能力)
-3. 零成本上下文压缩 (CompactionMiddleware)
+3. ~~零成本上下文压缩 (CompactionMiddleware)~~ — 已移除，统一为 DeerFlow 同款单一路径 LLM 摘要 (NousSummarizationMiddleware)
 4. 声明式插件系统 (PluginManifest + PluginRegistry)
 5. Swarm/Team 多 Agent 协作 (PostgreSQL Mailbox)
 6. 模块化 Prompt (缓存边界 + 动态拼接)

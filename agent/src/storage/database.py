@@ -20,6 +20,8 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ LANGGRAPH_PG_URI = os.environ.get(
 
 _pool: asyncpg.Pool | None = None
 _checkpointer: AsyncPostgresSaver | None = None
-_checkpointer_ctx = None  # keep the async-ctx-manager alive
+_checkpointer_pool: AsyncConnectionPool | None = None
 
 
 async def _init_pool() -> asyncpg.Pool:
@@ -45,29 +47,49 @@ async def _init_pool() -> asyncpg.Pool:
 async def get_checkpointer() -> AsyncPostgresSaver:
     """Return a shared ``AsyncPostgresSaver`` instance.
 
-    On first call the saver is created via ``from_conn_string``, entered
-    as an async context-manager, and ``setup()`` is called to ensure the
-    checkpoint tables exist.  Subsequent calls return the cached instance.
+    The saver is backed by an ``AsyncConnectionPool`` (rather than a single
+    long-lived connection from ``from_conn_string``).  A single connection
+    dies permanently on idle timeout, postgres restart, or a network blip —
+    after which every ``aget_tuple`` raises ``the connection is closed``.
+
+    The pool health-checks each connection on checkout (``check_connection``)
+    and recycles dead ones, so transient DB drops self-heal instead of
+    wedging all subsequent runs.  Subsequent calls return the cached instance.
     """
-    global _checkpointer, _checkpointer_ctx
+    global _checkpointer, _checkpointer_pool
 
     if _checkpointer is None:
-        logger.info("Initialising AsyncPostgresSaver")
-        _checkpointer_ctx = AsyncPostgresSaver.from_conn_string(LANGGRAPH_PG_URI)
-        _checkpointer = await _checkpointer_ctx.__aenter__()
+        logger.info("Initialising AsyncPostgresSaver (pooled)")
+        # AsyncPostgresSaver requires autocommit + dict_row connections.
+        _checkpointer_pool = AsyncConnectionPool(
+            conninfo=LANGGRAPH_PG_URI,
+            min_size=2,
+            max_size=10,
+            open=False,
+            # Validate connections on checkout; dead ones are dropped and
+            # replaced transparently instead of surfacing as runtime errors.
+            check=AsyncConnectionPool.check_connection,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        )
+        await _checkpointer_pool.open(wait=True)
+        _checkpointer = AsyncPostgresSaver(_checkpointer_pool)
         await _checkpointer.setup()
-        
+
         from src.storage.session_manager import setup_threads_table
         await setup_threads_table()
 
         from src.storage.history import setup_history_tables
         await setup_history_tables()
 
+        from src.runtime.event_store import PostgresRunEventStore
+        _run_event_store = PostgresRunEventStore()
+        await _run_event_store.setup()
+
         from src.config.swarm_config import get_swarm_config
         if get_swarm_config().enabled:
             from src.swarm.schema import setup_swarm_tables
             await setup_swarm_tables()
-        
+
         logger.info("AsyncPostgresSaver ready (%s)", LANGGRAPH_PG_URI.split("@")[-1])
 
     return _checkpointer
@@ -98,11 +120,11 @@ async def get_standalone_connection() -> AsyncIterator[asyncpg.Connection]:
 
 async def close_db() -> None:
     """Shut down checkpointer and connection pool gracefully."""
-    global _checkpointer, _checkpointer_ctx, _pool
+    global _checkpointer, _checkpointer_pool, _pool
 
-    if _checkpointer_ctx is not None:
-        await _checkpointer_ctx.__aexit__(None, None, None)
-        _checkpointer_ctx = None
+    if _checkpointer_pool is not None:
+        await _checkpointer_pool.close()
+        _checkpointer_pool = None
         _checkpointer = None
 
     if _pool is not None:

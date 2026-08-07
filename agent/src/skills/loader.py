@@ -52,22 +52,22 @@ def load_skills(skills_path: Path | None = None, use_config: bool = True, enable
 
     skills = []
 
-    # Scan public and custom directories
+    # Scan public and custom directories. Each SKILL.md (at any depth) is a skill;
+    # relative_path is computed from the category root so nested layouts work.
     for category in ["public", "custom"]:
         category_path = skills_path / category
         if not category_path.exists() or not category_path.is_dir():
             continue
 
-        # Each subdirectory is a potential skill
-        for skill_dir in category_path.iterdir():
-            if not skill_dir.is_dir():
+        for skill_file in sorted(category_path.rglob("SKILL.md")):
+            if not skill_file.is_file():
+                continue
+            # Skip dotted directories (e.g. custom/.history).
+            rel_parent = skill_file.parent.relative_to(category_path)
+            if any(part.startswith(".") for part in rel_parent.parts):
                 continue
 
-            skill_file = skill_dir / "SKILL.md"
-            if not skill_file.exists():
-                continue
-
-            skill = parse_skill_file(skill_file, category=category)
+            skill = parse_skill_file(skill_file, category=category, relative_path=rel_parent)
             if skill:
                 skills.append(skill)
 

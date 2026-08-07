@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - errorlint
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - nilerr
+    - unconvert
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+
+exclusions:
+  rules:
+    - path: _test\.go$
+      linters:
+        - errcheck

@@ -1,0 +1,16 @@
+FROM golang:1.25-alpine
+
+RUN apk add --no-cache bash ca-certificates curl git \
+    && go install github.com/air-verse/air@v1.63.0
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+EXPOSE 7776
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=6 \
+    CMD curl --fail --silent http://127.0.0.1:7776/ok >/dev/null || exit 1
+
+CMD ["air", "-c", ".air.toml"]

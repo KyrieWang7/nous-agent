@@ -18,6 +18,7 @@ import {
 import { useRehypeSplitWordsIntoSpans } from "@/core/rehype";
 import type { Subtask } from "@/core/tasks";
 import { useUpdateSubtask } from "@/core/tasks/context";
+import { resolveSubagentStatus } from "@/core/tasks/status-contract";
 import type { AgentThreadState } from "@/core/threads";
 import { cn } from "@/lib/utils";
 
@@ -120,7 +121,11 @@ export function MessageList({
                 const taskId = message.tool_call_id;
                 if (taskId) {
                   const result = extractTextFromMessage(message);
-                  if (result.startsWith("Task Succeeded. Result:")) {
+                  const { status, error } = resolveSubagentStatus(
+                    message.additional_kwargs,
+                    result,
+                  );
+                  if (status === "completed") {
                     updateSubtask({
                       id: taskId,
                       status: "completed",
@@ -128,17 +133,16 @@ export function MessageList({
                         .split("Task Succeeded. Result:")[1]
                         ?.trim(),
                     });
-                  } else if (result.startsWith("Task failed.")) {
+                  } else if (
+                    status === "failed" ||
+                    status === "timed_out" ||
+                    status === "polling_timed_out" ||
+                    status === "cancelled"
+                  ) {
                     updateSubtask({
                       id: taskId,
                       status: "failed",
-                      error: result.split("Task failed.")[1]?.trim(),
-                    });
-                  } else if (result.startsWith("Task timed out")) {
-                    updateSubtask({
-                      id: taskId,
-                      status: "failed",
-                      error: result,
+                      error: error ?? result.split("Task failed.")[1]?.trim() ?? result,
                     });
                   } else {
                     updateSubtask({

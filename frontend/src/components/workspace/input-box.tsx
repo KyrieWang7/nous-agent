@@ -58,6 +58,7 @@ import { cn } from "@/lib/utils";
 import {
   ModelSelector,
   ModelSelectorContent,
+  ModelSelectorEmpty,
   ModelSelectorInput,
   ModelSelectorItem,
   ModelSelectorList,
@@ -139,7 +140,7 @@ export function InputBox({
   const [skillPickerIndex, setSkillPickerIndex] = useState(0);
   const skillPickerRef = useRef<HTMLDivElement>(null);
   const skillListRef = useRef<HTMLDivElement>(null);
-  const { models } = useModels();
+  const { models, isLoading: modelsLoading, error: modelsError } = useModels();
   const { skills } = useSkills();
 
   const enabledSkills = useMemo(
@@ -653,15 +654,26 @@ export function InputBox({
           </Tooltip>
           <ModelSelector>
             <ModelSelectorTrigger asChild>
-              <PromptInputButton>
+              <PromptInputButton
+                title={modelsError ? t.inputBox.modelUnavailable : undefined}
+              >
                 <ModelSelectorName className="text-sm font-normal">
-                  {selectedModel?.display_name}
+                  {selectedModel?.display_name ??
+                    selectedModel?.name ??
+                    (modelsLoading
+                      ? t.inputBox.modelLoading
+                      : t.inputBox.modelUnavailable)}
                 </ModelSelectorName>
               </PromptInputButton>
             </ModelSelectorTrigger>
             <ModelSelectorContent>
               <ModelSelectorInput placeholder={t.inputBox.searchModels} />
               <ModelSelectorList>
+                <ModelSelectorEmpty>
+                  {modelsLoading
+                    ? t.inputBox.modelLoading
+                    : t.inputBox.modelUnavailable}
+                </ModelSelectorEmpty>
                 {models.map((m) => (
                   <ModelSelectorItem
                     key={m.name}

@@ -19,7 +19,6 @@ import asyncio
 import json
 import logging
 import mimetypes
-import re
 import shutil
 import tempfile
 import uuid
@@ -400,6 +399,7 @@ class DeerFlowClient:
                     "display_name": getattr(model, "display_name", None),
                     "description": getattr(model, "description", None),
                     "supports_thinking": getattr(model, "supports_thinking", False),
+                    "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
                 }
                 for model in self._app_config.models
             ]
@@ -471,6 +471,7 @@ class DeerFlowClient:
             "display_name": getattr(model, "display_name", None),
             "description": getattr(model, "description", None),
             "supports_thinking": getattr(model, "supports_thinking", False),
+            "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
         }
 
     # ------------------------------------------------------------------
@@ -604,6 +605,11 @@ class DeerFlowClient:
     def install_skill(self, skill_path: str | Path) -> dict:
         """Install a skill from a .skill archive (ZIP).
 
+        Uses the hardened installer ported from deer-flow, which adds:
+        - zip-bomb defence (bounded total uncompressed size),
+        - absolute-path / traversal / symlink rejection,
+        - LLM-driven security scanning of SKILL.md and support scripts.
+
         Args:
             skill_path: Path to the .skill file.
 
@@ -612,10 +618,19 @@ class DeerFlowClient:
 
         Raises:
             FileNotFoundError: If the file does not exist.
-            ValueError: If the file is invalid.
+            ValueError: If the file is invalid or fails security scanning.
         """
-        from src.gateway.routers.skills import _validate_skill_frontmatter
+        import asyncio
+
+        from src.skills.installer import (
+            SkillAlreadyExistsError,
+            _move_staged_skill_into_reserved_target,
+            _scan_skill_archive_contents_or_raise,
+            resolve_skill_dir_from_archive,
+            safe_extract_skill_archive,
+        )
         from src.skills.loader import get_skills_root_path
+        from src.skills.validation import _validate_skill_frontmatter
 
         path = Path(skill_path)
         if not path.exists():
@@ -624,8 +639,6 @@ class DeerFlowClient:
             raise ValueError(f"Path is not a file: {skill_path}")
         if path.suffix != ".skill":
             raise ValueError("File must have .skill extension")
-        if not zipfile.is_zipfile(path):
-            raise ValueError("File is not a valid ZIP archive")
 
         skills_root = get_skills_root_path()
         custom_dir = skills_root / "custom"
@@ -633,35 +646,34 @@ class DeerFlowClient:
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            with zipfile.ZipFile(path, "r") as zf:
-                total_size = sum(info.file_size for info in zf.infolist())
-                if total_size > 100 * 1024 * 1024:
-                    raise ValueError("Skill archive too large when extracted (>100MB)")
-                for info in zf.infolist():
-                    if Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
-                        raise ValueError(f"Unsafe path in archive: {info.filename}")
-                zf.extractall(tmp_path)
-            for p in tmp_path.rglob("*"):
-                if p.is_symlink():
-                    p.unlink()
 
-            items = list(tmp_path.iterdir())
-            if not items:
-                raise ValueError("Skill archive is empty")
+            try:
+                zf = zipfile.ZipFile(path, "r")
+            except (zipfile.BadZipFile, IsADirectoryError) as exc:
+                raise ValueError("File is not a valid ZIP archive") from exc
 
-            skill_dir = items[0] if len(items) == 1 and items[0].is_dir() else tmp_path
+            with zf:
+                safe_extract_skill_archive(zf, tmp_path)
+
+            skill_dir = resolve_skill_dir_from_archive(tmp_path)
 
             is_valid, message, skill_name = _validate_skill_frontmatter(skill_dir)
             if not is_valid:
                 raise ValueError(f"Invalid skill: {message}")
-            if not re.fullmatch(r"[a-zA-Z0-9_-]+", skill_name):
+            if not skill_name or "/" in skill_name or "\\" in skill_name or ".." in skill_name:
                 raise ValueError(f"Invalid skill name: {skill_name}")
 
             target = custom_dir / skill_name
             if target.exists():
-                raise ValueError(f"Skill '{skill_name}' already exists")
+                raise SkillAlreadyExistsError(f"Skill '{skill_name}' already exists")
 
-            shutil.copytree(skill_dir, target)
+            # Security scan: SKILL.md + support scripts/prompt inputs.
+            asyncio.run(_scan_skill_archive_contents_or_raise(skill_dir, skill_name))
+
+            with tempfile.TemporaryDirectory(prefix=f".installing-{skill_name}-", dir=custom_dir) as staging_root:
+                staging_target = Path(staging_root) / skill_name
+                shutil.copytree(skill_dir, staging_target)
+                _move_staged_skill_into_reserved_target(staging_target, target)
 
         return {"success": True, "skill_name": skill_name, "message": f"Skill '{skill_name}' installed successfully"}
 
@@ -734,7 +746,7 @@ class DeerFlowClient:
         Raises:
             FileNotFoundError: If any file does not exist.
         """
-        from src.gateway.routers.uploads import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
+        from src.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
         # Validate all files upfront to avoid partial uploads.
         resolved_files = []

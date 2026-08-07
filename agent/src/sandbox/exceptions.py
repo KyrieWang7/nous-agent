@@ -1,4 +1,11 @@
-"""Sandbox-related exceptions with structured error information."""
+"""Sandbox-related exceptions with structured error information.
+
+Provides a hierarchy of exceptions for sandbox operations, enabling
+consistent error handling across the application in high-concurrency
+production scenarios.
+"""
+
+import errno
 
 
 class SandboxError(Exception):
@@ -35,7 +42,7 @@ class SandboxCommandError(SandboxError):
     """Raised when a command execution fails in the sandbox."""
 
     def __init__(self, message: str, command: str | None = None, exit_code: int | None = None):
-        details = {}
+        details: dict = {}
         if command:
             details["command"] = command[:100] + "..." if len(command) > 100 else command
         if exit_code is not None:
@@ -49,7 +56,7 @@ class SandboxFileError(SandboxError):
     """Raised when a file operation fails in the sandbox."""
 
     def __init__(self, message: str, path: str | None = None, operation: str | None = None):
-        details = {}
+        details: dict = {}
         if path:
             details["path"] = path
         if operation:
@@ -60,9 +67,44 @@ class SandboxFileError(SandboxError):
 
 
 class SandboxPermissionError(SandboxFileError):
-    """Raised when a permission error occurs during file operations."""
+    """Raised when a permission error occurs during file operations.
 
-    pass
+    Includes path traversal attempts and read-only mount violations.
+    """
+
+    def __init__(
+        self,
+        message: str = "Permission denied",
+        path: str | None = None,
+        operation: str | None = None,
+        err_code: int = errno.EACCES,
+    ):
+        super().__init__(message, path, operation)
+        self.err_code = err_code
+
+
+class SandboxReadOnlyError(SandboxPermissionError):
+    """Raised when attempting to write to a read-only mounted path."""
+
+    def __init__(self, path: str | None = None, operation: str | None = None):
+        super().__init__(
+            message="Read-only file system",
+            path=path,
+            operation=operation,
+            err_code=errno.EROFS,
+        )
+
+
+class SandboxPathTraversalError(SandboxPermissionError):
+    """Raised when a path traversal attack is detected (.. escape)."""
+
+    def __init__(self, path: str | None = None):
+        super().__init__(
+            message="Access denied: path escapes mounted directory",
+            path=path,
+            operation="resolve",
+            err_code=errno.EACCES,
+        )
 
 
 class SandboxFileNotFoundError(SandboxFileError):

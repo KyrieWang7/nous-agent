@@ -17,7 +17,7 @@ def _make_app_config(models: list[ModelConfig]) -> AppConfig:
     )
 
 
-def _make_model(name: str, *, supports_thinking: bool) -> ModelConfig:
+def _make_model(name: str, *, supports_thinking: bool, supports_reasoning_effort: bool = False) -> ModelConfig:
     return ModelConfig(
         name=name,
         display_name=name,
@@ -26,6 +26,7 @@ def _make_model(name: str, *, supports_thinking: bool) -> ModelConfig:
         model=name,
         supports_thinking=supports_thinking,
         supports_vision=False,
+        supports_reasoning_effort=supports_reasoning_effort,
     )
 
 
@@ -80,13 +81,14 @@ def test_make_lead_agent_disables_thinking_when_model_does_not_support_it(monkey
 
     monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
     monkeypatch.setattr(tools_module, "get_available_tools", lambda **kwargs: [])
-    monkeypatch.setattr(lead_agent_module, "_build_middlewares", lambda config, model_name: [])
+    monkeypatch.setattr(lead_agent_module, "_build_middlewares", lambda config, model_name, extra_middleware=None: [])
 
     captured: dict[str, object] = {}
 
-    def _fake_create_chat_model(*, name, thinking_enabled):
+    def _fake_create_chat_model(*, name, thinking_enabled, reasoning_effort=None):
         captured["name"] = name
         captured["thinking_enabled"] = thinking_enabled
+        captured["reasoning_effort"] = reasoning_effort
         return object()
 
     monkeypatch.setattr(lead_agent_module, "create_chat_model", _fake_create_chat_model)
@@ -108,6 +110,43 @@ def test_make_lead_agent_disables_thinking_when_model_does_not_support_it(monkey
     assert result["model"] is not None
 
 
+def test_make_lead_agent_propagates_reasoning_effort(monkeypatch):
+    app_config = _make_app_config([_make_model("effort-model", supports_thinking=False, supports_reasoning_effort=True)])
+
+    import src.tools as tools_module
+
+    monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
+    monkeypatch.setattr(tools_module, "get_available_tools", lambda **kwargs: [])
+    monkeypatch.setattr(lead_agent_module, "_build_middlewares", lambda config, model_name, extra_middleware=None: [])
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_chat_model(*, name, thinking_enabled, reasoning_effort=None):
+        captured["name"] = name
+        captured["thinking_enabled"] = thinking_enabled
+        captured["reasoning_effort"] = reasoning_effort
+        return object()
+
+    monkeypatch.setattr(lead_agent_module, "create_chat_model", _fake_create_chat_model)
+    monkeypatch.setattr(lead_agent_module, "create_agent", lambda **kwargs: kwargs)
+
+    result = lead_agent_module.make_lead_agent(
+        {
+            "configurable": {
+                "model_name": "effort-model",
+                "thinking_enabled": False,
+                "reasoning_effort": "high",
+                "is_plan_mode": False,
+                "subagent_enabled": False,
+            }
+        }
+    )
+
+    assert captured["name"] == "effort-model"
+    assert captured["reasoning_effort"] == "high"
+    assert result["model"] is not None
+
+
 def test_build_middlewares_uses_resolved_model_name_for_vision(monkeypatch):
     app_config = _make_app_config(
         [
@@ -125,7 +164,7 @@ def test_build_middlewares_uses_resolved_model_name_for_vision(monkeypatch):
     )
 
     monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
-    monkeypatch.setattr(lead_agent_module, "_create_summarization_middleware", lambda: None)
+    monkeypatch.setattr(lead_agent_module, "_create_summarization_middlewares", lambda: None)
     monkeypatch.setattr(lead_agent_module, "_create_todo_list_middleware", lambda is_plan_mode: None)
 
     middlewares = lead_agent_module._build_middlewares(

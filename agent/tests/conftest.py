@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 
 # Make 'src' importable from any working directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
 # Break the circular import chain that exists in production code:
 #   src.subagents.__init__
 #     -> .executor (SubagentExecutor, SubagentResult)

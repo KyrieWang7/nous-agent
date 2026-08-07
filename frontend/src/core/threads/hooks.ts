@@ -22,7 +22,10 @@ import {
   fetchThreads as gwFetchThreads,
   updateThread as gwUpdateThread,
 } from "./api";
-import { mergeSSEValuesMessages } from "./merge-messages";
+import {
+  findEquivalentMessageIndex,
+  mergeSSEValuesMessages,
+} from "./merge-messages";
 import { MessageManager } from "./message-manager";
 import { fetchActiveRunId, reconnectSSE, streamSSE } from "./transport";
 import type {
@@ -232,9 +235,13 @@ function useSSEStream(
         flushSync(() => {
           setState((prev) => {
             const prevMessages = (prev.values.messages ?? []).slice();
+            const pending = msgManagerRef.current.get(messageId);
+            const equivalentIndex = pending
+              ? findEquivalentMessageIndex(prevMessages, pending.message)
+              : -1;
             const entry = msgManagerRef.current.get(
               messageId,
-              prevMessages.length,
+              equivalentIndex >= 0 ? equivalentIndex : prevMessages.length,
             );
             if (!entry) return prev;
             const { message: accumulated, index } = entry;

@@ -81,6 +81,8 @@ export const zhCN: Translations = {
     ultraModeDescription:
       "继承自 Pro 模式，可调用子代理分工协作，适合复杂多步骤任务，能力最强",
     searchModels: "搜索模型...",
+    modelLoading: "正在加载模型...",
+    modelUnavailable: "模型不可用",
     surpriseMe: "小惊喜",
     surpriseMePrompt: "给我一个小惊喜吧",
     suggestions: [

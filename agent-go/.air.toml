@@ -1,0 +1,17 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -tags=docker -o ./tmp/agentd ./cmd/agentd"
+bin = "./tmp/agentd"
+full_bin = "./tmp/agentd --config ./config.example.yaml"
+include_ext = ["go", "yaml", "yml", "json"]
+include_file = ["config.example.yaml"]
+exclude_dir = ["tmp", ".git", ".nous-agent"]
+delay = 500
+stop_on_error = true
+send_interrupt = true
+kill_delay = "2s"
+
+[log]
+time = true
