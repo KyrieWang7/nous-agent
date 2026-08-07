@@ -1,0 +1,126 @@
+server:
+  address: ":7776"
+
+default_model: deepseek-v4-flash
+models:
+  - name: deepseek-v4-flash
+    display_name: DeepSeek V4 Flash
+    description: Fast DeepSeek model using the same endpoint as the Python Harness
+    provider: openai-compatible
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key: $DEEPSEEK_API_KEY
+    max_tokens: 8192
+    context_length: 128000
+    timeout: 120
+    supports_thinking: true
+
+  - name: MiniMax-M2.7-highspeed
+    display_name: MiniMax M2.7 Highspeed
+    provider: openai-compatible
+    model: MiniMax-M2.7-highspeed
+    base_url: https://api.minimax.chat/v1
+    api_key: $MINIMAX_API_KEY
+    max_tokens: 8192
+    context_length: 128000
+    timeout: 120
+    supports_thinking: true
+
+  - name: gpt-4o
+    display_name: GPT-4o
+    provider: openai-compatible
+    model: gpt-4o
+    api_key: $OPENAI_API_KEY
+    max_tokens: 4096
+    context_length: 128000
+    timeout: 120
+    supports_vision: true
+
+  - name: deepseek-v4-pro
+    display_name: DeepSeek V4 Pro
+    provider: openai-compatible
+    model: deepseek-v4-pro
+    base_url: https://api.deepseek.com
+    api_key: $DEEPSEEK_API_KEY
+    max_tokens: 8192
+    context_length: 128000
+    timeout: 120
+    supports_thinking: true
+
+sandbox:
+  enabled: true
+  provider: local
+  base_dir: ./.nous-agent/workspaces
+  exec_timeout: 30s
+
+permissions:
+  mode: workspace_write
+
+skills:
+  enabled: true
+  path: ../agent/skills/public
+
+subagents:
+  enabled: true
+  max_concurrent: 3
+  task_ttl: 24h
+
+extensions:
+  mcp_servers: {}
+  # filesystem:
+  #   enabled: true
+  #   type: stdio
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+memory:
+  enabled: false
+  max_facts: 50
+  confidence_threshold: 0.7
+  injection_tokens: 1000
+
+title:
+  enabled: true
+  max_words: 8
+  max_chars: 80
+
+swarm:
+  enabled: false
+  poll_limit: 50
+
+summarization:
+  enabled: true
+  trigger_tokens: 96000
+  keep_messages: 10
+  max_summary_tokens: 1024
+  max_input_messages: 200
+  max_input_chars: 120000
+
+guardrails:
+  enabled: false
+  fail_closed: true
+  input: true
+  output: true
+
+hooks: []
+# - name: protect-production
+#   enabled: true
+#   events: [pre_tool_use]
+#   command: ./hooks/protect-production
+#   matcher: "^(bash|write_file)$"
+#   timeout: 10s
+
+loop:
+  max_iterations: 100
+  stop_reinjection_limit: 3
+  deadline: 30m
+  tool_concurrency: 4
+  token_budget: 100000
+  middleware_timeout: 30s
+
+runtime:
+  event_buffer_size: 500
+  event_ttl: 24h
+  heartbeat_interval: 15s
+  redis_url: $REDIS_URL
+  database_url: $DATABASE_URL

@@ -212,7 +212,7 @@ backend/.deer-flow/threads/
 
 ### 组件
 
-1. **Upload Router** (`src/gateway/routers/uploads.py`)
+1. **Upload Router** (`gateway/src/nous_gateway/routers/uploads.py`)
    - 处理文件上传、列表、删除请求
    - 使用 markitdown 转换文档
 

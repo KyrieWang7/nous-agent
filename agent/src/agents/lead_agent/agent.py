@@ -1,21 +1,14 @@
 import logging
 
-from deepagents.middleware.summarization import SummarizationMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
-
-try:
-    from deepagents.middleware.summarization import SummarizationToolMiddleware, compute_summarization_defaults
-except ImportError:
-    SummarizationToolMiddleware = None  # type: ignore[assignment,misc]
-    compute_summarization_defaults = None  # type: ignore[assignment]
 from langchain_core.runnables import RunnableConfig
 
 from src.agents.lead_agent.prompt import apply_prompt_template
 from src.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from src.agents.middlewares.compaction import create_summarization_middleware
 from src.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
 from src.agents.middlewares.memory_middleware import MemoryMiddleware
-from src.agents.middlewares.postgres_backend import PostgresBackend
 from src.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
 from src.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
 from src.agents.middlewares.title_middleware import TitleMiddleware
@@ -23,7 +16,6 @@ from src.agents.middlewares.uploads_middleware import UploadsMiddleware
 from src.agents.middlewares.view_image_middleware import ViewImageMiddleware
 from src.agents.thread_state import ThreadState
 from src.config.app_config import get_app_config
-from src.config.summarization_config import get_summarization_config
 from src.models import create_chat_model
 from src.sandbox.middleware import SandboxMiddleware
 
@@ -48,85 +40,15 @@ def _resolve_model_name(requested_model_name: str | None) -> str:
 
 
 def _create_summarization_middlewares() -> tuple | None:
-    """Create and configure the summarization middleware (+ optional tool middleware) from config.
+    """Create the configured summarization middleware from config.
 
-    Returns a tuple of middlewares or None if disabled.
+    Single LLM-summarization path (ported from DeerFlow). Returns a tuple of
+    middlewares or None if disabled.
     """
-    config = get_summarization_config()
-
-    if not config.enabled:
+    middleware = create_summarization_middleware()
+    if middleware is None:
         return None
-
-    # Prepare trigger parameter
-    trigger = None
-    if config.trigger is not None:
-        if isinstance(config.trigger, list):
-            trigger = [t.to_tuple() for t in config.trigger]
-        else:
-            trigger = config.trigger.to_tuple()
-
-    # Prepare keep parameter
-    keep = config.keep.to_tuple()
-
-    # Prepare model parameter
-    if config.model_name:
-        model = config.model_name
-    else:
-        model = create_chat_model(thinking_enabled=False)
-
-    # When trigger is not explicitly configured, try model-aware defaults
-    if trigger is None and not isinstance(model, str) and compute_summarization_defaults is not None:
-        try:
-            defaults = compute_summarization_defaults(model)
-            trigger = defaults["trigger"]
-            keep = defaults["keep"]
-            if config.truncate_args is None:
-                pass  # will be set from defaults below
-        except Exception:
-            logger.debug("compute_summarization_defaults failed, using config values")
-
-    # Prepare kwargs
-    kwargs = {
-        "model": model,
-        "backend": PostgresBackend(),
-        "trigger": trigger,
-        "keep": keep,
-    }
-
-    if config.trim_tokens_to_summarize is not None:
-        kwargs["trim_tokens_to_summarize"] = config.trim_tokens_to_summarize
-
-    if config.summary_prompt is not None:
-        kwargs["summary_prompt"] = config.summary_prompt
-
-    # Build truncate_args_settings from config or model-aware defaults
-    if config.truncate_args is not None:
-        truncate_settings = {}
-        if config.truncate_args.trigger is not None:
-            truncate_settings["trigger"] = config.truncate_args.trigger.to_tuple()
-        if config.truncate_args.keep is not None:
-            truncate_settings["keep"] = config.truncate_args.keep.to_tuple()
-        if config.truncate_args.max_length is not None:
-            truncate_settings["max_length"] = config.truncate_args.max_length
-        if config.truncate_args.truncation_text is not None:
-            truncate_settings["truncation_text"] = config.truncate_args.truncation_text
-        kwargs["truncate_args_settings"] = truncate_settings
-    elif not isinstance(model, str) and "truncate_args_settings" not in kwargs and compute_summarization_defaults is not None:
-        try:
-            defaults = compute_summarization_defaults(model)
-            if "truncate_args_settings" in defaults:
-                kwargs["truncate_args_settings"] = defaults["truncate_args_settings"]
-        except Exception:
-            pass
-
-    summ_mw = SummarizationMiddleware(**kwargs)
-    middlewares = [summ_mw]
-
-    if SummarizationToolMiddleware is not None:
-        tool_mw = SummarizationToolMiddleware(summ_mw)
-        middlewares.append(tool_mw)
-
-    return tuple(middlewares)
+    return (middleware,)
 
 
 def _create_todo_list_middleware(is_plan_mode: bool) -> TodoListMiddleware | None:
@@ -341,16 +263,6 @@ def _maybe_add_inbox_poller_middleware(chain: list, config: RunnableConfig) -> N
         logger.debug("Swarm module not available; skipping InboxPollerMiddleware")
 
 
-def _maybe_add_compaction_middleware(chain: list) -> None:
-    """Add CompactionMiddleware if context compaction is available."""
-    try:
-        from src.context.middleware import CompactionMiddleware
-
-        chain.append(CompactionMiddleware())
-    except ImportError:
-        logger.debug("CompactionMiddleware not available; skipping")
-
-
 # ThreadDataMiddleware must be before SandboxMiddleware to ensure thread_id is available
 # UploadsMiddleware should be after ThreadDataMiddleware to access thread_id
 # DanglingToolCallMiddleware patches missing ToolMessages before model sees the history
@@ -402,13 +314,10 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, extra_mid
     from src.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware
     middlewares.append(ToolOutputBudgetMiddleware.from_app_config(app_config))
 
-    # Add summarization middleware (+ optional compact_conversation tool middleware)
+    # Add summarization middleware (single LLM-summarization path, ported from DeerFlow)
     summ_pair = _create_summarization_middlewares()
     if summ_pair is not None:
         middlewares.extend(summ_pair)
-
-    # Add CompactionMiddleware if available
-    _maybe_add_compaction_middleware(middlewares)
 
     # Add TodoList middleware if plan mode is enabled
     is_plan_mode = config.get("configurable", {}).get("is_plan_mode", False)

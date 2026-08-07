@@ -1,6 +1,9 @@
-# DeerFlow Backend
+# Nous Agent Python Harness
 
-DeerFlow is a LangGraph-based AI super agent with sandbox execution, persistent memory, and extensible tool integration. The backend enables AI agents to execute code, browse the web, manage files, delegate tasks to subagents, and retain context across conversations - all in isolated, per-thread environments.
+The Python/LangGraph implementation of the Nous Agent Harness product. The
+sibling `../agent-go` provides the same frontend-facing harness role with a
+native Go runtime and matching event names. The separately deployed Python
+Gateway lives in `../gateway`; this harness does not import it.
 
 ---
 
@@ -15,8 +18,8 @@ DeerFlow is a LangGraph-based AI super agent with sandbox execution, persistent 
               /api/langgraph/*  │                  │  /api/* (other)
                                 ▼                  ▼
                ┌────────────────────┐  ┌────────────────────────┐
-               │ LangGraph Server   │  │   Gateway API (8001)   │
-               │    (Port 2024)     │  │   FastAPI REST         │
+               │  Python Harness    │  │   Gateway API (7777)   │
+               │    (Port 7776)     │  │   FastAPI REST         │
                │                    │  │                        │
                │ ┌────────────────┐ │  │ Models, MCP, Skills,   │
                │ │  Lead Agent    │ │  │ Memory, Uploads,       │
@@ -190,23 +193,20 @@ make dev
 make gateway
 ```
 
-Direct access: LangGraph at http://localhost:2024, Gateway at http://localhost:8001
+Direct access: Python Harness at http://localhost:7776, Gateway at http://localhost:7777
 
 ---
 
 ## Project Structure
 
 ```
-backend/
+agent/
 ├── src/
 │   ├── agents/                  # Agent system
 │   │   ├── lead_agent/         # Main agent (factory, prompts)
 │   │   ├── middlewares/        # 9 middleware components
 │   │   ├── memory/             # Memory extraction & storage
 │   │   └── thread_state.py    # ThreadState schema
-│   ├── gateway/                # FastAPI Gateway API
-│   │   ├── app.py             # Application setup
-│   │   └── routers/           # 6 route modules
 │   ├── sandbox/                # Sandbox execution
 │   │   ├── local/             # Local filesystem provider
 │   │   ├── sandbox.py         # Abstract interface
@@ -287,8 +287,8 @@ MCP servers and skill states in a single file:
 
 ```bash
 make install    # Install dependencies
-make dev        # Run LangGraph server (port 2024)
-make gateway    # Run Gateway API (port 8001)
+make agent      # Run Python Harness (port 7776)
+make gateway    # Run sibling Gateway API (port 7777)
 make lint       # Run linter (ruff)
 make format     # Format code (ruff)
 ```
@@ -313,7 +313,7 @@ uv run pytest
 
 - **LangGraph** (1.0.6+) - Agent framework and multi-agent orchestration
 - **LangChain** (1.2.3+) - LLM abstractions and tool system
-- **FastAPI** (0.115.0+) - Gateway REST API
+- **FastAPI** (0.115.0+) - Harness compatibility API
 - **langchain-mcp-adapters** - Model Context Protocol support
 - **agent-sandbox** - Sandboxed code execution
 - **markitdown** - Multi-format document conversion

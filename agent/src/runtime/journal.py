@@ -529,7 +529,10 @@ class RunJournal(BaseCallbackHandler):
                 "category": category,
                 "content": content if isinstance(content, dict) else {"text": content},
                 "metadata": metadata or {},
-                "created_at": datetime.now(UTC).isoformat(),
+                # Store a tz-aware datetime (not an ISO string): asyncpg's binary
+                # protocol encodes the parameter before the SQL `::timestamptz`
+                # cast applies, so a str would raise DataError.
+                "created_at": datetime.now(UTC),
             }
         )
         if len(self._buffer) >= self._flush_threshold:

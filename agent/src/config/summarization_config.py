@@ -78,7 +78,8 @@ class SummarizationConfig(BaseModel):
     )
     truncate_args: TruncateArgsConfig | None = Field(
         default=None,
-        description="Settings for truncating large tool-call arguments in older messages before summarization.",
+        description="[Reserved] Settings for truncating large tool-call arguments in older messages before summarization. "
+        "Not currently consumed — kept for config compatibility; tool-argument truncation is covered by trim_tokens_to_summarize.",
     )
 
 

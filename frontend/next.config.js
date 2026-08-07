@@ -6,26 +6,20 @@ import "./src/env.js";
 
 /** @type {import("next").NextConfig} */
 const gatewayUrl =
-  process.env.NEXT_PUBLIC_BACKEND_BASE_URL ?? "http://127.0.0.1:7777";
-const langgraphUrl =
-  process.env.NEXT_PUBLIC_LANGGRAPH_BASE_URL ?? "http://127.0.0.1:7776";
-
+  process.env.GATEWAY_BASE_URL ??
+  process.env.NEXT_PUBLIC_BACKEND_BASE_URL ??
+  "http://127.0.0.1:7777";
 const config = {
   devIndicators: false,
   async rewrites() {
     return [
-      // LangGraph Agent API — must be matched before the general /api/* rule
-      {
-        source: "/api/langgraph/:path*",
-        destination: `${langgraphUrl}/:path*`,
-      },
       // Gateway API (models, MCP, skills, memory, uploads, artifacts)
       {
-        source: "/api/:first((?!drama$|langgraph$)[^/]+)",
+        source: "/api/:first((?!(?:drama|langgraph)(?:/|$))[^/]+)",
         destination: `${gatewayUrl}/api/:first`,
       },
       {
-        source: "/api/:first((?!drama$|langgraph$)[^/]+)/:rest*",
+        source: "/api/:first((?!(?:drama|langgraph)(?:/|$))[^/]+)/:rest*",
         destination: `${gatewayUrl}/api/:first/:rest*`,
       },
     ];

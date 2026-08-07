@@ -10,11 +10,6 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: F401
 
 from src.client import DeerFlowClient
-from src.gateway.routers.mcp import McpConfigResponse
-from src.gateway.routers.memory import MemoryConfigResponse, MemoryStatusResponse
-from src.gateway.routers.models import ModelResponse, ModelsListResponse
-from src.gateway.routers.skills import SkillInstallResponse, SkillResponse, SkillsListResponse
-from src.gateway.routers.uploads import UploadResponse
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -529,7 +524,7 @@ class TestSkillsManagement:
 
             with (
                 patch("src.skills.loader.get_skills_root_path", return_value=skills_root),
-                patch("src.gateway.routers.skills._validate_skill_frontmatter", return_value=(True, "OK", "my-skill")),
+                patch("src.skills.validation._validate_skill_frontmatter", return_value=(True, "OK", "my-skill")),
             ):
                 result = client.install_skill(archive_path)
 
@@ -1220,7 +1215,7 @@ class TestScenarioSkillInstallAndUse:
             # Step 1: Install
             with (
                 patch("src.skills.loader.get_skills_root_path", return_value=skills_root),
-                patch("src.gateway.routers.skills._validate_skill_frontmatter", return_value=(True, "OK", "my-analyzer")),
+                patch("src.skills.validation._validate_skill_frontmatter", return_value=(True, "OK", "my-analyzer")),
             ):
                 result = client.install_skill(archive)
             assert result["success"] is True
@@ -1350,8 +1345,8 @@ class TestScenarioEdgeCases:
 
             with (
                 patch.object(DeerFlowClient, "_get_uploads_dir", return_value=uploads_dir),
-                patch("src.gateway.routers.uploads.CONVERTIBLE_EXTENSIONS", {".pdf"}),
-                patch("src.gateway.routers.uploads.convert_file_to_markdown", side_effect=Exception("conversion failed")),
+                patch("src.utils.file_conversion.CONVERTIBLE_EXTENSIONS", {".pdf"}),
+                patch("src.utils.file_conversion.convert_file_to_markdown", side_effect=Exception("conversion failed")),
             ):
                 result = client.upload_files("t-pdf-fail", [pdf_file])
 
@@ -1360,218 +1355,3 @@ class TestScenarioEdgeCases:
             assert result["files"][0]["filename"] == "doc.pdf"
             assert "markdown_file" not in result["files"][0]  # Conversion failed gracefully
             assert (uploads_dir / "doc.pdf").exists()  # File still uploaded
-
-
-# ---------------------------------------------------------------------------
-# Gateway conformance — validate client output against Gateway Pydantic models
-# ---------------------------------------------------------------------------
-
-class TestGatewayConformance:
-    """Validate that DeerFlowClient return dicts conform to Gateway Pydantic response models.
-
-    Each test calls a client method, then parses the result through the
-    corresponding Gateway response model. If the client drifts (missing or
-    wrong-typed fields), Pydantic raises ``ValidationError`` and CI catches it.
-    """
-
-    def test_list_models(self, mock_app_config):
-        model = MagicMock()
-        model.name = "test-model"
-        model.display_name = "Test Model"
-        model.description = "A test model"
-        model.supports_thinking = False
-        model.supports_reasoning_effort = False
-        mock_app_config.models = [model]
-
-        with patch("src.client.get_app_config", return_value=mock_app_config):
-            client = DeerFlowClient()
-
-        result = client.list_models()
-        parsed = ModelsListResponse(**result)
-        assert len(parsed.models) == 1
-        assert parsed.models[0].name == "test-model"
-
-    def test_get_model(self, mock_app_config):
-        model = MagicMock()
-        model.name = "test-model"
-        model.display_name = "Test Model"
-        model.description = "A test model"
-        model.supports_thinking = True
-        model.supports_reasoning_effort = True
-        mock_app_config.models = [model]
-        mock_app_config.get_model_config.return_value = model
-
-        with patch("src.client.get_app_config", return_value=mock_app_config):
-            client = DeerFlowClient()
-
-        result = client.get_model("test-model")
-        assert result is not None
-        parsed = ModelResponse(**result)
-        assert parsed.name == "test-model"
-
-    def test_list_skills(self, client):
-        skill = MagicMock()
-        skill.name = "web-search"
-        skill.description = "Search the web"
-        skill.license = "MIT"
-        skill.category = "public"
-        skill.enabled = True
-
-        with patch("src.skills.loader.load_skills", return_value=[skill]):
-            result = client.list_skills()
-
-        parsed = SkillsListResponse(**result)
-        assert len(parsed.skills) == 1
-        assert parsed.skills[0].name == "web-search"
-
-    def test_get_skill(self, client):
-        skill = MagicMock()
-        skill.name = "web-search"
-        skill.description = "Search the web"
-        skill.license = "MIT"
-        skill.category = "public"
-        skill.enabled = True
-
-        with patch("src.skills.loader.load_skills", return_value=[skill]):
-            result = client.get_skill("web-search")
-
-        assert result is not None
-        parsed = SkillResponse(**result)
-        assert parsed.name == "web-search"
-
-    def test_install_skill(self, client, tmp_path):
-        skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: my-skill\ndescription: A test skill\n---\nBody\n"
-        )
-
-        archive = tmp_path / "my-skill.skill"
-        with zipfile.ZipFile(archive, "w") as zf:
-            zf.write(skill_dir / "SKILL.md", "my-skill/SKILL.md")
-
-        custom_dir = tmp_path / "custom"
-        custom_dir.mkdir()
-        with patch("src.skills.loader.get_skills_root_path", return_value=tmp_path):
-            result = client.install_skill(archive)
-
-        parsed = SkillInstallResponse(**result)
-        assert parsed.success is True
-        assert parsed.skill_name == "my-skill"
-
-    def test_get_mcp_config(self, client):
-        server = MagicMock()
-        server.model_dump.return_value = {
-            "enabled": True,
-            "type": "stdio",
-            "command": "npx",
-            "args": ["-y", "server"],
-            "env": {},
-            "url": None,
-            "headers": {},
-            "description": "test server",
-        }
-        ext_config = MagicMock()
-        ext_config.mcp_servers = {"test": server}
-
-        with patch("src.client.get_extensions_config", return_value=ext_config):
-            result = client.get_mcp_config()
-
-        parsed = McpConfigResponse(**result)
-        assert "test" in parsed.mcp_servers
-
-    def test_update_mcp_config(self, client, tmp_path):
-        server = MagicMock()
-        server.model_dump.return_value = {
-            "enabled": True,
-            "type": "stdio",
-            "command": "npx",
-            "args": [],
-            "env": {},
-            "url": None,
-            "headers": {},
-            "description": "",
-        }
-        ext_config = MagicMock()
-        ext_config.mcp_servers = {"srv": server}
-        ext_config.skills = {}
-
-        config_file = tmp_path / "extensions_config.json"
-        config_file.write_text("{}")
-
-        with (
-            patch("src.client.get_extensions_config", return_value=ext_config),
-            patch("src.client.ExtensionsConfig.resolve_config_path", return_value=config_file),
-            patch("src.client.reload_extensions_config", return_value=ext_config),
-        ):
-            result = client.update_mcp_config({"srv": server.model_dump.return_value})
-
-        parsed = McpConfigResponse(**result)
-        assert "srv" in parsed.mcp_servers
-
-    def test_upload_files(self, client, tmp_path):
-        uploads_dir = tmp_path / "uploads"
-        uploads_dir.mkdir()
-
-        src_file = tmp_path / "hello.txt"
-        src_file.write_text("hello")
-
-        with patch.object(DeerFlowClient, "_get_uploads_dir", return_value=uploads_dir):
-            result = client.upload_files("t-conform", [src_file])
-
-        parsed = UploadResponse(**result)
-        assert parsed.success is True
-        assert len(parsed.files) == 1
-
-    def test_get_memory_config(self, client):
-        mem_cfg = MagicMock()
-        mem_cfg.enabled = True
-        mem_cfg.storage_path = ".deer-flow/memory.json"
-        mem_cfg.debounce_seconds = 30
-        mem_cfg.max_facts = 100
-        mem_cfg.fact_confidence_threshold = 0.7
-        mem_cfg.injection_enabled = True
-        mem_cfg.max_injection_tokens = 2000
-
-        with patch("src.config.memory_config.get_memory_config", return_value=mem_cfg):
-            result = client.get_memory_config()
-
-        parsed = MemoryConfigResponse(**result)
-        assert parsed.enabled is True
-        assert parsed.max_facts == 100
-
-    def test_get_memory_status(self, client):
-        mem_cfg = MagicMock()
-        mem_cfg.enabled = True
-        mem_cfg.storage_path = ".deer-flow/memory.json"
-        mem_cfg.debounce_seconds = 30
-        mem_cfg.max_facts = 100
-        mem_cfg.fact_confidence_threshold = 0.7
-        mem_cfg.injection_enabled = True
-        mem_cfg.max_injection_tokens = 2000
-
-        memory_data = {
-            "version": "1.0",
-            "lastUpdated": "",
-            "user": {
-                "workContext": {"summary": "", "updatedAt": ""},
-                "personalContext": {"summary": "", "updatedAt": ""},
-                "topOfMind": {"summary": "", "updatedAt": ""},
-            },
-            "history": {
-                "recentMonths": {"summary": "", "updatedAt": ""},
-                "earlierContext": {"summary": "", "updatedAt": ""},
-                "longTermBackground": {"summary": "", "updatedAt": ""},
-            },
-            "facts": [],
-        }
-
-        with (
-            patch("src.config.memory_config.get_memory_config", return_value=mem_cfg),
-            patch("src.agents.memory.updater.get_memory_data", return_value=memory_data),
-        ):
-            result = client.get_memory_status()
-
-        parsed = MemoryStatusResponse(**result)
-        assert parsed.config.enabled is True
-        assert parsed.data.version == "1.0"

@@ -1,6 +1,6 @@
 from typing import Annotated, NotRequired, TypedDict
 
-from deepagents.middleware.summarization import SummarizationState
+from langchain.agents import AgentState
 
 
 class SandboxState(TypedDict):
@@ -53,7 +53,7 @@ class SwarmContext(TypedDict):
     is_leader: NotRequired[bool]
 
 
-class ThreadState(SummarizationState):
+class ThreadState(AgentState):
     sandbox: NotRequired[SandboxState | None]
     thread_data: NotRequired[ThreadDataState | None]
     title: NotRequired[str | None]
@@ -62,3 +62,4 @@ class ThreadState(SummarizationState):
     uploaded_files: NotRequired[list[dict] | None]
     viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]  # image_path -> {base64, mime_type}
     swarm_context: NotRequired[SwarmContext | None]
+    summary_text: NotRequired[str | None]

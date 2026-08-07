@@ -16,7 +16,7 @@ export function getLangGraphBaseURL() {
     if (typeof window !== "undefined") {
       return `${window.location.origin}/api/langgraph`;
     }
-    // Fallback for SSR — Next.js rewrite proxies /api/langgraph to agent:2024
-    return "http://localhost:3000/api/langgraph";
+    // Fallback for SSR; local development uses the same-origin Next.js proxy.
+    return "http://localhost:7775/api/langgraph";
   }
 }

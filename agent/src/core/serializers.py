@@ -19,9 +19,19 @@ _SKIP_KEYS = frozenset({
 })
 
 
-def serialize_message(msg: AnyMessage) -> dict:
-    """Convert a LangChain message to a JSON-serializable dict."""
-    return msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+def serialize_message(msg: AnyMessage) -> dict | None:
+    """Convert a LangChain message to a JSON-serializable dict.
+
+    Returns ``None`` for values that are not message-like (e.g. bare strings
+    or other primitives that occasionally appear in stream chunks), since
+    ``dict()`` on those raises ``ValueError``/``TypeError``.
+    """
+    if hasattr(msg, "model_dump"):
+        return msg.model_dump()
+    if isinstance(msg, dict):
+        return msg
+    logger.debug("Skipping non-message stream chunk of type %s", type(msg).__name__)
+    return None
 
 
 def serialize_state_values(values: dict[str, Any] | None) -> dict[str, Any]:
@@ -35,7 +45,7 @@ def serialize_state_values(values: dict[str, Any] | None) -> dict[str, Any]:
             continue
         try:
             if k == "messages" and isinstance(v, list):
-                result[k] = [serialize_message(m) for m in v]
+                result[k] = [m for m in (serialize_message(msg) for msg in v) if m is not None]
             elif hasattr(v, "model_dump"):
                 result[k] = v.model_dump()
             else:

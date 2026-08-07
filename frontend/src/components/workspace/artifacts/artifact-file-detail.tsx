@@ -260,6 +260,52 @@ export function ArtifactFileDetail({
   );
 }
 
+/**
+ * Resolve an image `src` referenced inside a markdown artifact into a URL the
+ * browser can actually load.
+ *
+ * Markdown produced by the agent references images with sandbox-relative or
+ * virtual paths (e.g. `./charts/foo.png` or `/mnt/user-data/outputs/foo.png`).
+ * Without rewriting, the browser resolves these against the frontend page URL
+ * and gets a 404. We resolve them against the markdown file's directory and
+ * route them through the artifact API.
+ */
+function resolveMarkdownImageSrc(
+  src: string,
+  mdFilepath: string,
+  threadId: string,
+): string {
+  // Leave absolute URLs and data URIs untouched.
+  if (/^(https?:)?\/\//i.test(src) || src.startsWith("data:")) {
+    return src;
+  }
+
+  // Directory of the markdown file (filepath always starts with "/").
+  const dir = mdFilepath.slice(0, mdFilepath.lastIndexOf("/")) || "";
+
+  let resolved: string;
+  if (src.startsWith("/")) {
+    // Already an absolute sandbox/virtual path.
+    resolved = src;
+  } else {
+    // Resolve relative path (handles "./" and "../") against the md directory.
+    const stripped = src.replace(/^\.\//, "");
+    const segments = `${dir}/${stripped}`.split("/");
+    const out: string[] = [];
+    for (const seg of segments) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") {
+        out.pop();
+        continue;
+      }
+      out.push(seg);
+    }
+    resolved = `/${out.join("/")}`;
+  }
+
+  return urlOfArtifact({ filepath: resolved, threadId });
+}
+
 export function ArtifactFilePreview({
   filepath,
   threadId,
@@ -277,7 +323,20 @@ export function ArtifactFilePreview({
         <Streamdown
           className="size-full"
           {...streamdownPlugins}
-          components={{ a: CitationLink }}
+          components={{
+            a: CitationLink,
+            img: ({ src, ...props }) => (
+              // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+              <img
+                {...props}
+                src={
+                  typeof src === "string"
+                    ? resolveMarkdownImageSrc(src, filepath, threadId)
+                    : src
+                }
+              />
+            ),
+          }}
         >
           {content ?? ""}
         </Streamdown>

@@ -14,8 +14,8 @@ This document provides a comprehensive overview of the DeerFlow backend architec
 │                          Nginx (Port 2026)                               │
 │                    Unified Reverse Proxy Entry Point                      │
 │  ┌────────────────────────────────────────────────────────────────────┐  │
-│  │  /api/langgraph/*  →  LangGraph Server (2024)                      │  │
-│  │  /api/*            →  Gateway API (8001)                           │  │
+│  │  /api/langgraph/*  →  Selected Harness (7776)                      │  │
+│  │  /api/*            →  Gateway API (7777)                           │  │
 │  │  /*                →  Frontend (3000)                               │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────┬────────────────────────────────────────┘
@@ -24,8 +24,8 @@ This document provides a comprehensive overview of the DeerFlow backend architec
           │                       │                       │
           ▼                       ▼                       ▼
 ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-│   LangGraph Server  │ │    Gateway API      │ │     Frontend        │
-│     (Port 2024)     │ │    (Port 8001)      │ │    (Port 3000)      │
+│  Selected Harness   │ │    Gateway API      │ │     Frontend        │
+│     (Port 7776)     │ │    (Port 7777)      │ │    (Port 3000)      │
 │                     │ │                     │ │                     │
 │  - Agent Runtime    │ │  - Models API       │ │  - Next.js App      │
 │  - Thread Mgmt      │ │  - MCP Config       │ │  - React UI         │
@@ -79,7 +79,7 @@ The LangGraph server is the core agent runtime, built on LangGraph for robust mu
 
 FastAPI application providing REST endpoints for non-agent operations.
 
-**Entry Point**: `src/gateway/app.py`
+**Entry Point**: `gateway/src/nous_gateway/app.py` (sibling project)
 
 **Routers**:
 - `models.py` - `/api/models` - Model listing and details

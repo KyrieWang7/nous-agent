@@ -8,10 +8,10 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _client: httpx.Client | None = None
-_base_url: str = "http://localhost:8001"
+_base_url: str = "http://localhost:7777"
 
 
-def configure(base_url: str = "http://localhost:8001"):
+def configure(base_url: str = "http://localhost:7777"):
     """Configure the gateway client."""
     global _base_url, _client
     _base_url = base_url

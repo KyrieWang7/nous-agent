@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+.DS_Store
+
+agentd
+*.test
+*.log
+coverage.out
+
+config.yaml
+.nous-agent

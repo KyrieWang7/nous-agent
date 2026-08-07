@@ -186,6 +186,20 @@ def _extract_text(content: Any) -> str:
     return str(content)
 
 
+def _parse_update_data_from_response(content: Any) -> dict[str, Any] | None:
+    """Extract the first JSON object from plain, fenced, or wrapped LLM output."""
+    text = _extract_text(content).strip()
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _strip_upload_mentions_from_memory(memory_data: dict[str, Any]) -> dict[str, Any]:
     """Remove sentences about file uploads from all memory summaries and facts.
 
@@ -290,15 +304,9 @@ class MemoryUpdater:
             # Sync LLM call — safe for ThreadPoolExecutor
             model = self._get_model()
             response = model.invoke(prompt)
-            response_text = _extract_text(response.content).strip()
-
-            if response_text.startswith("```"):
-                lines = response_text.split("\n")
-                response_text = "\n".join(
-                    lines[1:-1] if lines[-1] == "```" else lines[1:]
-                )
-
-            update_data = json.loads(response_text)
+            update_data = _parse_update_data_from_response(response.content)
+            if update_data is None:
+                raise json.JSONDecodeError("no JSON object found", _extract_text(response.content), 0)
 
             updated_memory, facts_to_remove, new_facts = self._apply_updates(
                 current_memory, update_data, thread_id
@@ -361,15 +369,9 @@ class MemoryUpdater:
 
             model = self._get_model()
             response = model.invoke(prompt)
-            response_text = _extract_text(response.content).strip()
-
-            if response_text.startswith("```"):
-                lines = response_text.split("\n")
-                response_text = "\n".join(
-                    lines[1:-1] if lines[-1] == "```" else lines[1:]
-                )
-
-            update_data = json.loads(response_text)
+            update_data = _parse_update_data_from_response(response.content)
+            if update_data is None:
+                raise json.JSONDecodeError("no JSON object found", _extract_text(response.content), 0)
 
             updated_memory, facts_to_remove, new_facts = self._apply_updates(
                 current_memory, update_data, thread_id

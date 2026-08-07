@@ -9,9 +9,28 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_timestamp(value: Any) -> datetime | None:
+    """Coerce a created_at value into a tz-aware datetime for asyncpg.
+
+    asyncpg's binary protocol encodes parameters before the SQL `::timestamptz`
+    cast applies, so an ISO string raises DataError. Accept both datetimes and
+    ISO strings defensively; fall back to None (DB DEFAULT NOW()) on failure.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            logger.warning("Invalid created_at timestamp %r; using DB default", value)
+            return None
+    return None
 
 
 class RunEventStore(ABC):
@@ -174,7 +193,7 @@ class PostgresRunEventStore(RunEventStore):
                         e.get("category", "trace"),
                         json.dumps(e.get("content", {}), default=str, ensure_ascii=False),
                         json.dumps(e.get("metadata", {}), default=str, ensure_ascii=False),
-                        e.get("created_at"),
+                        _coerce_timestamp(e.get("created_at")),
                     )
                     for e in events
                 ],

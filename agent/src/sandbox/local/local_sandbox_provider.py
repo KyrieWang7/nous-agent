@@ -9,6 +9,11 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+from src.config.paths import (
+    ACP_VIRTUAL_PATH_PREFIX,
+    VIRTUAL_PATH_PREFIX,
+    get_paths,
+)
 from src.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from src.sandbox.sandbox import Sandbox
 from src.sandbox.sandbox_provider import SandboxProvider
@@ -139,11 +144,36 @@ class LocalSandboxProvider(SandboxProvider):
                 self._thread_sandboxes.move_to_end(thread_id)
                 return cached.id
 
-            # Build per-thread sandbox with base mappings
-            # Future: add per-thread path mappings (user-data, workspace, etc.)
+            # Build per-thread sandbox with base mappings + per-thread user-data
+            # mappings so that agent writes to /mnt/user-data/... land under
+            # {base_dir}/threads/{thread_id}/user-data/... on the host. Without
+            # this the gateway artifact endpoint cannot find the file because
+            # the agent ends up writing to the literal container path.
+            paths = get_paths()
+            try:
+                paths.ensure_thread_dirs(thread_id)
+            except ValueError as e:
+                # Defensive: thread_id may not match the safe regex. In that
+                # case fall back to the static mappings only.
+                logger.warning("ensure_thread_dirs(%s) failed: %s", thread_id, e)
+                per_thread_mappings: list[PathMapping] = []
+            else:
+                per_thread_mappings = [
+                    PathMapping(
+                        container_path=VIRTUAL_PATH_PREFIX,
+                        local_path=str(paths.sandbox_user_data_dir(thread_id)),
+                        read_only=False,
+                    ),
+                    PathMapping(
+                        container_path=ACP_VIRTUAL_PATH_PREFIX,
+                        local_path=str(paths.acp_workspace_dir(thread_id)),
+                        read_only=False,
+                    ),
+                ]
+
             sandbox = LocalSandbox(
                 f"local:{thread_id}",
-                path_mappings=list(self._path_mappings),
+                path_mappings=list(self._path_mappings) + per_thread_mappings,
             )
             self._thread_sandboxes[thread_id] = sandbox
             self._evict_if_over_capacity()
