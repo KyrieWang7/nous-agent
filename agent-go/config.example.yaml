@@ -2,6 +2,8 @@ server:
   address: ":7776"
 
 default_model: deepseek-v4-flash
+# Setting both TUYOO_BASE_URL and TUYOO_API_KEY routes every
+# openai-compatible model below through that gateway without editing this file.
 models:
   - name: deepseek-v4-flash
     display_name: DeepSeek V4 Flash
@@ -11,9 +13,19 @@ models:
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY
     max_tokens: 8192
+    temperature: 0.7
     context_length: 128000
     timeout: 120
     supports_thinking: true
+    # Optional integer micro-currency rates per one million tokens.
+    # pricing:
+    #   input_per_million_micros: 0
+    #   output_per_million_micros: 0
+    #   cached_input_per_million_micros: 0
+    when_thinking_enabled:
+      extra_body:
+        thinking:
+          type: enabled
 
   - name: MiniMax-M2.7-highspeed
     display_name: MiniMax M2.7 Highspeed
@@ -22,6 +34,7 @@ models:
     base_url: https://api.minimax.chat/v1
     api_key: $MINIMAX_API_KEY
     max_tokens: 8192
+    temperature: 0.7
     context_length: 128000
     timeout: 120
     supports_thinking: true
@@ -32,6 +45,7 @@ models:
     model: gpt-4o
     api_key: $OPENAI_API_KEY
     max_tokens: 4096
+    temperature: 0.7
     context_length: 128000
     timeout: 120
     supports_vision: true
@@ -43,18 +57,70 @@ models:
     base_url: https://api.deepseek.com
     api_key: $DEEPSEEK_API_KEY
     max_tokens: 8192
+    temperature: 0.7
     context_length: 128000
     timeout: 120
     supports_thinking: true
+    when_thinking_enabled:
+      extra_body:
+        thinking:
+          type: enabled
 
 sandbox:
   enabled: true
   provider: local
   base_dir: ./.nous-agent/workspaces
   exec_timeout: 30s
+  # Use a remote or Kubernetes-backed sandbox service instead:
+  # provider: remote
+  # remote_url: https://sandbox.internal
+  # remote_headers:
+  #   Authorization: Bearer $SANDBOX_TOKEN
 
 permissions:
   mode: workspace_write
+
+# Python-compatible community tool declarations. Search and image search use
+# Tavily; web_fetch uses Jina Reader. Empty keys fall back to the matching
+# TAVILY_API_KEY / JINA_API_KEY environment variables.
+tool_groups:
+  - name: web
+
+tools:
+  - name: web_search
+    group: web
+    use: src.community.tavily.tools:web_search_tool
+    api_key: $TAVILY_API_KEY
+    max_results: 5
+    timeout: 30s
+  - name: web_fetch
+    group: web
+    use: src.community.jina_ai.tools:web_fetch_tool
+    api_key: $JINA_API_KEY
+    timeout: 10s
+  - name: image_search
+    group: web
+    use: src.community.image_search.tools:image_search_tool
+    api_key: $TAVILY_API_KEY
+    max_results: 5
+    timeout: 30s
+
+plugins:
+  enabled: true
+  directories:
+    - ~/.deerflow/plugins
+    - .deerflow/plugins
+  # plugin.json requiredPermission is a minimum run permission. It never
+  # elevates a run; omitted values default to danger_full_access.
+
+# Optional ACP v1 subprocess agents. The Go Harness performs the native
+# initialize/session/new/session/prompt JSON-RPC flow.
+# acp_agents:
+#   codex:
+#     command: npx
+#     args: ["-y", "@zed-industries/codex-acp"]
+#     description: External coding agent
+#     auto_approve_permissions: false
 
 skills:
   enabled: true
@@ -63,7 +129,15 @@ skills:
 subagents:
   enabled: true
   max_concurrent: 3
+  max_turns: 50
   task_ttl: 24h
+  timeout: 15m
+  # Optional per-profile deadlines; omitted profiles inherit timeout.
+  # agents:
+  #   explore:
+  #     timeout: 5m
+  #   verification:
+  #     timeout: 10m
 
 extensions:
   mcp_servers: {}
@@ -71,7 +145,7 @@ extensions:
   #   enabled: true
   #   type: stdio
   #   command: npx
-  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/mnt/user-data"]
 
 memory:
   enabled: false
@@ -86,6 +160,9 @@ title:
 
 swarm:
   enabled: false
+  max_team_size: 5
+  message_poll_interval: 2s
+  teammate_timeout: 15m
   poll_limit: 50
 
 summarization:
@@ -116,6 +193,8 @@ loop:
   deadline: 30m
   tool_concurrency: 4
   token_budget: 100000
+  # Optional hard cost ceiling in integer micro-units for the whole run.
+  cost_budget_micros: 0
   middleware_timeout: 30s
 
 runtime:

@@ -40,7 +40,7 @@ func publishRuntime(ctx context.Context, st *middleware.State, typ runtime.Event
 	if !ok {
 		return
 	}
-	event := runtime.MustEvent(run.RunID, run.ThreadID, typ, data)
+	event := runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, typ, data)
 	if run.Publish != nil {
 		run.Publish(ctx, event)
 	} else if run.Bus != nil {

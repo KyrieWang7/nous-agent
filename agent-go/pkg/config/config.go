@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/hooks"
@@ -18,47 +19,73 @@ import (
 )
 
 type Config struct {
-	Server        ServerConfig        `yaml:"server"`
-	Models        []ModelConfig       `yaml:"models"`
-	DefaultModel  string              `yaml:"default_model"`
-	Sandbox       SandboxConfig       `yaml:"sandbox"`
-	Permissions   PermissionConfig    `yaml:"permissions"`
-	Loop          LoopConfig          `yaml:"loop"`
-	Runtime       RuntimeConfig       `yaml:"runtime"`
-	Skills        SkillsConfig        `yaml:"skills"`
-	Subagents     SubagentConfig      `yaml:"subagents"`
-	Extensions    ExtensionsConfig    `yaml:"extensions"`
-	Memory        MemoryConfig        `yaml:"memory"`
-	Title         TitleConfig         `yaml:"title"`
-	Swarm         SwarmConfig         `yaml:"swarm"`
-	Summarization SummarizationConfig `yaml:"summarization"`
-	Guardrails    GuardrailsConfig    `yaml:"guardrails"`
-	Hooks         []HookConfig        `yaml:"hooks"`
+	Server        ServerConfig              `yaml:"server"`
+	Models        []ModelConfig             `yaml:"models"`
+	DefaultModel  string                    `yaml:"default_model"`
+	Sandbox       SandboxConfig             `yaml:"sandbox"`
+	Permissions   PermissionConfig          `yaml:"permissions"`
+	Loop          LoopConfig                `yaml:"loop"`
+	Runtime       RuntimeConfig             `yaml:"runtime"`
+	Skills        SkillsConfig              `yaml:"skills"`
+	Subagents     SubagentConfig            `yaml:"subagents"`
+	ToolGroups    []ToolGroupConfig         `yaml:"tool_groups"`
+	Tools         []ToolConfig              `yaml:"tools"`
+	Plugins       PluginsConfig             `yaml:"plugins"`
+	ACPAgents     map[string]ACPAgentConfig `yaml:"acp_agents"`
+	Extensions    ExtensionsConfig          `yaml:"extensions"`
+	Memory        MemoryConfig              `yaml:"memory"`
+	Title         TitleConfig               `yaml:"title"`
+	Swarm         SwarmConfig               `yaml:"swarm"`
+	Summarization SummarizationConfig       `yaml:"summarization"`
+	Guardrails    GuardrailsConfig          `yaml:"guardrails"`
+	Hooks         []HookConfig              `yaml:"hooks"`
 }
 
 type ServerConfig struct {
 	Address string `yaml:"address"`
 }
 type ModelConfig struct {
-	Name             string         `yaml:"name"`
-	DisplayName      string         `yaml:"display_name"`
-	Description      string         `yaml:"description"`
-	Provider         string         `yaml:"provider"`
-	Model            string         `yaml:"model"`
-	BaseURL          string         `yaml:"base_url"`
-	APIKey           string         `yaml:"api_key"`
-	MaxTokens        int            `yaml:"max_tokens"`
-	ContextLength    int            `yaml:"context_length"`
-	Timeout          int            `yaml:"timeout"`
-	SupportsThinking bool           `yaml:"supports_thinking"`
-	SupportsVision   bool           `yaml:"supports_vision"`
-	ExtraBody        map[string]any `yaml:"extra_body"`
+	Name                    string               `yaml:"name"`
+	DisplayName             string               `yaml:"display_name"`
+	Description             string               `yaml:"description"`
+	Provider                string               `yaml:"provider"`
+	Model                   string               `yaml:"model"`
+	BaseURL                 string               `yaml:"base_url"`
+	APIKey                  string               `yaml:"api_key"`
+	MaxTokens               int                  `yaml:"max_tokens"`
+	Temperature             *float64             `yaml:"temperature"`
+	ContextLength           int                  `yaml:"context_length"`
+	Timeout                 int                  `yaml:"timeout"`
+	SupportsThinking        bool                 `yaml:"supports_thinking"`
+	SupportsReasoningEffort bool                 `yaml:"supports_reasoning_effort"`
+	SupportsVision          bool                 `yaml:"supports_vision"`
+	ExtraBody               map[string]any       `yaml:"extra_body"`
+	WhenThinkingEnabled     *ModelThinkingConfig `yaml:"when_thinking_enabled"`
+	Pricing                 ModelPricingConfig   `yaml:"pricing"`
+}
+
+// ModelThinkingConfig contains provider options that only apply when a run
+// explicitly enables thinking. Keeping this separate prevents vendor-specific
+// fields from leaking into ordinary requests.
+type ModelThinkingConfig struct {
+	ExtraBody map[string]any `yaml:"extra_body"`
+}
+
+// ModelPricingConfig stores integer micro-currency rates per million tokens.
+// A zero-valued config keeps cost accounting disabled for that model while
+// token accounting remains active.
+type ModelPricingConfig struct {
+	InputPerMillionMicros       int64 `yaml:"input_per_million_micros"`
+	OutputPerMillionMicros      int64 `yaml:"output_per_million_micros"`
+	CachedInputPerMillionMicros int64 `yaml:"cached_input_per_million_micros"`
 }
 type SandboxConfig struct {
-	Enabled     bool          `yaml:"enabled"`
-	Provider    string        `yaml:"provider"`
-	BaseDir     string        `yaml:"base_dir"`
-	ExecTimeout time.Duration `yaml:"exec_timeout"`
+	Enabled       bool              `yaml:"enabled"`
+	Provider      string            `yaml:"provider"`
+	BaseDir       string            `yaml:"base_dir"`
+	ExecTimeout   time.Duration     `yaml:"exec_timeout"`
+	RemoteURL     string            `yaml:"remote_url"`
+	RemoteHeaders map[string]string `yaml:"remote_headers"`
 }
 type PermissionConfig struct {
 	Mode          permission.Mode            `yaml:"mode"`
@@ -70,6 +97,7 @@ type LoopConfig struct {
 	Deadline             time.Duration `yaml:"deadline"`
 	ToolConcurrency      int           `yaml:"tool_concurrency"`
 	TokenBudget          int           `yaml:"token_budget"`
+	CostBudgetMicros     int64         `yaml:"cost_budget_micros"`
 	MiddlewareTimeout    time.Duration `yaml:"middleware_timeout"`
 }
 type RuntimeConfig struct {
@@ -86,13 +114,43 @@ type SkillsConfig struct {
 	Disabled []string `yaml:"-"`
 }
 type SubagentConfig struct {
-	Enabled       bool          `yaml:"enabled"`
-	MaxConcurrent int           `yaml:"max_concurrent"`
-	TaskTTL       time.Duration `yaml:"task_ttl"`
+	Enabled       bool                             `yaml:"enabled"`
+	MaxConcurrent int                              `yaml:"max_concurrent"`
+	MaxTurns      int                              `yaml:"max_turns"`
+	TaskTTL       time.Duration                    `yaml:"task_ttl"`
+	Timeout       time.Duration                    `yaml:"timeout"`
+	Agents        map[string]SubagentProfileConfig `yaml:"agents"`
+}
+type SubagentProfileConfig struct {
+	Timeout time.Duration `yaml:"timeout"`
+}
+type ToolGroupConfig struct {
+	Name string `yaml:"name"`
+}
+type ToolConfig struct {
+	Name       string        `yaml:"name"`
+	Group      string        `yaml:"group"`
+	Use        string        `yaml:"use"`
+	APIKey     string        `yaml:"api_key"`
+	MaxResults int           `yaml:"max_results"`
+	Timeout    time.Duration `yaml:"timeout"`
+}
+type PluginsConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	Directories []string `yaml:"directories"`
+}
+type ACPAgentConfig struct {
+	Command                string            `yaml:"command"`
+	Args                   []string          `yaml:"args"`
+	Env                    map[string]string `yaml:"env"`
+	Description            string            `yaml:"description"`
+	Model                  string            `yaml:"model"`
+	AutoApprovePermissions bool              `yaml:"auto_approve_permissions"`
 }
 type ExtensionsConfig struct {
 	MCPServers map[string]MCPServerConfig `yaml:"mcp_servers"`
 }
+
 type MCPServerConfig struct {
 	Enabled bool              `yaml:"enabled"`
 	Type    string            `yaml:"type"`
@@ -115,8 +173,11 @@ type TitleConfig struct {
 	MaxChars int  `yaml:"max_chars"`
 }
 type SwarmConfig struct {
-	Enabled   bool `yaml:"enabled"`
-	PollLimit int  `yaml:"poll_limit"`
+	Enabled             bool          `yaml:"enabled"`
+	MaxTeamSize         int           `yaml:"max_team_size"`
+	MessagePollInterval time.Duration `yaml:"message_poll_interval"`
+	TeammateTimeout     time.Duration `yaml:"teammate_timeout"`
+	PollLimit           int           `yaml:"poll_limit"`
 }
 type SummarizationConfig struct {
 	Enabled          bool `yaml:"enabled"`
@@ -149,10 +210,10 @@ func Defaults() Config {
 		Permissions:   PermissionConfig{Mode: permission.ModeWorkspaceWrite},
 		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, MiddlewareTimeout: 30 * time.Second},
 		Runtime:       RuntimeConfig{EventBufferSize: 500, EventTTL: 24 * time.Hour, HeartbeatInterval: 15 * time.Second},
-		Subagents:     SubagentConfig{Enabled: true, MaxConcurrent: 3, TaskTTL: 24 * time.Hour},
+		Subagents:     SubagentConfig{Enabled: true, MaxConcurrent: 3, MaxTurns: 50, TaskTTL: 24 * time.Hour, Timeout: 15 * time.Minute},
 		Memory:        MemoryConfig{MaxFacts: 50, ConfidenceThreshold: .7, InjectionTokens: 1000},
 		Title:         TitleConfig{Enabled: true, MaxWords: 8, MaxChars: 80},
-		Swarm:         SwarmConfig{PollLimit: 50},
+		Swarm:         SwarmConfig{MaxTeamSize: 5, MessagePollInterval: 2 * time.Second, TeammateTimeout: 15 * time.Minute, PollLimit: 50},
 		Summarization: SummarizationConfig{Enabled: true, KeepMessages: 10, MaxSummaryTokens: 1024, MaxInputMessages: 200, MaxInputChars: 120_000},
 		Guardrails:    GuardrailsConfig{FailClosed: true, Input: true, Output: true},
 	}
@@ -175,14 +236,16 @@ func Load(path string) (Config, error) {
 	if err := applyExtensions(&cfg, os.Getenv("NOUS_EXTENSIONS_CONFIG_PATH")); err != nil {
 		return Config{}, err
 	}
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate([]string{"openai-compatible", "anthropic"}); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-func applyEnv(c *Config) {
+func applyEnv(c *Config) error {
 	if v := os.Getenv("NOUS_AGENT_ADDR"); v != "" {
 		c.Server.Address = v
 	}
@@ -195,6 +258,22 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("NOUS_SKILLS_PATH"); v != "" {
 		c.Skills.Path = v
 	}
+
+	gatewayBaseURL := strings.TrimSpace(os.Getenv("TUYOO_BASE_URL"))
+	gatewayAPIKey := strings.TrimSpace(os.Getenv("TUYOO_API_KEY"))
+	if (gatewayBaseURL == "") != (gatewayAPIKey == "") {
+		return errors.New("config: TUYOO_BASE_URL and TUYOO_API_KEY must be set together")
+	}
+	if gatewayBaseURL != "" {
+		for index := range c.Models {
+			if c.Models[index].Provider != "openai-compatible" {
+				continue
+			}
+			c.Models[index].BaseURL = gatewayBaseURL
+			c.Models[index].APIKey = gatewayAPIKey
+		}
+	}
+	return nil
 }
 
 func applyExtensions(c *Config, path string) error {
@@ -249,6 +328,9 @@ func (c *Config) Validate(providers []string) error {
 		if !slices.Contains(providers, m.Provider) {
 			return fmt.Errorf("config: unknown provider %q for model %q; available: %v", m.Provider, m.Name, providers)
 		}
+		if m.Pricing.InputPerMillionMicros < 0 || m.Pricing.OutputPerMillionMicros < 0 || m.Pricing.CachedInputPerMillionMicros < 0 {
+			return fmt.Errorf("config: model %q pricing cannot be negative", m.Name)
+		}
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = c.Models[0].Name
@@ -258,8 +340,85 @@ func (c *Config) Validate(providers []string) error {
 	if c.Permissions.Mode != "" && !c.Permissions.Mode.Valid() {
 		return fmt.Errorf("config: invalid permission mode %q", c.Permissions.Mode)
 	}
-	if c.Sandbox.Enabled && c.Sandbox.Provider != "local" && c.Sandbox.Provider != "docker" {
-		return fmt.Errorf("config: unsupported sandbox provider %q; available: [local docker]", c.Sandbox.Provider)
+	if c.Loop.TokenBudget < 0 || c.Loop.CostBudgetMicros < 0 {
+		return errors.New("config: loop token_budget and cost_budget_micros cannot be negative")
+	}
+	if c.Sandbox.Enabled && c.Sandbox.Provider != "local" && c.Sandbox.Provider != "docker" && c.Sandbox.Provider != "remote" {
+		return fmt.Errorf("config: unsupported sandbox provider %q; available: [local docker remote]", c.Sandbox.Provider)
+	}
+	if c.Sandbox.Enabled && c.Sandbox.Provider == "remote" && strings.TrimSpace(c.Sandbox.RemoteURL) == "" {
+		return errors.New("config: sandbox.remote_url is required for the remote provider")
+	}
+	groups := make(map[string]struct{}, len(c.ToolGroups))
+	for i, group := range c.ToolGroups {
+		name := strings.TrimSpace(group.Name)
+		if name == "" {
+			return fmt.Errorf("config: tool_groups[%d] requires name", i)
+		}
+		if _, exists := groups[name]; exists {
+			return fmt.Errorf("config: duplicate tool group %q", name)
+		}
+		groups[name] = struct{}{}
+	}
+	toolNames := make(map[string]struct{}, len(c.Tools))
+	for i, configuredTool := range c.Tools {
+		name := strings.TrimSpace(configuredTool.Name)
+		if name == "" {
+			return fmt.Errorf("config: tools[%d] requires name", i)
+		}
+		if _, exists := toolNames[name]; exists {
+			return fmt.Errorf("config: duplicate tool %q", name)
+		}
+		toolNames[name] = struct{}{}
+		if configuredTool.Group != "" {
+			if _, exists := groups[configuredTool.Group]; !exists {
+				return fmt.Errorf("config: tool %q references unknown group %q", name, configuredTool.Group)
+			}
+		}
+	}
+	if c.Plugins.Enabled && len(c.Plugins.Directories) == 0 {
+		return errors.New("config: plugins.directories is required when plugins are enabled")
+	}
+	for name, agent := range c.ACPAgents {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(agent.Command) == "" || strings.TrimSpace(agent.Description) == "" {
+			return fmt.Errorf("config: ACP agent %q requires name, command and description", name)
+		}
+	}
+	if c.Subagents.MaxConcurrent <= 0 || c.Subagents.MaxConcurrent > 4 {
+		return errors.New("config: subagents.max_concurrent must be between 1 and 4")
+	}
+	if c.Subagents.MaxTurns <= 0 || c.Subagents.MaxTurns > 100 {
+		return errors.New("config: subagents.max_turns must be between 1 and 100")
+	}
+	if c.Subagents.TaskTTL <= 0 {
+		return errors.New("config: subagents.task_ttl must be greater than zero")
+	}
+	if c.Subagents.Timeout <= 0 {
+		return errors.New("config: subagents.timeout must be greater than zero")
+	}
+	knownSubagents := []string{"bash", "explore", "general-purpose", "plan", "verification"}
+	for name, profile := range c.Subagents.Agents {
+		if !slices.Contains(knownSubagents, name) {
+			return fmt.Errorf("config: unknown subagent profile %q; available: %v", name, knownSubagents)
+		}
+		if profile.Timeout < 0 {
+			return fmt.Errorf("config: subagents.agents.%s.timeout cannot be negative", name)
+		}
+	}
+	if c.Swarm.MaxTeamSize < 2 {
+		return errors.New("config: swarm.max_team_size must be at least 2")
+	}
+	if c.Swarm.MessagePollInterval <= 0 {
+		return errors.New("config: swarm.message_poll_interval must be greater than zero")
+	}
+	if c.Swarm.TeammateTimeout <= 0 {
+		return errors.New("config: swarm.teammate_timeout must be greater than zero")
+	}
+	if c.Swarm.PollLimit <= 0 {
+		return errors.New("config: swarm.poll_limit must be greater than zero")
+	}
+	if c.Swarm.Enabled && strings.TrimSpace(c.Runtime.DatabaseURL) == "" {
+		return errors.New("config: swarm.enabled requires runtime.database_url")
 	}
 	for name, server := range c.Extensions.MCPServers {
 		if !server.Enabled {
@@ -300,6 +459,15 @@ func (c *Config) Validate(providers []string) error {
 		}
 	}
 	return nil
+}
+
+// TimeoutFor returns the trusted execution deadline for one built-in profile.
+// A missing or zero-valued profile override inherits the global deadline.
+func (c SubagentConfig) TimeoutFor(name string) time.Duration {
+	if profile, ok := c.Agents[strings.TrimSpace(name)]; ok && profile.Timeout > 0 {
+		return profile.Timeout
+	}
+	return c.Timeout
 }
 
 func (c Config) SelectedModel() (ModelConfig, error) {

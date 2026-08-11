@@ -28,6 +28,8 @@ function displayStatusFor(
   if (explicit) return explicit;
 
   if (member.status === "removed") return "completed";
+  if (member.status === "completed") return "completed";
+  if (member.status === "failed") return "failed";
   if (member.status === "running") return "running";
   if (member.status === "active") return "active";
   return "waiting";

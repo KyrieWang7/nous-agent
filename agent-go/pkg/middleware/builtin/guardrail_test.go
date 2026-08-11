@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/guardrail"
@@ -45,6 +46,23 @@ func TestGuardrailOutputRewritesTranscript(t *testing.T) {
 	}
 }
 
+func TestGuardrailUsesActionWhenProviderOmitsRiskLevel(t *testing.T) {
+	evaluator, err := guardrail.New(guardrail.ProviderFunc(func(context.Context, guardrail.Direction, string) (guardrail.Decision, error) {
+		return guardrail.Decision{Action: guardrail.ActionBlock, Replacement: "blocked"}, nil
+	}), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := middleware.NewState(middleware.StateInit{History: message.NewHistory()})
+	st.ModelOutput = &model.Response{Message: message.Message{Role: message.RoleAssistant, Content: "unsafe"}}
+	if err := NewGuardrailOutput(evaluator).AfterModel(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if st.RiskLevel != "block" {
+		t.Fatalf("risk level = %q, want block", st.RiskLevel)
+	}
+}
+
 func TestGuardrailOutputPublishesReplacementAfterStreaming(t *testing.T) {
 	h := message.NewHistory()
 	h.Append(message.Message{Role: message.RoleAssistant, Content: "unsafe"})
@@ -71,5 +89,12 @@ func TestGuardrailOutputPublishesReplacementAfterStreaming(t *testing.T) {
 	}
 	if len(events) != 2 || events[0].Type != runtime.EventGuardrailBlock || events[1].Type != runtime.EventMessageReplace {
 		t.Fatalf("events = %#v", events)
+	}
+	var replacement runtime.MessageReplace
+	if err := json.Unmarshal(events[1].Data, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.MessageID != "run-1:0" {
+		t.Fatalf("replacement message_id = %q", replacement.MessageID)
 	}
 }

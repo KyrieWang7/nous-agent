@@ -13,6 +13,18 @@ class LangGraphAPI {
   }
 
   readonly threads = {
+    create: async (threadId: string): Promise<void> => {
+      const res = await authFetch(`${this.baseUrl}/threads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          thread_id: threadId,
+          if_exists: "do_nothing",
+        }),
+      });
+      if (!res.ok) throw new Error(`create thread failed: ${res.status}`);
+    },
+
     getState: async <V = Record<string, unknown>>(
       threadId: string,
     ): Promise<ThreadState<V>> => {

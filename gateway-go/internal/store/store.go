@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -57,7 +60,14 @@ type Message struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-type Store struct{ pool *pgxpool.Pool }
+type database interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Close()
+}
+
+type Store struct{ pool database }
 
 func Open(ctx context.Context, url string) (*Store, error) {
 	if url == "" {
@@ -202,7 +212,7 @@ func (s *Store) Teams(ctx context.Context, threadID string) ([]Team, error) {
 	if !s.Available() {
 		return []Team{}, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,name,NULL::text,created_at FROM agent_swarm_teams WHERE lead_thread_id=$1 ORDER BY created_at DESC`, threadID)
+	rows, err := s.pool.Query(ctx, `SELECT id,name,description,created_at FROM agent_swarm_teams WHERE lead_thread_id=$1 ORDER BY created_at DESC`, threadID)
 	if err != nil {
 		return nil, err
 	}
@@ -210,19 +220,32 @@ func (s *Store) Teams(ctx context.Context, threadID string) ([]Team, error) {
 	out := make([]Team, 0)
 	for rows.Next() {
 		var item Team
-		if err := rows.Scan(&item.ID, &item.Name, &item.Description, &item.CreatedAt); err != nil {
+		var description sql.NullString
+		if err := rows.Scan(&item.ID, &item.Name, &description, &item.CreatedAt); err != nil {
 			return nil, err
 		}
+		item.Description = optionalString(description)
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) TeamExists(ctx context.Context, teamID string) (bool, error) {
+	if !s.Available() {
+		return false, nil
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_swarm_teams WHERE id=$1)`, teamID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (s *Store) Members(ctx context.Context, teamID string) ([]Member, error) {
 	if !s.Available() {
 		return []Member{}, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT name,status,NULL::text,NULL::timestamptz FROM agent_swarm_team_members WHERE team_id=$1 ORDER BY name`, teamID)
+	rows, err := s.pool.Query(ctx, `SELECT name,status,model,joined_at FROM agent_swarm_team_members WHERE team_id=$1 ORDER BY joined_at,name`, teamID)
 	if err != nil {
 		return nil, err
 	}
@@ -230,9 +253,13 @@ func (s *Store) Members(ctx context.Context, teamID string) ([]Member, error) {
 	out := make([]Member, 0)
 	for rows.Next() {
 		var item Member
-		if err := rows.Scan(&item.Name, &item.Status, &item.Model, &item.JoinedAt); err != nil {
+		var model sql.NullString
+		var joinedAt sql.NullTime
+		if err := rows.Scan(&item.Name, &item.Status, &model, &joinedAt); err != nil {
 			return nil, err
 		}
+		item.Model = optionalString(model)
+		item.JoinedAt = optionalTime(joinedAt)
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -267,4 +294,18 @@ func value(pointer *string) string {
 
 func boolValue(pointer *bool) bool {
 	return pointer != nil && *pointer
+}
+
+func optionalString(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
+}
+
+func optionalTime(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	return &value.Time
 }

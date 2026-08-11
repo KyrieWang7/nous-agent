@@ -15,7 +15,7 @@ func NewTokenUsage() *TokenUsage           { return &TokenUsage{} }
 func (TokenUsage) Name() string            { return NameTokenUsage }
 func (TokenUsage) Grade() middleware.Grade { return middleware.GradeListener }
 func (TokenUsage) AfterModel(ctx context.Context, st *middleware.State) error {
-	if st.ModelOutput == nil {
+	if st.ModelOutput == nil || st.UsageRecorded {
 		return nil
 	}
 	run, ok := runtime.RunContextFrom(ctx)

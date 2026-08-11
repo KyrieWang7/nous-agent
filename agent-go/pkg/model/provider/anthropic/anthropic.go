@@ -23,6 +23,7 @@ type Client struct {
 	http                     *http.Client
 	baseURL, apiKey, modelID string
 	maxTokens                int
+	temperature              *float64
 	info                     model.Info
 }
 
@@ -46,7 +47,22 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 	if ctxLen <= 0 {
 		ctxLen = 200000
 	}
-	return &Client{http: &http.Client{Timeout: timeout}, baseURL: base, apiKey: cfg.APIKey, modelID: cfg.Model, maxTokens: max, info: model.Info{Name: cfg.Name, ContextLength: ctxLen, MaxOutputTokens: max, SupportsThinking: cfg.SupportsThinking, SupportsVision: cfg.SupportsVision, SupportsTools: true}}, nil
+	return &Client{
+		http:        &http.Client{Timeout: timeout},
+		baseURL:     base,
+		apiKey:      cfg.APIKey,
+		modelID:     cfg.Model,
+		maxTokens:   max,
+		temperature: cfg.Temperature,
+		info: model.Info{
+			Name:             cfg.Name,
+			ContextLength:    ctxLen,
+			MaxOutputTokens:  max,
+			SupportsThinking: cfg.SupportsThinking,
+			SupportsVision:   cfg.SupportsVision,
+			SupportsTools:    true,
+		},
+	}, nil
 }
 func (c *Client) Info() model.Info { return c.info }
 func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Response, error) {
@@ -77,6 +93,13 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 }
 func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
 	payload := map[string]any{"model": c.modelID, "max_tokens": c.maxTokens, "messages": wireMessages(req.Messages), "stream": stream}
+	temperature := req.Temperature
+	if temperature == nil {
+		temperature = c.temperature
+	}
+	if temperature != nil {
+		payload["temperature"] = *temperature
+	}
 	if req.System != "" {
 		if req.EnablePromptCache {
 			payload["system"] = []any{map[string]any{"type": "text", "text": req.System, "cache_control": map[string]string{"type": "ephemeral"}}}

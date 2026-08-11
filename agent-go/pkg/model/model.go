@@ -86,12 +86,13 @@ type Response struct {
 
 // Info 描述模型能力。中间件据此决定是否生效（如 ViewImage 只在 SupportsVision 时挂载）。
 type Info struct {
-	Name             string
-	ContextLength    int
-	MaxOutputTokens  int
-	SupportsThinking bool
-	SupportsVision   bool
-	SupportsTools    bool
+	Name                    string
+	ContextLength           int
+	MaxOutputTokens         int
+	SupportsThinking        bool
+	SupportsReasoningEffort bool
+	SupportsVision          bool
+	SupportsTools           bool
 }
 
 // Model 是唯一的模型抽象。
@@ -112,7 +113,13 @@ type ProviderConfig struct {
 	Temperature      *float64
 	ContextLength    int
 	SupportsThinking bool
-	SupportsVision   bool
-	ExtraBody        map[string]any
-	Timeout          int // 秒
+	// SupportsReasoningEffort allows the per-run reasoning_effort option to be
+	// forwarded in ExtraBody. Providers that do not implement it leave this false.
+	SupportsReasoningEffort bool
+	SupportsVision          bool
+	ExtraBody               map[string]any
+	// ThinkingExtraBody is merged only for requests whose Thinking flag is true.
+	// It is interpreted by OpenAI-compatible providers; native providers ignore it.
+	ThinkingExtraBody map[string]any
+	Timeout           int // 秒
 }

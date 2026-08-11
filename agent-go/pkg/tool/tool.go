@@ -15,8 +15,18 @@ import (
 
 // Metadata 描述工具的执行特征。并发分段与权限判定都读它（设计文档 §7.1、§7.2）。
 type Metadata struct {
+	// RequiredPermission is an optional minimum permission mode. It is kept as
+	// a string so tool remains independent of pkg/permission.
+	RequiredPermission string
+
 	// IsReadOnly 表示该工具不修改任何状态。
 	IsReadOnly bool
+
+	// IsAgentState marks orchestration state owned by the Harness itself (for
+	// example task and Swarm lifecycle records). These writes do not escape to
+	// the user's filesystem, so workspace_write may allow them without treating
+	// arbitrary external side effects as workspace changes.
+	IsAgentState bool
 
 	// IsConcurrencySafe 表示多个实例可同时执行而互不干扰。
 	//
@@ -58,6 +68,11 @@ type Result struct {
 	ContentBlocks []message.ContentBlock
 	IsError       bool
 	Artifacts     []Artifact
+	// AdditionalKwargs is persisted alongside the tool message and projected
+	// unchanged to the LangGraph-compatible wire format. It is intentionally
+	// generic because provider/UI contracts (for example the subagent status
+	// contract) should not make the tool package depend on a specific consumer.
+	AdditionalKwargs map[string]any
 }
 
 // Handler 执行一次工具调用。
@@ -96,7 +111,7 @@ func (d Definition) ModelSchema() model.ToolSchema {
 
 // Concurrent 报告该工具是否可与同类并发执行。
 func (d Definition) Concurrent() bool {
-	return d.Metadata.IsReadOnly && d.Metadata.IsConcurrencySafe
+	return d.Metadata.IsConcurrencySafe && (d.Metadata.IsReadOnly || d.Metadata.IsAgentState)
 }
 
 // Decision 是 BeforeTool 拦截的结果。

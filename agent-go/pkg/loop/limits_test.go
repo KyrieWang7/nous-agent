@@ -89,6 +89,21 @@ func TestLimits_ZeroCostCeilingIsUnbounded(t *testing.T) {
 	}
 }
 
+func TestLimits_TokenBudgetUsesAggregateSpend(t *testing.T) {
+	t.Parallel()
+
+	tr := loop.Limits{MaxTokens: 100}.NewTracker()
+	tr.ObserveSpend(99, 0)
+	if err := tr.Check(1); err != nil {
+		t.Fatalf("Check() below token budget = %v", err)
+	}
+
+	tr.ObserveSpend(100, 0)
+	if err := tr.Check(2); !errors.Is(err, loop.ErrBudgetExhausted) {
+		t.Fatalf("Check() at token budget = %v, want ErrBudgetExhausted", err)
+	}
+}
+
 func TestLimits_CostAccumulates(t *testing.T) {
 	t.Parallel()
 

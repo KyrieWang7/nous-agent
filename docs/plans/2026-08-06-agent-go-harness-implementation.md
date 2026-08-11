@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 在 `agent-go/` 从零构建生产级 Go Agent Harness 库：自持 `for` 循环内核 + 四阶段中间件链 + LangGraph 兼容 HTTP/SSE 适配器，使现有 Next.js 前端零改动切换到 Go 实现。
+**Goal:** 在 `agent-go/` 从零构建生产级 Go Agent Harness 库：自持 `for` 循环内核 + 四阶段中间件链 + LangGraph 兼容 HTTP/SSE 适配器，使现有 Next.js 前端可通过同一组事件语义切换到 Go 实现。
 
 **Architecture:** 内核（`pkg/loop`）持有回合编排（压缩→裁剪→工具集→采样→落存→工具执行→停止判定），形态取自 `agentsdk-go` `runLoop`。横切关注点归四阶段中间件链（`BeforeAgent`/`BeforeModel`/`AfterModel`/`AfterAgent` + `BeforeTool`/`AfterTool`），代码风格与声明式锚点排序取自 `nous-agent`。15 个注入接口承载可替换实现。设计文档：`docs/plans/2026-08-06-agent-go-harness-design.md`（本计划的每个任务都对应其中一节，实现前先读对应节）。
 
@@ -807,9 +807,9 @@ func TestReconnect_DedupesOverlapById(t *testing.T) {}
 
 **Commit** — `feat(agent-go): config loading with fail-fast name validation`
 
-### Task 43: 契约测试 — golden SSE
+### Task 43: 契约测试 — 语义 SSE
 
-**Files:** `agent-go/test/contract/{capture_test.go,golden/*.jsonl}`
+**Files:** `agent-go/internal/langgraphapi/server_test.go`、`agent-go/cmd/agentd/main_test.go`
 
 > **2026-08-07 范围调整：已由语义契约测试替代。** Go runtime 不复制
 > LangGraph 内部语义，服务端允许两套实现并存；兼容边界收窄为
@@ -914,9 +914,13 @@ func TestSkillActivation_InjectedAfterCompaction(t *testing.T) {}
 
 ### Task 55: pkg/swarm — Team · Mailbox · Spawner + 迁移
 
-**参考设计文档 §10.2。表结构与 Python 版兼容，允许 Go 与 Python agent 同 team 协作。**
+**参考设计文档 §10.2。Go 与 Python 保持工具/事件语义一致，但使用独立表和
+运行时，不在同一个 team 中混跑。**
 
-**测试要点：** `swarm_messages` 广播 `to='*'`；`TeamManager` CRUD；`Spawner` 复用 `subagent.Manager`；`max_team_size` 生效。迁移单独一个文件 `002_swarm.up.sql`。
+**测试要点：** `agent_swarm_messages` 广播只保存一条 `to_agent='*'`，逐成员
+receipt 独立消费；发送者与后加入成员不可消费该广播；`TeamManager` CRUD；
+`Spawner` 复用 `subagent.Manager`；`max_team_size` 生效；Go 迁移不得修改
+Python legacy 的 `swarm_*` 表。
 
 **Commit** — `feat(agent-go): swarm team, mailbox and spawner`
 

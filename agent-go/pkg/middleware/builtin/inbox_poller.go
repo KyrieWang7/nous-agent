@@ -4,33 +4,59 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/swarm"
 )
 
 const NameInboxPoller = "inboxPoller"
 
 type InboxPoller struct {
-	mailbox swarm.Mailbox
-	limit   int
+	mailbox  swarm.Mailbox
+	limit    int
+	interval time.Duration
+	now      func() time.Time
+	lastPoll sync.Map
 }
 
-func NewInboxPoller(mailbox swarm.Mailbox, limit int) *InboxPoller {
-	return &InboxPoller{mailbox: mailbox, limit: limit}
+func NewInboxPoller(mailbox swarm.Mailbox, limit int, interval ...time.Duration) *InboxPoller {
+	pollInterval := 2 * time.Second
+	if len(interval) > 0 && interval[0] > 0 {
+		pollInterval = interval[0]
+	}
+	return &InboxPoller{mailbox: mailbox, limit: limit, interval: pollInterval, now: time.Now}
 }
-func (InboxPoller) Name() string            { return NameInboxPoller }
-func (InboxPoller) Grade() middleware.Grade { return middleware.GradeListener }
+func (*InboxPoller) Name() string            { return NameInboxPoller }
+func (*InboxPoller) Grade() middleware.Grade { return middleware.GradeListener }
 func (p *InboxPoller) BeforeModel(ctx context.Context, st *middleware.State) error {
 	if p.mailbox == nil || st.ModelInput == nil {
 		return nil
+	}
+	// A registered mailbox is a server capability, not permission to consume
+	// messages. Disabled runs must leave receipts untouched for a later Swarm
+	// run that actually owns them.
+	enabled, _ := st.Value("swarm_enabled")
+	if value, ok := enabled.(bool); !ok || !value {
+		return nil
+	}
+	if st.RunID != "" && p.interval > 0 {
+		now := p.now()
+		if last, ok := p.lastPoll.Load(st.RunID); ok && now.Sub(last.(time.Time)) < p.interval {
+			return nil
+		}
+		p.lastPoll.Store(st.RunID, now)
 	}
 	var (
 		msgs []swarm.Message
 		err  error
 	)
-	if trusted, ok := p.mailbox.(swarm.ThreadMailbox); ok {
+	if run, ok := runtime.RunContextFrom(ctx); ok && run.SwarmTeamID != "" && run.SwarmAgentName != "" {
+		msgs, err = p.mailbox.Poll(ctx, run.SwarmTeamID, run.SwarmAgentName, p.limit)
+	} else if trusted, ok := p.mailbox.(swarm.ThreadMailbox); ok {
 		msgs, err = trusted.PollForThread(ctx, st.ThreadID, p.limit)
 	} else {
 		team, _ := st.Value("swarm_team_id")
@@ -58,5 +84,12 @@ func (p *InboxPoller) BeforeModel(ctx context.Context, st *middleware.State) err
 		fmt.Fprintf(&b, "- from %s: %s\n", msg.From, msg.Content)
 	}
 	st.ModelInput.Messages = append(st.ModelInput.Messages, message.Message{Role: message.RoleSystem, Content: strings.TrimSpace(b.String())})
+	return nil
+}
+
+func (p *InboxPoller) AfterAgent(_ context.Context, st *middleware.State) error {
+	if p != nil && st != nil && st.RunID != "" {
+		p.lastPoll.Delete(st.RunID)
+	}
 	return nil
 }

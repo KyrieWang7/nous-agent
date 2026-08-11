@@ -16,6 +16,13 @@ node_modules/
 out/
 .turbo/
 
+# Go build artifacts
+/agent-go/agentd
+/agent-go/agentctl
+/gateway-go/gateway
+*.test
+coverage.out
+
 # Environment / Secrets
 .env
 .env.local

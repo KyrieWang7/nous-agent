@@ -194,6 +194,25 @@ func TestFS_WriteReadList(t *testing.T) {
 	}
 }
 
+func TestFS_ListWithLimitReportsTruncation(t *testing.T) {
+	t.Parallel()
+
+	h := newHandle(t)
+	ctx := context.Background()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := h.FS().WriteFile(ctx, "many/"+name, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, truncated, err := sandbox.ListWithLimit(ctx, h.FS(), "many", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || !truncated {
+		t.Fatalf("ListWithLimit() = %d entries, truncated=%t; want 2, true", len(entries), truncated)
+	}
+}
+
 func TestFS_ReadMissingFileIsNotFound(t *testing.T) {
 	t.Parallel()
 

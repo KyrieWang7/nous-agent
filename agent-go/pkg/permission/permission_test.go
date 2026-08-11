@@ -31,6 +31,11 @@ var (
 	readTool    = def("read_file", true, true)
 	writeTool   = def("write_file", false, true)
 	unsandboxed = def("http_post", false, false)
+	agentState  = func() tool.Definition {
+		d := def("send_message", false, false)
+		d.Metadata.IsAgentState = true
+		return d
+	}()
 )
 
 func TestAuthorize_ModeMatrix(t *testing.T) {
@@ -44,10 +49,12 @@ func TestAuthorize_ModeMatrix(t *testing.T) {
 		{permission.ModeReadOnly, readTool, true},
 		{permission.ModeReadOnly, writeTool, false},
 		{permission.ModeReadOnly, unsandboxed, false},
+		{permission.ModeReadOnly, agentState, false},
 
 		{permission.ModeWorkspaceWrite, readTool, true},
 		{permission.ModeWorkspaceWrite, writeTool, true},
 		{permission.ModeWorkspaceWrite, unsandboxed, false},
+		{permission.ModeWorkspaceWrite, agentState, true},
 
 		{permission.ModeAllow, readTool, true},
 		{permission.ModeAllow, writeTool, true},
@@ -271,6 +278,73 @@ func TestAllowedTools_SkipsUnregisteredNames(t *testing.T) {
 
 	if len(got) != 1 || got[0] != "read_file" {
 		t.Fatalf("AllowedTools() = %v, want [read_file]", got)
+	}
+}
+
+func TestRequiredPermissionMinimum(t *testing.T) {
+	t.Parallel()
+
+	dangerTool := def("external_command", false, false)
+	dangerTool.Metadata.RequiredPermission = string(permission.ModeDangerFullAccess)
+	r := tool.NewRegistry()
+	if err := r.Register(dangerTool); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []permission.Mode{permission.ModeWorkspaceWrite, permission.ModePrompt, permission.ModeAllow} {
+		t.Run(string(mode), func(t *testing.T) {
+			p := mustPolicy(t, permission.Config{Mode: mode, Prompter: &fakePrompter{approve: true}})
+			if got := p.Authorize(context.Background(), dangerTool, nil); got.Allowed {
+				t.Fatalf("Authorize() allowed danger_full_access tool under %s", mode)
+			}
+			if got := p.AllowedTools(r, []string{dangerTool.Name}); len(got) != 0 {
+				t.Fatalf("AllowedTools() = %v under %s, want hidden", got, mode)
+			}
+		})
+	}
+	p := mustPolicy(t, permission.Config{Mode: permission.ModeDangerFullAccess})
+	if got := p.Authorize(context.Background(), dangerTool, nil); !got.Allowed {
+		t.Fatalf("Authorize() denied matching minimum: %s", got.Reason)
+	}
+	if got := p.AllowedTools(r, []string{dangerTool.Name}); len(got) != 1 {
+		t.Fatalf("AllowedTools() = %v, want visible", got)
+	}
+}
+
+func TestRequiredPermissionInvalidFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	d := def("bad_manifest_tool", false, false)
+	d.Metadata.RequiredPermission = "root_everything"
+	p := mustPolicy(t, permission.Config{Mode: permission.ModeDangerFullAccess})
+	if got := p.Authorize(context.Background(), d, nil); got.Allowed || !strings.Contains(got.Reason, "unknown mode") {
+		t.Fatalf("Authorize() = %#v, want invalid requirement denial", got)
+	}
+	r := tool.NewRegistry()
+	if err := r.Register(d); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.AllowedTools(r, []string{d.Name}); len(got) != 0 {
+		t.Fatalf("AllowedTools() = %v, want hidden", got)
+	}
+}
+
+func TestPromptMinimumVisibilityAndEmptyRequirementCompatibility(t *testing.T) {
+	t.Parallel()
+
+	promptTool := def("prompt_plugin", false, false)
+	promptTool.Metadata.RequiredPermission = string(permission.ModePrompt)
+	r := tool.NewRegistry()
+	for _, d := range []tool.Definition{promptTool, writeTool} {
+		if err := r.Register(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mode := range []permission.Mode{permission.ModePrompt, permission.ModeAllow, permission.ModeDangerFullAccess} {
+		p := mustPolicy(t, permission.Config{Mode: mode})
+		got := p.AllowedTools(r, []string{promptTool.Name, writeTool.Name})
+		if len(got) != 2 {
+			t.Fatalf("AllowedTools() under %s = %v, want both tools", mode, got)
+		}
 	}
 }
 

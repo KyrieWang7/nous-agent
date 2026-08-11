@@ -44,6 +44,10 @@ type Message struct {
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 	Name             string         `json:"name,omitempty"`
 	IsError          bool           `json:"is_error,omitempty"`
+	// AdditionalKwargs carries provider/UI metadata which must survive the
+	// transcript round trip.  The subagent tool uses this for its terminal
+	// status contract; other adapters may add orthogonal keys.
+	AdditionalKwargs map[string]any `json:"additional_kwargs,omitempty"`
 }
 
 // Clone 返回 m 的深拷贝。
@@ -68,7 +72,36 @@ func Clone(m Message) Message {
 		out.ContentBlocks = make([]ContentBlock, len(m.ContentBlocks))
 		copy(out.ContentBlocks, m.ContentBlocks)
 	}
+	if m.AdditionalKwargs != nil {
+		out.AdditionalKwargs = cloneAdditionalKwargs(m.AdditionalKwargs)
+	}
 
+	return out
+}
+
+func cloneAdditionalKwargs(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		switch nested := value.(type) {
+		case map[string]any:
+			out[key] = cloneAdditionalKwargs(nested)
+		case []any:
+			items := make([]any, len(nested))
+			for i, item := range nested {
+				if m, ok := item.(map[string]any); ok {
+					items[i] = cloneAdditionalKwargs(m)
+				} else {
+					items[i] = item
+				}
+			}
+			out[key] = items
+		default:
+			out[key] = value
+		}
+	}
 	return out
 }
 

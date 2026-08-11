@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 )
@@ -17,6 +18,46 @@ var ErrEscape = errors.New("sandbox: path escapes the sandbox root")
 
 // ErrNotFound 表示路径不存在。
 var ErrNotFound = errors.New("sandbox: path not found")
+
+// ErrReadLimit indicates that a read crossed its byte ceiling. Callers should
+// wrap it with the virtual path so tool errors remain actionable.
+var ErrReadLimit = errors.New("sandbox: file exceeds read limit")
+
+// MaxReadFileBytes is the uniform upper bound for one FS.ReadFile call.
+// Implementations must reject larger files before allocating their contents.
+const MaxReadFileBytes int64 = 8 << 20
+
+// ReadAllLimited reads at most limit bytes without trusting a prior Stat.
+// Reading one sentinel byte closes the Stat/read race where a regular file can
+// grow after validation and otherwise force an unbounded allocation.
+func ReadAllLimited(ctx context.Context, reader io.Reader, limit int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit < 0 {
+		return nil, errors.New("sandbox: read limit must not be negative")
+	}
+	data, err := io.ReadAll(io.LimitReader(contextReader{ctx: ctx, reader: reader}, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrReadLimit
+	}
+	return data, nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
+}
 
 // Entry 是一个目录项。
 type Entry struct {
@@ -66,6 +107,31 @@ type FS interface {
 	WriteFile(ctx context.Context, path string, data []byte) error
 	List(ctx context.Context, path string) ([]Entry, error)
 	Stat(ctx context.Context, path string) (Entry, error)
+}
+
+type limitedLister interface {
+	ListLimit(ctx context.Context, path string, limit int) ([]Entry, bool, error)
+}
+
+// ListWithLimit bounds directory materialization when the FS supports it.
+// Local and Docker providers implement the optional contract; the fallback
+// preserves compatibility for external FS implementations and still trims the
+// returned slice before handing it to callers.
+func ListWithLimit(ctx context.Context, fsys FS, path string, limit int) ([]Entry, bool, error) {
+	if limit <= 0 {
+		return nil, false, errors.New("sandbox: list limit must be positive")
+	}
+	if bounded, ok := fsys.(limitedLister); ok {
+		return bounded.ListLimit(ctx, path, limit)
+	}
+	entries, err := fsys.List(ctx, path)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(entries) <= limit {
+		return entries, false, nil
+	}
+	return entries[:limit], true, nil
 }
 
 // Handle 是一个已就绪的沙箱实例。

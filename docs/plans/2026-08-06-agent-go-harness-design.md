@@ -18,7 +18,7 @@ checkpoint 语义。当前稳定边界是前端 SSE 投影：原生 `/api/v1` �
 
 ### 目标
 
-在 `agent-go/` 从零构建一套 **生产级 Go Agent Harness 库**。内核是自持的 `for` 循环（形态取自 `agentsdk-go` / Claude Code），编排语义归内核；横切关注点归四阶段中间件链（代码风格与链装配方式取自 `nous-agent`）。最外层贴一个 LangGraph 兼容的 HTTP/SSE 适配器，使现有 Next.js 前端**零改动**即可指向 Go 实现。
+在 `agent-go/` 从零构建一套 **生产级 Go Agent Harness 库**。内核是自持的 `for` 循环（形态取自 `agentsdk-go` / Claude Code），编排语义归内核；横切关注点归四阶段中间件链（代码风格与链装配方式取自 `nous-agent`）。最外层提供 LangGraph 兼容的 HTTP/SSE 适配器，使现有 Next.js 前端可通过同一组事件语义连接 Go 实现。
 
 ### 非目标
 
@@ -517,7 +517,17 @@ Skill 安全扫描：禁止引用宿主路径、禁止声明本地 FS/shell 工�
 
 ### 10.2 Swarm
 
-复用现有 PG mailbox 语义，表结构与 Python 版兼容，允许 Go 与 Python agent 在同一 team 协作：`swarm_teams` · `swarm_team_members` · `swarm_messages`（广播 `to='*'`）。`TeamManager` + `Mailbox` + `Spawner`（复用 `subagent.Manager`）。`InboxPoller` 在 `BeforeModel` 轮询注入。工具：`team_create` · `team_delete` · `send_message` · `list_teammates`。
+复用现有 PG mailbox 的产品语义，但 Go 与 Python 是相对独立的运行时和
+持久化边界。Go 使用 `agent_swarm_teams` · `agent_swarm_team_members` ·
+`agent_swarm_messages` · `agent_swarm_message_receipts`；迁移期 Python legacy
+继续使用 `swarm_*`。两边保持工具与事件契约一致，不支持在同一个 team 中混跑；
+需要迁移存量 team 时走显式迁移程序，不能让两个运行时同时写一组表。
+
+广播仍保存为单条 `to_agent='*'` 消息，通过逐成员 receipt 独立消费；发送者
+不会收到自己的广播，发送后加入的成员不会收到历史广播。`TeamManager` +
+`Mailbox` + `Spawner`（复用 `subagent.Manager`）。`InboxPoller` 在
+`BeforeModel` 轮询注入。工具：`team_create` · `team_delete` · `send_message` ·
+`list_teammates`。
 
 层级固定为一层（主 agent + worker），不做自由协商多 agent。
 
@@ -614,7 +624,8 @@ run_event         (id BIGSERIAL, run_id, event_type, category, content, metadata
 run_completion    (run_id, thread_id, status, iterations, llm_call_count,
                    input_tokens, output_tokens, lead_tokens, subagent_tokens,
                    middleware_tokens, cost_micros, duration_ms, completed_at)
-swarm_teams / swarm_team_members / swarm_messages
+agent_swarm_teams / agent_swarm_team_members / agent_swarm_messages /
+agent_swarm_message_receipts
 memory_fact       (id, thread_id, fact, confidence, created_at)
 skill_usage       (skill_name, use_count, view_count, last_activity_at)
 ```
@@ -661,7 +672,10 @@ GET    /threads/{tid}/runs/{rid}/stream          POST /threads/{tid}/runs/{rid}/
 GET    /threads/{tid}/stream
 ```
 
-SSE `stream_mode` 支持 `values` / `messages` / `custom` / `updates`，chunk 形状与 Python 版逐字节一致——由契约测试保证（§18）。
+兼容路由接受 Python 客户端使用的 `stream_mode` 字段；稳定 wire 边界是
+`metadata / values / messages / custom / error / end` 六类事件及其前端消费所需
+字段。Go 内部事件和非契约 payload 可以独立演进，不要求与 Python 逐字节一致
+（§18）。
 
 ## 15. 用量与遥测
 
@@ -743,7 +757,10 @@ runtime             event_buffer_size · redis_stream_enabled · event_ttl ·
 - **`faux` model provider 是硬要求**。脚本化确定性响应，`loop` / `chain` / `subagent` 的全部测试不碰真实 API、不花钱、不需要 key。
 - 表驱动单测，`t.Parallel()` 尽量开。
 - **`middleware.Build()` 顺序快照测试** + "配置声明的中间件都在最终链里"断言。
-- **契约测试**：抓一批 Python 版 `/threads/{tid}/runs/stream` 的真实 SSE 输出存 golden 文件，Go 适配器逐字节比对。这是"前端零改动"唯一可信的验证方式。
+- **语义契约测试**：成功、失败、原生与兼容路由覆盖
+  `metadata / values / messages / custom / error / end`；对前端依赖的消息、任务、
+  风险和 token 字段做结构化断言。内部事件类型保持细粒度，不锁定 Python 的
+  非契约 payload 或随机 ID。
 - 集成测试用 dockertest 起 Postgres + miniredis 起 Redis。
 - `-race` 覆盖并发工具执行、EventBus、Journal。
 - 压缩持久化专项测试：压缩轮之后 `LoadHistory` 必须能读回那一轮的问答（这是 pace-grid 坏过的路径）。
@@ -777,7 +794,7 @@ M2 是关键里程碑：它是"能不能替换 Python 版"的分水岭。
 | subagent 用量不回灌 | 归因永远为 0，且可绕过预算 | 回灌父 Journal，按 `subagent:<name>:<toolCallID>` 去重 |
 | 摘要器故障阻塞会话 | 长会话彻底不可用 | 回退结构化占位摘要；摘要输入按条数与总长封顶 |
 | 监听类中间件错误判死回合 | 标题生成失败导致回答丢失 | 中间件错误按治理/修复/监听三级分类 |
-| SSE 契约与 Python 版有偏差 | 前端"零改动"落空 | golden 文件逐字节契约测试 |
+| SSE 契约与 Python 版有偏差 | 同一前端无法稳定切换服务端 | 六类事件的语义契约测试 + 前端消费回归测试 |
 | Go 无运行时反射加载 | Python 的 dotted-path 扩展点无法平移 | 编译期注册表 + 进程外扩展（MCP / 子进程 Hook） |
 
 ### 明确不做

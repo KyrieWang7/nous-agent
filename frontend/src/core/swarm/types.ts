@@ -7,7 +7,7 @@ export interface SwarmTeam {
 
 export interface SwarmTeamMember {
   name: string;
-  status: "active" | "running" | "removed";
+  status: "active" | "running" | "completed" | "failed" | "removed";
   model: string | null;
   joined_at: string | null;
 }

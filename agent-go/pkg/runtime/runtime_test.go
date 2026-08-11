@@ -16,6 +16,17 @@ func ev(runID string, t runtime.EventType) runtime.Event {
 	return runtime.MustEvent(runID, "thread-1", t, map[string]string{"x": "y"})
 }
 
+func TestRunContextEventStreamRunID(t *testing.T) {
+	t.Parallel()
+
+	if got := (runtime.RunContext{RunID: "root"}).EventStreamRunID(); got != "root" {
+		t.Fatalf("root stream ID = %q, want root", got)
+	}
+	if got := (runtime.RunContext{RunID: "root:task", EventRunID: "root"}).EventStreamRunID(); got != "root" {
+		t.Fatalf("child stream ID = %q, want root", got)
+	}
+}
+
 // --- 事件分类 ---
 
 func TestEvent_CategoryAssignment(t *testing.T) {
@@ -31,6 +42,9 @@ func TestEvent_CategoryAssignment(t *testing.T) {
 		{runtime.EventRunEnd, runtime.CategoryAudit},
 		{runtime.EventError, runtime.CategoryAudit},
 		{runtime.EventGuardrailBlock, runtime.CategoryAudit},
+		{runtime.EventSubagentStart, runtime.CategoryAudit},
+		{runtime.EventSubagentResult, runtime.CategoryAudit},
+		{runtime.EventSubagentProgress, runtime.CategoryTrace},
 		// message_replace 丢掉就等于把被拦截的文本留在用户屏幕上
 		{runtime.EventMessageReplace, runtime.CategoryAudit},
 	}
@@ -574,9 +588,9 @@ func TestJournal_EntriesWithoutCallIDStillCount(t *testing.T) {
 	j.Observe(runtime.Entry{Bucket: runtime.BucketLead, ModelName: "standard", Usage: usage})
 	j.Observe(runtime.Entry{Bucket: runtime.BucketLead, ModelName: "standard", Usage: usage})
 
-	// 无法去重时不能静默丢弃，否则用量被低估
-	if got := j.Totals(); got.LLMCalls < 1 {
-		t.Fatalf("LLMCalls = %d, want at least 1", got.LLMCalls)
+	// 无法去重时不能静默丢弃，否则用量被低估。
+	if got := j.Totals(); got.LLMCalls != 2 || got.LeadTokens != 30 {
+		t.Fatalf("totals = %#v, want both unidentified calls counted", got)
 	}
 }
 
@@ -710,13 +724,46 @@ func TestJournal_MergeFeedsSubagentUsageBack(t *testing.T) {
 	}
 }
 
+func TestJournal_MergeSubagentDeduplicatesTaskReplay(t *testing.T) {
+	t.Parallel()
+
+	parent := runtime.NewJournal(pricer())
+	child := runtime.NewJournal(pricer())
+	child.Observe(runtime.Entry{
+		Bucket: runtime.BucketLead, CallID: "child-call", ModelName: "standard",
+		Usage: model.Usage{InputTokens: 20, OutputTokens: 4},
+	})
+
+	if !parent.MergeSubagent("task-1", "explore", child) {
+		t.Fatal("first task merge was rejected")
+	}
+	if parent.MergeSubagent("task-1", "explore", child) {
+		t.Fatal("replayed task was merged twice")
+	}
+	if !parent.MergeSubagent("task-2", "explore", child) {
+		t.Fatal("distinct task merge was rejected")
+	}
+
+	got := parent.Totals()
+	if got.SubagentTokens != 48 || got.LLMCalls != 2 {
+		t.Fatalf("totals = %#v, want two distinct task merges", got)
+	}
+	if bySource := parent.BySource()["subagent:explore"]; bySource != 48 {
+		t.Fatalf("BySource[subagent:explore] = %d, want 48", bySource)
+	}
+}
+
 func TestJournal_OnChangeObservesLateSubagentMerge(t *testing.T) {
 	parent := runtime.NewJournal(nil)
 	child := runtime.NewJournal(nil)
 	child.Observe(runtime.Entry{Bucket: runtime.BucketLead, CallID: "child-1", Usage: model.Usage{InputTokens: 4, OutputTokens: 2}})
 
-	changed := make(chan runtime.Totals, 1)
+	changed := make(chan runtime.Totals, 2)
 	parent.SetOnChange(func(totals runtime.Totals) { changed <- totals })
+	initial := <-changed
+	if initial.LLMCalls != 0 {
+		t.Fatalf("initial totals = %#v", initial)
+	}
 	parent.Merge("explore", child)
 
 	select {
@@ -726,6 +773,55 @@ func TestJournal_OnChangeObservesLateSubagentMerge(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("late merge did not trigger persistence callback")
+	}
+}
+
+func TestJournal_SetOnChangeImmediatelyObservesExistingTotals(t *testing.T) {
+	j := runtime.NewJournal(nil)
+	j.Observe(runtime.Entry{Bucket: runtime.BucketLead, CallID: "lead-1", Usage: model.Usage{InputTokens: 3, OutputTokens: 2}})
+	changed := make(chan runtime.Totals, 1)
+	j.SetOnChange(func(totals runtime.Totals) { changed <- totals })
+
+	select {
+	case totals := <-changed:
+		if totals.LeadTokens != 5 || totals.LLMCalls != 1 {
+			t.Fatalf("totals = %#v", totals)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current totals were not delivered when callback was installed")
+	}
+}
+
+func TestJournal_ChildSharesAggregateSpendWithoutDoubleCountingMerge(t *testing.T) {
+	t.Parallel()
+
+	parent := runtime.NewJournal(pricer())
+	child := parent.Child()
+	child.Observe(runtime.Entry{
+		Bucket: runtime.BucketLead, Source: "worker", CallID: "child-call",
+		ModelName: "standard", Usage: model.Usage{InputTokens: 7, OutputTokens: 3},
+	})
+
+	tokensBefore, costBefore := parent.Spend()
+	if tokensBefore != 10 || costBefore == 0 {
+		t.Fatalf("shared spend before merge = (%d, %d)", tokensBefore, costBefore)
+	}
+	parent.MergeSubagent("task-1", "worker", child)
+	tokensAfter, costAfter := parent.Spend()
+	if tokensAfter != tokensBefore || costAfter != costBefore {
+		t.Fatalf("merge double-counted shared spend: before=(%d,%d) after=(%d,%d)", tokensBefore, costBefore, tokensAfter, costAfter)
+	}
+}
+
+func TestJournal_ChildInheritsPricingWithoutSharingTotals(t *testing.T) {
+	parent := runtime.NewJournal(pricer())
+	child := parent.Child()
+	child.Observe(runtime.Entry{Bucket: runtime.BucketLead, CallID: "child-1", ModelName: "standard", Usage: model.Usage{InputTokens: 1_000_000}})
+	if child.Totals().CostMicros == 0 {
+		t.Fatal("child did not inherit pricing")
+	}
+	if parent.Totals().LLMCalls != 0 {
+		t.Fatalf("child mutated parent before merge: %#v", parent.Totals())
 	}
 }
 

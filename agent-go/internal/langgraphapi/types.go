@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 )
 
 // Agent is the narrow bridge between the LangGraph wire adapter and the
@@ -13,6 +14,19 @@ import (
 // run lifecycle, history persistence and SSE framing.
 type Agent interface {
 	Run(context.Context, AgentRequest) (AgentResult, error)
+}
+
+// RunPreparer lets a dynamic assembly pin one coherent generation for a run.
+// Agent, tool disclosure, and pricing must come from the same generation.
+type RunPreparer interface {
+	PrepareRun() (PreparedRun, error)
+}
+
+type PreparedRun struct {
+	Agent        Agent
+	AllowedTools []string
+	Pricer       *runtime.Pricer
+	Release      func()
 }
 
 type AgentRequest struct {
@@ -136,6 +150,20 @@ func toWireMessage(m message.Message) wireMessage {
 		ToolCallID:       m.ToolCallID,
 		AdditionalKwargs: map[string]any{},
 		ResponseMetadata: map[string]any{},
+	}
+	if m.AdditionalKwargs != nil {
+		for key, value := range m.AdditionalKwargs {
+			w.AdditionalKwargs[key] = value
+		}
+	}
+	// Agent implementations that predate the structured task contract may
+	// still return only the legacy result prefix. Normalize at the wire edge as
+	// a final compatibility guard; the transcript boundary performs the same
+	// normalization before persistence.
+	if m.Role == message.RoleTool && m.Name == "task" {
+		for key, value := range message.StampSubagentStatus(m).AdditionalKwargs {
+			w.AdditionalKwargs[key] = value
+		}
 	}
 	if m.ReasoningContent != "" {
 		w.AdditionalKwargs["reasoning_content"] = m.ReasoningContent

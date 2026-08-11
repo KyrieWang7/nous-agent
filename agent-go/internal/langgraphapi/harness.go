@@ -6,6 +6,7 @@ import (
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 )
 
@@ -14,10 +15,11 @@ import (
 // establishes the per-thread sandbox lease, and returns only this run's new
 // transcript entries.
 type HarnessAgent struct {
-	Runner        *loop.Runner
-	SystemPrompt  string
-	Sandbox       sandbox.Provider
-	InitialValues map[string]any
+	Runner              *loop.Runner
+	SystemPrompt        string
+	SystemPromptBuilder func(map[string]any) string
+	Sandbox             sandbox.Provider
+	InitialValues       map[string]any
 }
 
 func (a HarnessAgent) Run(ctx context.Context, req AgentRequest) (AgentResult, error) {
@@ -33,15 +35,24 @@ func (a HarnessAgent) Run(ctx context.Context, req AgentRequest) (AgentResult, e
 		lease := sandbox.NewLease(a.Sandbox, req.ThreadID)
 		ctx = sandbox.NewContext(ctx, lease)
 	}
+	values := mergeRunValues(a.InitialValues, req.Config, req.Context)
+	if run, ok := runtime.RunContextFrom(ctx); ok {
+		run.Values = values
+		ctx = runtime.WithRunContext(ctx, run)
+	}
+	systemPrompt := a.SystemPrompt
+	if a.SystemPromptBuilder != nil {
+		systemPrompt = a.SystemPromptBuilder(values)
+	}
 	result, err := a.Runner.Run(ctx, loop.Request{
 		ThreadID:      req.ThreadID,
 		RunID:         req.RunID,
 		AssistantID:   req.AssistantID,
-		SystemPrompt:  a.SystemPrompt,
+		SystemPrompt:  systemPrompt,
 		History:       history,
 		Prompt:        req.Prompt,
 		ContentBlocks: req.ContentBlocks,
-		Values:        mergeRunValues(a.InitialValues, req.Config, req.Context),
+		Values:        values,
 	})
 	if err != nil {
 		return AgentResult{}, err

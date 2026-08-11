@@ -3,6 +3,7 @@ package runtime
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 )
@@ -125,6 +126,15 @@ type Journal struct {
 	// 是运营必须能回答的问题。
 	bySource map[string]int
 	onChange func(Totals)
+	spend    *sharedSpend
+}
+
+// sharedSpend is inherited by child journals. It lets every runner observe
+// the aggregate lead, middleware, and subagent spend without double-counting
+// child totals when they are merged back into the parent journal.
+type sharedSpend struct {
+	tokens atomic.Int64
+	cost   atomic.Int64
 }
 
 // NewJournal 返回用量记账本。
@@ -133,6 +143,25 @@ func NewJournal(p *Pricer) *Journal {
 		pricer:   p,
 		seen:     make(map[string]struct{}),
 		bySource: make(map[string]int),
+		spend:    &sharedSpend{},
+	}
+}
+
+// Child returns an empty journal that uses the same pricing table. A child
+// must keep its own dedupe set and buckets, then Merge attributes the complete
+// child spend to the parent's subagent bucket.
+func (j *Journal) Child() *Journal {
+	if j == nil {
+		return NewJournal(nil)
+	}
+	j.mu.Lock()
+	pricer := j.pricer
+	j.mu.Unlock()
+	return &Journal{
+		pricer:   pricer,
+		seen:     make(map[string]struct{}),
+		bySource: make(map[string]int),
+		spend:    j.spend,
 	}
 }
 
@@ -146,11 +175,13 @@ func (j *Journal) Observe(e Entry) bool {
 
 	j.mu.Lock()
 
-	if _, dup := j.seen[key]; dup {
-		j.mu.Unlock()
-		return false
+	if key != "" {
+		if _, dup := j.seen[key]; dup {
+			j.mu.Unlock()
+			return false
+		}
+		j.seen[key] = struct{}{}
 	}
-	j.seen[key] = struct{}{}
 
 	tokens := e.Usage.TotalTokens()
 
@@ -158,7 +189,8 @@ func (j *Journal) Observe(e Entry) bool {
 	j.totals.OutputTokens += e.Usage.OutputTokens
 	j.totals.CachedInputTokens += e.Usage.CachedInputTokens
 	j.totals.LLMCalls++
-	j.totals.CostMicros += j.pricer.CostMicros(e.ModelName, e.Usage)
+	cost := j.pricer.CostMicros(e.ModelName, e.Usage)
+	j.totals.CostMicros += cost
 
 	switch e.Bucket {
 	case BucketSubagent:
@@ -174,10 +206,21 @@ func (j *Journal) Observe(e Entry) bool {
 	}
 	totals, onChange := j.totals, j.onChange
 	j.mu.Unlock()
+	j.spend.tokens.Add(int64(tokens))
+	j.spend.cost.Add(cost)
 	if onChange != nil {
 		onChange(totals)
 	}
 	return true
+}
+
+// Spend returns aggregate consumption shared by this journal and all of its
+// descendants. Tokens and cost are monotonic for the lifetime of a run.
+func (j *Journal) Spend() (tokens int64, costMicros int64) {
+	if j == nil || j.spend == nil {
+		return 0, 0
+	}
+	return j.spend.tokens.Load(), j.spend.cost.Load()
 }
 
 // dedupeKey 构造去重键。
@@ -188,8 +231,9 @@ func (j *Journal) Observe(e Entry) bool {
 // （设计文档 §10.1）。
 func dedupeKey(e Entry) string {
 	if e.CallID == "" {
-		// 没有 CallID 时无法去重，用一个不会碰撞的键让它照常计入。
-		return fmt.Sprintf("%s:%s:nocallid:%d", e.Bucket, e.Source, len(e.ModelName))
+		// 没有稳定标识时无法证明两次上报属于同一次调用。宁可计入
+		// 两次，也不能用派生字段碰撞后静默低估真实用量。
+		return ""
 	}
 	return fmt.Sprintf("%s:%s:%s", e.Bucket, e.Source, e.CallID)
 }
@@ -224,12 +268,35 @@ func (j *Journal) BySource() map[string]int {
 // 不回灌的话 subagent_tokens 永远是 0，而且一个 run 可以靠不断派发
 // 绕过成本上限（设计文档 §10.1）。
 func (j *Journal) Merge(name string, child *Journal) {
+	j.mergeSubagent("", name, child)
+}
+
+// MergeSubagent merges one completed child exactly once for a trusted task ID.
+// Replayed tool calls can execute the same task identity more than once; the
+// parent bill must still contain that task's usage only once.
+func (j *Journal) MergeSubagent(taskID, name string, child *Journal) bool {
+	if taskID == "" {
+		j.Merge(name, child)
+		return j != nil && child != nil
+	}
+	key := dedupeKey(Entry{Bucket: BucketSubagent, Source: name, CallID: taskID})
+	return j.mergeSubagent(key, name, child)
+}
+
+func (j *Journal) mergeSubagent(dedupeKey, name string, child *Journal) bool {
 	if j == nil || child == nil {
-		return
+		return false
 	}
 
 	t := child.Totals()
 	j.mu.Lock()
+	if dedupeKey != "" {
+		if _, duplicate := j.seen[dedupeKey]; duplicate {
+			j.mu.Unlock()
+			return false
+		}
+		j.seen[dedupeKey] = struct{}{}
+	}
 
 	j.totals.InputTokens += t.InputTokens
 	j.totals.OutputTokens += t.OutputTokens
@@ -240,6 +307,12 @@ func (j *Journal) Merge(name string, child *Journal) {
 	// 子账本里的一切都归父账本的 subagent 桶，包括子 agent 自己的
 	// middleware 开销 —— 从父 run 的视角看，那都是"派发的代价"。
 	j.totals.SubagentTokens += t.InputTokens + t.OutputTokens
+	if j.spend != child.spend {
+		// Legacy/custom callers may merge an independently constructed journal.
+		// Production children use Child(), which already shares this counter.
+		j.spend.tokens.Add(int64(t.InputTokens + t.OutputTokens))
+		j.spend.cost.Add(t.CostMicros)
+	}
 
 	if name != "" {
 		j.bySource[string(BucketSubagent)+":"+name] += t.InputTokens + t.OutputTokens
@@ -249,16 +322,23 @@ func (j *Journal) Merge(name string, child *Journal) {
 	if onChange != nil {
 		onChange(totals)
 	}
+	return true
 }
 
-// SetOnChange installs a callback for future accounting changes. The callback
-// runs without the journal lock and is intended for idempotent persistence of
-// late asynchronous subagent usage.
+// SetOnChange installs a callback and immediately supplies the current
+// snapshot. Installing under the journal lock closes the race where a child
+// merge lands after the run completion was saved but before the callback is
+// visible. Callers must still make persistence monotonic because callbacks
+// from concurrent observations may complete out of order.
 func (j *Journal) SetOnChange(fn func(Totals)) {
 	if j == nil {
 		return
 	}
 	j.mu.Lock()
 	j.onChange = fn
+	totals := j.totals
 	j.mu.Unlock()
+	if fn != nil {
+		fn(totals)
+	}
 }

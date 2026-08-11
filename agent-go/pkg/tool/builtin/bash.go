@@ -108,6 +108,6 @@ func formatExec(res *sandbox.ExecResult) string {
 // 而不是注册了再靠权限去拦 —— 少一层可以出错的地方。
 func All() []tool.Definition {
 	return []tool.Definition{
-		LS(), ReadFile(), WriteFile(), StrReplace(), Bash(), ViewImage(),
+		LS(), Glob(), Grep(), ReadFile(), WriteFile(), StrReplace(), Bash(), ViewImage(), PresentFiles(),
 	}
 }

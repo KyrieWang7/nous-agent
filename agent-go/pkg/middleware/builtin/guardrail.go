@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/guardrail"
@@ -31,7 +32,7 @@ func (g *GuardrailInput) BeforeModel(ctx context.Context, st *middleware.State) 
 	if err != nil {
 		return err
 	}
-	st.RiskLevel = decision.RiskLevel
+	st.RiskLevel = decisionRiskLevel(decision)
 	st.GuardrailAction = string(decision.Action)
 	if decision.Action != guardrail.ActionBlock {
 		return nil
@@ -62,7 +63,7 @@ func (g *GuardrailOutput) AfterModel(ctx context.Context, st *middleware.State) 
 	if err != nil {
 		return err
 	}
-	st.RiskLevel = decision.RiskLevel
+	st.RiskLevel = decisionRiskLevel(decision)
 	st.GuardrailAction = string(decision.Action)
 	if decision.Action != guardrail.ActionBlock {
 		return nil
@@ -79,9 +80,17 @@ func (g *GuardrailOutput) AfterModel(ctx context.Context, st *middleware.State) 
 	publishRuntime(ctx, st, runtime.EventGuardrailBlock, decision)
 	if st.Streamed && st.OriginalOutput != replacement {
 		publishRuntime(ctx, st, runtime.EventMessageReplace, runtime.MessageReplace{
-			Content: replacement,
-			Reason:  decision.Reason,
+			Content:   replacement,
+			MessageID: fmt.Sprintf("%s:%d", st.RunID, st.Iteration),
+			Reason:    decision.Reason,
 		})
 	}
 	return nil
+}
+
+func decisionRiskLevel(decision guardrail.Decision) string {
+	if level := strings.TrimSpace(decision.RiskLevel); level != "" {
+		return strings.ToLower(level)
+	}
+	return string(decision.Action)
 }

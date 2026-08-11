@@ -89,7 +89,10 @@ function mergeToolCalls(
         if (typeof tc.args === "string" && typeof existing.args === "string") {
           existing.args = existing.args + tc.args;
         } else if (tc.args && typeof tc.args === "object") {
-          existing.args = { ...(existing.args as Record<string, unknown> ?? {}), ...tc.args };
+          existing.args = {
+            ...((existing.args as Record<string, unknown>) ?? {}),
+            ...tc.args,
+          };
         }
         if (tc.name) existing.name = tc.name;
         if (tc.id) existing.id = tc.id;
@@ -100,7 +103,10 @@ function mergeToolCalls(
       const existingById = tc.id ? result.find((r) => r.id === tc.id) : null;
       if (existingById) {
         if (tc.args && typeof tc.args === "object") {
-          existingById.args = { ...(existingById.args as Record<string, unknown> ?? {}), ...tc.args };
+          existingById.args = {
+            ...((existingById.args as Record<string, unknown>) ?? {}),
+            ...tc.args,
+          };
         }
         if (tc.name) existingById.name = tc.name;
       } else {
@@ -160,21 +166,27 @@ function deriveToolCalls(
     if (typeof chunk.args === "string" && chunk.args.length > 0) {
       parsedArgs = parsePartialJSON(chunk.args);
     } else if (chunk.args && typeof chunk.args === "object") {
-      parsedArgs = chunk.args as Record<string, unknown>;
+      parsedArgs = chunk.args;
     }
 
     if (existing) {
       if (parsedArgs && Object.keys(parsedArgs).length > 0) {
-        existing.args = { ...(typeof existing.args === "object" ? existing.args : {}), ...parsedArgs };
+        existing.args = {
+          ...(typeof existing.args === "object" ? existing.args : {}),
+          ...parsedArgs,
+        };
       }
       if (chunk.name) existing.name = chunk.name;
       if (chunk.id) existing.id = chunk.id;
     } else {
       derived.push({
         ...chunk,
-        args: parsedArgs && Object.keys(parsedArgs).length > 0
-          ? parsedArgs
-          : (typeof chunk.args === "string" ? {} : (chunk.args ?? {})),
+        args:
+          parsedArgs && Object.keys(parsedArgs).length > 0
+            ? parsedArgs
+            : typeof chunk.args === "string"
+              ? {}
+              : (chunk.args ?? {}),
       });
     }
   }
@@ -192,7 +204,7 @@ function mergeResponseMetadata(
 }
 
 export class MessageManager {
-  private chunks: Map<string, ChunkEntry> = new Map();
+  private chunks = new Map<string, ChunkEntry>();
 
   /**
    * Add a serialized message chunk. Returns the message id, or null if
@@ -226,8 +238,12 @@ export class MessageManager {
       type: prev.type,
       content: concatContent(prev.content, incoming.content),
       additional_kwargs: mergeAdditionalKwargs(
-        (prev as unknown as Record<string, unknown>).additional_kwargs as Record<string, unknown> | undefined,
-        (incoming as unknown as Record<string, unknown>).additional_kwargs as Record<string, unknown> | undefined,
+        (prev as unknown as Record<string, unknown>).additional_kwargs as
+          | Record<string, unknown>
+          | undefined,
+        (incoming as unknown as Record<string, unknown>).additional_kwargs as
+          | Record<string, unknown>
+          | undefined,
       ),
       response_metadata: mergeResponseMetadata(
         prev.response_metadata,
@@ -272,7 +288,11 @@ export class MessageManager {
   get(
     id: string,
     defaultIndex?: number,
-  ): { message: Message; index: number; metadata?: Record<string, unknown> } | null {
+  ): {
+    message: Message;
+    index: number;
+    metadata?: Record<string, unknown>;
+  } | null {
     const entry = this.chunks.get(id);
     if (!entry) return null;
     if (defaultIndex !== undefined && entry.index === undefined) {
@@ -283,6 +303,34 @@ export class MessageManager {
       index: entry.index ?? 0,
       metadata: entry.metadata,
     };
+  }
+
+  /**
+   * Replace the accumulated content for an already-streamed message.
+   * Guardrail compensation events arrive after deltas, so simply changing the
+   * React snapshot would let a later chunk resurrect the rejected text.
+   */
+  replaceContent(id: string, content: Message["content"]): boolean {
+    const entry = this.chunks.get(id);
+    if (!entry) return false;
+
+    const next: Record<string, unknown> = {
+      ...(entry.message as unknown as Record<string, unknown>),
+      content,
+    };
+    const additionalKwargs = next.additional_kwargs;
+    if (additionalKwargs && typeof additionalKwargs === "object") {
+      const cleanedKwargs = {
+        ...(additionalKwargs as Record<string, unknown>),
+      };
+      delete cleanedKwargs.reasoning_content;
+      next.additional_kwargs = cleanedKwargs;
+    }
+    delete next.tool_calls;
+    delete next.tool_call_chunks;
+    delete next.invalid_tool_calls;
+    entry.message = next as unknown as Message;
+    return true;
   }
 
   clear(): void {

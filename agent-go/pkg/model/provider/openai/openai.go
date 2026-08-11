@@ -32,10 +32,11 @@ type Client struct {
 	apiKey  string
 	info    model.Info
 
-	modelID     string
-	maxTokens   int
-	temperature *float64
-	extraBody   map[string]any
+	modelID           string
+	maxTokens         int
+	temperature       *float64
+	extraBody         map[string]any
+	thinkingExtraBody map[string]any
 }
 
 // New 按配置构造客户端。
@@ -65,16 +66,18 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 		apiKey:  cfg.APIKey,
 		modelID: cfg.Model,
 		info: model.Info{
-			Name:             cfg.Name,
-			ContextLength:    ctxLen,
-			MaxOutputTokens:  cfg.MaxTokens,
-			SupportsThinking: cfg.SupportsThinking,
-			SupportsVision:   cfg.SupportsVision,
-			SupportsTools:    true,
+			Name:                    cfg.Name,
+			ContextLength:           ctxLen,
+			MaxOutputTokens:         cfg.MaxTokens,
+			SupportsThinking:        cfg.SupportsThinking,
+			SupportsReasoningEffort: cfg.SupportsReasoningEffort,
+			SupportsVision:          cfg.SupportsVision,
+			SupportsTools:           true,
 		},
-		maxTokens:   cfg.MaxTokens,
-		temperature: cfg.Temperature,
-		extraBody:   cfg.ExtraBody,
+		maxTokens:         cfg.MaxTokens,
+		temperature:       cfg.Temperature,
+		extraBody:         cfg.ExtraBody,
+		thinkingExtraBody: cfg.ThinkingExtraBody,
 	}, nil
 }
 
@@ -183,24 +186,25 @@ func (c *Client) buildBody(req model.Request, stream bool) ([]byte, error) {
 		payload["tools"] = toWireTools(req.Tools)
 	}
 
-	for k, v := range c.extraBody {
-		if isStructuralField(k) {
-			continue
-		}
-		payload[k] = v
+	mergeExtraBody(payload, c.extraBody)
+	if req.Thinking {
+		mergeExtraBody(payload, c.thinkingExtraBody)
 	}
-	for k, v := range req.ExtraBody {
-		if isStructuralField(k) {
-			continue
-		}
-		payload[k] = v
-	}
+	mergeExtraBody(payload, req.ExtraBody)
 
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshalling request: %w", err)
 	}
 	return out, nil
+}
+
+func mergeExtraBody(payload, extra map[string]any) {
+	for k, v := range extra {
+		if !isStructuralField(k) {
+			payload[k] = v
+		}
+	}
 }
 
 func isStructuralField(k string) bool {

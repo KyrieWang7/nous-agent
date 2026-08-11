@@ -7,6 +7,8 @@
 
 import type { Message, ToolCall } from "./message";
 
+export type RunRiskVerdict = "pass" | "review" | "block" | "unknown";
+
 export type ThreadStatus = "idle" | "busy" | "interrupted" | "error";
 
 export interface TokenUsage {
@@ -60,20 +62,26 @@ export interface ToolCallWithResult {
  * Mirrors the subset of `UseStream` / `UseStreamCustom` that the app
  * actually uses — nothing more — so we're free from SDK version churn.
  */
-export interface ThreadStream<V extends Record<string, unknown> = Record<string, unknown>> {
+export interface ThreadStream<
+  V extends Record<string, unknown> = Record<string, unknown>,
+> {
   values: V;
   messages: Message[];
   isLoading: boolean;
   isThreadLoading: boolean;
+  /** Existing route no longer exists in the Harness and should be replaced. */
+  threadNotFound?: boolean;
   error: unknown;
   tokenUsage: TokenUsage | null;
+  /** Raw structured safety level from the terminal run event, when present. */
+  riskLevel?: string | null;
+  /** Normalized safety decision used by the stream consumer. */
+  riskVerdict?: RunRiskVerdict | null;
 
   submit: (
     values: Record<string, unknown> | null | undefined,
     options?: {
-      optimisticValues?:
-        | Partial<V>
-        | ((prev: V) => Partial<V>);
+      optimisticValues?: Partial<V> | ((prev: V) => Partial<V>);
       config?: Record<string, unknown>;
       context?: Record<string, unknown>;
       command?: Record<string, unknown>;

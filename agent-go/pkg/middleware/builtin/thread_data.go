@@ -34,7 +34,7 @@ func (m *ThreadData) BeforeAgent(_ context.Context, st *middleware.State) error 
 	if base == "" {
 		base = ".nous-agent/threads"
 	}
-	root := filepath.Join(base, st.ThreadID, "user-data")
+	root := filepath.Join(base, st.ThreadID)
 	paths := map[string]string{
 		"workspace_path": filepath.Join(root, "workspace"),
 		"uploads_path":   filepath.Join(root, "uploads"),

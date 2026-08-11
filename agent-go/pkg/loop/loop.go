@@ -15,6 +15,7 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -166,8 +167,13 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		SystemPrompt: req.SystemPrompt,
 		History:      req.History,
 	})
-	for key, value := range req.Values {
-		st.SetValue(key, value)
+	// Values belongs to this run and is intentionally shared with RunContext.
+	// Trusted tool lifecycle code can therefore update state that later model
+	// iterations and child dispatches must observe. Child runs clone the map in
+	// subagent.cloneRunContext before they mutate it.
+	st.Values = req.Values
+	if st.Values == nil {
+		st.Values = make(map[string]any)
 	}
 
 	if err := r.seed(st, req); err != nil {
@@ -180,6 +186,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 	// AfterAgent 必须跑到，即便回合失败：它承载遥测、记忆入队、标题生成这类收尾。
 	defer func() {
 		_ = r.cfg.Chain.Execute(context.WithoutCancel(ctx), middleware.StageAfterAgent, st)
+		r.syncSpend(ctx, tracker)
 		res.Compacted = st.Compacted
 		res.CostMicros = tracker.CostMicros()
 		res.Values = cloneValues(st.Values)
@@ -205,6 +212,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 			return res, err
 		}
 		// 2 不可删的安全上限
+		r.syncSpend(ctx, tracker)
 		if err := tracker.Check(iteration); err != nil {
 			res.Iterations = iteration
 			return res, err
@@ -234,6 +242,13 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		case middleware.DirectiveContinue:
 			continue
 		}
+		// BeforeModel may perform metered work (for example compaction or a
+		// policy lookup). Re-read the shared budget before starting the lead
+		// model so that auxiliary and child usage cannot bypass the ceiling.
+		r.syncSpend(ctx, tracker)
+		if err := tracker.Check(iteration); err != nil {
+			return res, err
+		}
 
 		// 7 采样
 		resp, streamed, err := r.cfg.Sampler.Sample(ctx, st)
@@ -247,6 +262,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		res.Response = resp
 		res.StopReason = resp.StopReason
 		res.Usage = res.Usage.Add(resp.Usage)
+		st.UsageRecorded = r.observeLeadUsage(ctx, resp)
 
 		// 8 落存回复
 		st.History.Append(resp.Message)
@@ -256,6 +272,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 			return res, err
 		}
 		directive := st.Take()
+		r.syncSpend(ctx, tracker)
 
 		// 9b 切面通过后才对外发布。顺序反过来就等于把被护栏拦截的文本
 		// 留在用户屏幕上。
@@ -273,6 +290,9 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 
 		// 10 有工具调用则执行后继续
 		if calls := toolCallsOf(st.ModelOutput); len(calls) > 0 {
+			if err := tracker.Check(iteration); err != nil {
+				return res, err
+			}
 			stop, err := r.runTools(ctx, st, calls)
 			if err != nil {
 				return res, err
@@ -303,6 +323,30 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		// 12 回合结束
 		return res, nil
 	}
+}
+
+func (r *Runner) syncSpend(ctx context.Context, tracker *Tracker) {
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Journal == nil {
+		return
+	}
+	tokens, cost := run.Journal.Spend()
+	tracker.ObserveSpend(tokens, cost)
+}
+
+func (r *Runner) observeLeadUsage(ctx context.Context, response *model.Response) bool {
+	if response == nil {
+		return false
+	}
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Journal == nil {
+		return false
+	}
+	run.Journal.Observe(runtime.Entry{
+		Bucket: runtime.BucketLead, Source: "lead", CallID: response.CallID,
+		ModelName: response.ModelName, Usage: response.Usage,
+	})
+	return true
 }
 
 func cloneValues(in map[string]any) map[string]any {
@@ -385,14 +429,27 @@ func (r *Runner) runTools(ctx context.Context, st *middleware.State, calls []too
 		if o.Result == nil {
 			continue
 		}
-		st.History.Append(message.Message{
-			Role:          message.RoleTool,
-			ToolCallID:    o.Call.ID,
-			Name:          o.Call.Name,
-			Content:       o.Result.Content,
-			ContentBlocks: o.Result.ContentBlocks,
-			IsError:       o.Result.IsError,
-		})
+		toolMessage := message.Message{
+			Role:             message.RoleTool,
+			ToolCallID:       o.Call.ID,
+			Name:             o.Call.Name,
+			Content:          o.Result.Content,
+			ContentBlocks:    o.Result.ContentBlocks,
+			IsError:          o.Result.IsError,
+			AdditionalKwargs: cloneAdditionalKwargs(o.Result.AdditionalKwargs),
+		}
+		// ToolErrorHandling may produce a task error result without knowing the
+		// frontend contract. Stamp the legacy-compatible terminal status at the
+		// transcript boundary so every persisted task message is structured.
+		if toolMessage.Name == "task" {
+			toolMessage = message.StampSubagentStatus(toolMessage)
+			if _, ok := toolMessage.AdditionalKwargs[message.SubagentStatusKey]; !ok && o.ExecErr != nil {
+				toolMessage.Content = "Task failed. Error: " + o.ExecErr.Error()
+				toolMessage.IsError = true
+				toolMessage.AdditionalKwargs = message.MakeSubagentAdditionalKwargs(message.SubagentFailed, o.ExecErr.Error())
+			}
+		}
+		st.History.Append(toolMessage)
 	}
 
 	if err != nil {
@@ -402,6 +459,17 @@ func (r *Runner) runTools(ctx context.Context, st *middleware.State, calls []too
 		return true, nil
 	}
 	return false, nil
+}
+
+func cloneAdditionalKwargs(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func (r *Runner) evaluateStop(ctx context.Context, st *middleware.State) (string, error) {

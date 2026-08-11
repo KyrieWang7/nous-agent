@@ -11,7 +11,31 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
+
+func TestRuntimeEventsRouteChildToolsToRootRun(t *testing.T) {
+	t.Parallel()
+
+	var published runtime.Event
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID:      "root:task-1",
+		EventRunID: "root",
+		ThreadID:   "thread",
+		Publish: func(_ context.Context, event runtime.Event) int64 {
+			published = event
+			return 1
+		},
+	})
+	st := middleware.NewState(middleware.StateInit{RunID: "root:task-1", ThreadID: "thread"})
+	st.ToolCall = &tool.Call{ID: "call-1", Name: "read_file"}
+	if _, err := NewRuntimeEvents().BeforeTool(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if published.RunID != "root" || published.ThreadID != "thread" || published.Type != runtime.EventToolStart {
+		t.Fatalf("event = %#v", published)
+	}
+}
 
 func TestThreadDataAndUploads(t *testing.T) {
 	base := t.TempDir()
@@ -22,6 +46,9 @@ func TestThreadDataAndUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 	paths, _ := st.Values["thread_data"].(map[string]string)
+	if got, want := paths["workspace_path"], filepath.Join(base, "thread-1", "workspace"); got != want {
+		t.Fatalf("workspace path = %q, want %q", got, want)
+	}
 	if err := os.WriteFile(filepath.Join(paths["uploads_path"], "notes.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +56,7 @@ func TestThreadDataAndUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := h.All()[h.Len()-1]
-	if last.Role != message.RoleSystem || !strings.Contains(last.Content, "notes.txt") {
+	if last.Role != message.RoleSystem || !strings.Contains(last.Content, "notes.txt") || !strings.Contains(last.Content, "/mnt/user-data/uploads/notes.txt") {
 		t.Fatalf("upload injection = %#v", last)
 	}
 }
@@ -44,6 +71,20 @@ func TestTokenUsageRecordsLeadJournal(t *testing.T) {
 	}
 	if got := j.Totals().LeadTokens; got != 5 {
 		t.Fatalf("lead tokens = %d", got)
+	}
+}
+
+func TestTokenUsageSkipsResponsesAlreadyRecordedByKernel(t *testing.T) {
+	j := runtime.NewJournal(nil)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{Journal: j})
+	st := middleware.NewState(middleware.StateInit{})
+	st.ModelOutput = &model.Response{Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}
+	st.UsageRecorded = true
+	if err := NewTokenUsage().AfterModel(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if got := j.Totals().LeadTokens; got != 0 {
+		t.Fatalf("lead tokens = %d; kernel-recorded usage was duplicated", got)
 	}
 }
 

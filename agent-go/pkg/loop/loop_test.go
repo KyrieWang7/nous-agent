@@ -14,6 +14,7 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -36,6 +37,23 @@ type harnessOpts struct {
 	trimmer    loop.Trimmer
 	publisher  loop.Publisher
 	resolver   loop.ToolSetResolver
+}
+
+type setRunValue struct{}
+
+func (setRunValue) Name() string { return "setRunValue" }
+func (setRunValue) BeforeAgent(_ context.Context, st *middleware.State) error {
+	st.SetValue("team_id", "team-1")
+	return nil
+}
+
+type meteredBeforeModel struct{ usage model.Usage }
+
+func (meteredBeforeModel) Name() string { return "meteredBeforeModel" }
+func (m meteredBeforeModel) BeforeModel(ctx context.Context, _ *middleware.State) error {
+	run, _ := runtime.RunContextFrom(ctx)
+	run.Journal.Observe(runtime.Entry{Bucket: runtime.BucketMiddleware, Source: "test", CallID: "middleware-call", Usage: m.usage})
+	return nil
 }
 
 func newHarness(t *testing.T, opts harnessOpts) *harness {
@@ -124,6 +142,26 @@ func TestLoop_NoToolCallsEndsTurn(t *testing.T) {
 	}
 }
 
+func TestLoopSharesRunValuesWithMiddlewareAndReturnsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, harnessOpts{turns: []faux.Turn{faux.Text("done")}, middleware: []middleware.Middleware{setRunValue{}}})
+	values := map[string]any{"swarm_enabled": true}
+	result, err := h.runner.Run(context.Background(), loop.Request{
+		ThreadID: "t1", RunID: "r1", History: message.NewHistory(), Prompt: "work", Values: values,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values["team_id"] != "team-1" || result.Values["team_id"] != "team-1" {
+		t.Fatalf("input/result values = %#v / %#v", values, result.Values)
+	}
+	result.Values["team_id"] = "changed"
+	if values["team_id"] != "team-1" {
+		t.Fatal("result values must be a snapshot, not the live run map")
+	}
+}
+
 // --- 步 10：有工具调用则继续 ---
 
 func TestLoop_ToolCallsContinueUntilPlainAnswer(t *testing.T) {
@@ -146,6 +184,57 @@ func TestLoop_ToolCallsContinueUntilPlainAnswer(t *testing.T) {
 	}
 	if res.Iterations != 2 {
 		t.Fatalf("Iterations = %d, want 2", res.Iterations)
+	}
+}
+
+func TestLoop_TokenBudgetStopsBeforeDispatchingMoreWork(t *testing.T) {
+	t.Parallel()
+
+	var toolCalls atomic.Int32
+	counted := echoTool("echo")
+	counted.Handler = func(context.Context, tool.Call) (*tool.Result, error) {
+		toolCalls.Add(1)
+		return &tool.Result{Content: "ran"}, nil
+	}
+	h := newHarness(t, harnessOpts{
+		turns: []faux.Turn{
+			faux.ToolCall("echo", `{}`).WithUsage(model.Usage{InputTokens: 4, OutputTokens: 2}),
+			faux.Text("must not be reached"),
+		},
+		tools:  []tool.Definition{counted},
+		limits: loop.Limits{MaxTokens: 5},
+	})
+	journal := runtime.NewJournal(nil)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{Journal: journal})
+
+	_, err := h.run(ctx, "work")
+	if !errors.Is(err, loop.ErrBudgetExhausted) {
+		t.Fatalf("Run() error = %v, want ErrBudgetExhausted", err)
+	}
+	if got := toolCalls.Load(); got != 0 {
+		t.Fatalf("tool calls = %d; over-budget work must not be dispatched", got)
+	}
+	if got := h.fx.CallCount(); got != 1 {
+		t.Fatalf("model calls = %d, want 1", got)
+	}
+}
+
+func TestLoop_TokenBudgetIncludesBeforeModelAndStopsLeadSample(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, harnessOpts{
+		turns:      []faux.Turn{faux.Text("must not be reached")},
+		middleware: []middleware.Middleware{meteredBeforeModel{usage: model.Usage{InputTokens: 5}}},
+		limits:     loop.Limits{MaxTokens: 5},
+	})
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{Journal: runtime.NewJournal(nil)})
+
+	_, err := h.run(ctx, "work")
+	if !errors.Is(err, loop.ErrBudgetExhausted) {
+		t.Fatalf("Run() error = %v, want ErrBudgetExhausted", err)
+	}
+	if got := h.fx.CallCount(); got != 0 {
+		t.Fatalf("model calls = %d; middleware spend bypassed the run budget", got)
 	}
 }
 
@@ -211,6 +300,41 @@ func TestLoop_ToolResultsKeepModelOrder(t *testing.T) {
 	}
 	if len(toolIDs) != 2 || toolIDs[0] != "c1" || toolIDs[1] != "c2" {
 		t.Fatalf("tool results = %v, want [c1 c2] in the model's order", toolIDs)
+	}
+}
+
+func TestLoop_PersistsToolAdditionalKwargs(t *testing.T) {
+	t.Parallel()
+
+	task := tool.Definition{
+		Name:        "task",
+		Group:       "subagent",
+		Description: "task",
+		Parameters:  json.RawMessage(`{"type":"object"}`),
+		Handler: func(context.Context, tool.Call) (*tool.Result, error) {
+			return &tool.Result{
+				Content: "Task Succeeded. Result: child",
+				AdditionalKwargs: map[string]any{
+					message.SubagentStatusKey: message.SubagentCompleted,
+				},
+			}, nil
+		},
+	}
+	h := newHarness(t, harnessOpts{
+		turns: []faux.Turn{faux.ToolCall("task", `{}`), faux.Text("done")},
+		tools: []tool.Definition{task},
+	})
+	hist := message.NewHistory()
+	if _, err := h.runner.Run(context.Background(), loop.Request{ThreadID: "t1", RunID: "r1", History: hist, Prompt: "delegate"}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := hist.All()
+	if len(msgs) < 3 {
+		t.Fatalf("history = %#v, want tool message", msgs)
+	}
+	toolMsg := msgs[2]
+	if got := toolMsg.AdditionalKwargs[message.SubagentStatusKey]; got != message.SubagentCompleted {
+		t.Fatalf("status = %v, want %q", got, message.SubagentCompleted)
 	}
 }
 

@@ -2,18 +2,63 @@ package subagent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/harness"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/hooks"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware/builtin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
+
+// Keep this test package independent from middleware/builtin. The production
+// swarm package imports subagent, so importing builtin here would create a
+// test-only cycle once swarm lifecycle integration is enabled.
+type testTokenUsage struct{}
+
+func (testTokenUsage) Name() string { return "testTokenUsage" }
+func (testTokenUsage) AfterModel(ctx context.Context, st *middleware.State) error {
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Journal == nil || st.ModelOutput == nil {
+		return nil
+	}
+	run.Journal.Observe(runtime.Entry{Bucket: runtime.BucketLead, Source: "lead", CallID: st.ModelOutput.CallID, Usage: st.ModelOutput.Usage})
+	return nil
+}
+
+type failingAfterModel struct{}
+
+func (failingAfterModel) Name() string { return "failingAfterModel" }
+func (failingAfterModel) AfterModel(context.Context, *middleware.State) error {
+	return errors.New("after-model failed")
+}
+
+type captureTrustedRunID struct {
+	runID       *string
+	parentRunID *string
+	eventRunID  *string
+}
+
+func (m captureTrustedRunID) Name() string { return "captureTrustedRunID" }
+func (m captureTrustedRunID) BeforeAgent(ctx context.Context, _ *middleware.State) error {
+	run, _ := runtime.RunContextFrom(ctx)
+	*m.runID = run.RunID
+	*m.parentRunID = run.ParentRunID
+	*m.eventRunID = run.EventStreamRunID()
+	return nil
+}
 
 func TestDispatchUsesIndependentHistoryAndRestrictsTools(t *testing.T) {
 	var gotAllowed []string
@@ -41,10 +86,60 @@ func TestDispatchUsesIndependentHistoryAndRestrictsTools(t *testing.T) {
 	}
 }
 
+func TestDispatchUsesOneTrustedChildRunIDAcrossContextAndLoop(t *testing.T) {
+	var contextRunID, parentRunID, eventRunID string
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		h, err := harness.New(harness.Options{
+			Model:      faux.New(faux.Text("done")),
+			Middleware: []middleware.Middleware{captureTrustedRunID{runID: &contextRunID, parentRunID: &parentRunID, eventRunID: &eventRunID}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	manager := NewManager(factory, nil, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent:coordinator", ParentRunID: "parent", EventRunID: "parent", ThreadID: "thread"})
+	if _, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "task-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if contextRunID != "parent:coordinator:task-1" {
+		t.Fatalf("trusted child RunContext.RunID = %q, want parent:coordinator:task-1", contextRunID)
+	}
+	if parentRunID != "parent:coordinator" {
+		t.Fatalf("trusted child RunContext.ParentRunID = %q, want parent:coordinator", parentRunID)
+	}
+	if eventRunID != "parent" {
+		t.Fatalf("trusted child RunContext.EventStreamRunID() = %q, want parent", eventRunID)
+	}
+}
+
+func TestPublishRoutesNestedSubagentEventsToRootRun(t *testing.T) {
+	t.Parallel()
+
+	var got runtime.Event
+	run := runtime.RunContext{
+		RunID:      "root:coordinator",
+		EventRunID: "root",
+		ThreadID:   "thread",
+		Publish: func(_ context.Context, event runtime.Event) int64 {
+			got = event
+			return 1
+		},
+	}
+	publish(context.Background(), run, runtime.EventSubagentStart, map[string]string{"task_id": "task-1"})
+	if got.RunID != "root" || got.ThreadID != "thread" || got.Type != runtime.EventSubagentStart {
+		t.Fatalf("event = %#v", got)
+	}
+}
+
 func TestDispatchAttributesUsageOnlyToSubagentBucket(t *testing.T) {
 	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
 		m := faux.New(faux.Text("done").WithUsage(model.Usage{InputTokens: 3, OutputTokens: 2}))
-		h, err := harness.New(harness.Options{Model: m, Middleware: []middleware.Middleware{builtin.NewTokenUsage()}})
+		h, err := harness.New(harness.Options{Model: m, Middleware: []middleware.Middleware{testTokenUsage{}}})
 		if err != nil {
 			return nil, err
 		}
@@ -60,6 +155,65 @@ func TestDispatchAttributesUsageOnlyToSubagentBucket(t *testing.T) {
 	totals := journal.Totals()
 	if totals.SubagentTokens != 5 || totals.LeadTokens != 0 || totals.InputTokens != 3 || totals.OutputTokens != 2 {
 		t.Fatalf("totals = %#v", totals)
+	}
+}
+
+func TestDispatchDeduplicatesReplayedTaskUsage(t *testing.T) {
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		m := faux.New(faux.Text("done").WithUsage(model.Usage{InputTokens: 3, OutputTokens: 2}))
+		h, err := harness.New(harness.Options{Model: m, Middleware: []middleware.Middleware{testTokenUsage{}}})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	manager := NewManager(factory, nil, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	journal := runtime.NewJournal(nil)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent", ThreadID: "thread", Journal: journal})
+	request := DispatchRequest{Agent: "worker", Prompt: "work", ToolCallID: "task-1"}
+
+	for range 2 {
+		if _, err := manager.Dispatch(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if totals := journal.Totals(); totals.SubagentTokens != 5 || totals.LLMCalls != 1 {
+		t.Fatalf("replayed task totals = %#v, want one child charge", totals)
+	}
+
+	request.ToolCallID = "task-2"
+	if _, err := manager.Dispatch(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if totals := journal.Totals(); totals.SubagentTokens != 10 || totals.LLMCalls != 2 {
+		t.Fatalf("distinct task totals = %#v, want two child charges", totals)
+	}
+}
+
+func TestDispatchMergesUsageWhenChildFailsAfterSampling(t *testing.T) {
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		m := faux.New(faux.Text("partial").WithUsage(model.Usage{InputTokens: 4, OutputTokens: 1}))
+		h, err := harness.New(harness.Options{Model: m, Middleware: []middleware.Middleware{failingAfterModel{}, testTokenUsage{}}})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	manager := NewManager(factory, nil, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	journal := runtime.NewJournal(nil)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent", ThreadID: "thread", Journal: journal})
+	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work"})
+	if err == nil || result.Status != message.SubagentFailed {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if totals := journal.Totals(); totals.SubagentTokens != 5 || totals.LLMCalls != 1 {
+		t.Fatalf("parent totals = %#v", totals)
 	}
 }
 
@@ -104,12 +258,624 @@ func TestManagerLimitsConcurrentDispatch(t *testing.T) {
 		}
 	}
 }
+
+type blockingModel struct{}
+
+func (blockingModel) Info() model.Info { return model.Info{Name: "blocking", SupportsTools: true} }
+func (blockingModel) Complete(ctx context.Context, _ model.Request) (*model.Response, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (blockingModel) Stream(context.Context, model.Request) (model.StreamReader, error) {
+	return nil, nil
+}
+
+type panickingModel struct{}
+
+func (panickingModel) Info() model.Info { return model.Info{Name: "panicking", SupportsTools: true} }
+func (panickingModel) Complete(context.Context, model.Request) (*model.Response, error) {
+	panic("model adapter panic")
+}
+func (panickingModel) Stream(context.Context, model.Request) (model.StreamReader, error) {
+	return nil, nil
+}
+
+func TestDispatchAppliesTrustedTimeoutPolicy(t *testing.T) {
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		h, err := harness.New(harness.Options{Model: blockingModel{}})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	manager := NewManager(factory, nil, 0)
+	manager.SetTimeoutResolver(func(parent runtime.RunContext, _ DispatchRequest) time.Duration {
+		if parent.ThreadID != "thread" {
+			t.Fatalf("parent = %#v", parent)
+		}
+		return 10 * time.Millisecond
+	})
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent", ThreadID: "thread"})
+	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "wait"})
+	if err == nil || result.Status != message.SubagentTimedOut {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+}
+
 func TestBuiltinsAndTaskTool(t *testing.T) {
-	if len(Builtins()) != 5 {
-		t.Fatalf("builtins=%d", len(Builtins()))
+	definitions := Builtins()
+	if len(definitions) != 5 {
+		t.Fatalf("builtins=%d", len(definitions))
+	}
+	wantTurns := map[string]int{
+		"general-purpose": 50,
+		"explore":         30,
+		"plan":            20,
+		"bash":            30,
+		"verification":    40,
+	}
+	for _, definition := range definitions {
+		if definition.MaxTurns != wantTurns[definition.Name] {
+			t.Errorf("%s max turns = %d, want %d", definition.Name, definition.MaxTurns, wantTurns[definition.Name])
+		}
+		if strings.TrimSpace(definition.SystemPrompt) == "" {
+			t.Errorf("%s has no profile prompt", definition.Name)
+		}
+	}
+	verification := definitions[4]
+	if verification.Name != "verification" || len(verification.AllowedTools) != 0 {
+		t.Fatalf("verification profile = %#v, want trusted parent tool inheritance", verification)
+	}
+	for _, index := range []int{1, 2} {
+		for _, toolName := range []string{"glob", "grep", "ls", "read_file"} {
+			if !containsString(definitions[index].AllowedTools, toolName) {
+				t.Errorf("%s tools = %v, missing %q", definitions[index].Name, definitions[index].AllowedTools, toolName)
+			}
+		}
+	}
+	bash := definitions[3]
+	for _, toolName := range []string{"bash", "write_file", "str_replace"} {
+		if !containsString(bash.AllowedTools, toolName) {
+			t.Errorf("bash tools = %v, missing %q", bash.AllowedTools, toolName)
+		}
 	}
 	m := NewManager(nil, nil, 0)
 	if d := m.TaskTool(); d.Name != "task" {
 		t.Fatalf("tool=%s", d.Name)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTaskToolAcceptsCanonicalContractAndStampsSuccess(t *testing.T) {
+	var got Definition
+	factory := func(def Definition, _ []string) (*loop.Runner, error) {
+		got = def
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("child output"))})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	m := NewManager(factory, nil, 0)
+	if err := m.Register(Definition{Name: "explore", Description: "read only", MaxTurns: 15}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.TaskTool().Handler(context.Background(), tool.Call{
+		ID:   "call-1",
+		Name: "task",
+		Args: json.RawMessage(`{"description":"Inspect repository","prompt":"find the issue","subagent_type":"explore","max_turns":7}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.HasPrefix(result.Content, "Task Succeeded. Result:") {
+		t.Fatalf("result = %#v", result)
+	}
+	if got.Name != "explore" || got.MaxTurns != 7 {
+		t.Fatalf("definition override = %#v", got)
+	}
+	if status := result.AdditionalKwargs[message.SubagentStatusKey]; status != message.SubagentCompleted {
+		t.Fatalf("status = %v, want %q", status, message.SubagentCompleted)
+	}
+}
+
+func TestTaskToolCannotRaiseTrustedProfileTurnLimit(t *testing.T) {
+	var factoryCalls int
+	m := NewManager(func(_ Definition, _ []string) (*loop.Runner, error) {
+		factoryCalls++
+		return nil, errors.New("factory must not run")
+	}, nil, 0)
+	if err := m.Register(Definition{Name: "explore", Description: "read only", MaxTurns: 15}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.TaskTool().Handler(context.Background(), tool.Call{
+		ID:   "call-over-limit",
+		Name: "task",
+		Args: json.RawMessage(`{"description":"Inspect repository","prompt":"find the issue","subagent_type":"explore","max_turns":16}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "exceeds the trusted limit 15") {
+		t.Fatalf("result = %#v", result)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls = %d", factoryCalls)
+	}
+}
+
+func TestTaskToolAcceptsLegacyAgentAlias(t *testing.T) {
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("legacy output"))})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	m := NewManager(factory, nil, 0)
+	if err := m.Register(Definition{Name: "legacy", Description: "legacy"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.TaskTool().Handler(context.Background(), tool.Call{
+		ID:   "call-legacy",
+		Name: "task",
+		Args: json.RawMessage(`{"agent":"legacy","prompt":"old caller"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.HasPrefix(result.Content, "Task Succeeded. Result:") {
+		t.Fatalf("legacy result = %#v", result)
+	}
+}
+
+func TestTaskToolFailureCarriesStructuredError(t *testing.T) {
+	m := NewManager(nil, nil, 0)
+	events := make(chan runtime.Event, 2)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID: "parent", ThreadID: "thread",
+		Publish: func(_ context.Context, event runtime.Event) int64 {
+			events <- event
+			return 1
+		},
+	})
+	result, err := m.TaskTool().Handler(ctx, tool.Call{
+		ID:   "call-fail",
+		Name: "task",
+		Args: json.RawMessage(`{"description":"Unknown","prompt":"work","subagent_type":"missing"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.HasPrefix(result.Content, "Task failed. Error:") {
+		t.Fatalf("failure result = %#v", result)
+	}
+	if result.AdditionalKwargs[message.SubagentStatusKey] != message.SubagentFailed {
+		t.Fatalf("failure status = %#v", result.AdditionalKwargs)
+	}
+	if !strings.Contains(result.AdditionalKwargs[message.SubagentErrorKey].(string), "missing") {
+		t.Fatalf("failure error = %#v", result.AdditionalKwargs)
+	}
+	for _, wantType := range []runtime.EventType{runtime.EventSubagentStart, runtime.EventSubagentResult} {
+		event := <-events
+		if event.Type != wantType || !strings.Contains(string(event.Data), `"task_id":"call-fail"`) {
+			t.Fatalf("event = %#v, want type=%q and tool-call task id", event, wantType)
+		}
+	}
+}
+
+type flakyTaskStore struct {
+	mu     sync.Mutex
+	puts   []Result
+	failAt map[int]error
+	onPut  func(Result)
+}
+
+func (s *flakyTaskStore) Put(_ context.Context, result Result, _ time.Duration) error {
+	s.mu.Lock()
+	s.puts = append(s.puts, result)
+	attempt := len(s.puts)
+	err := s.failAt[attempt]
+	s.mu.Unlock()
+	if s.onPut != nil {
+		s.onPut(result)
+	}
+	return err
+}
+func (s *flakyTaskStore) Get(_ context.Context, id string) (Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.puts) - 1; i >= 0; i-- {
+		if s.puts[i].TaskID != id {
+			continue
+		}
+		if err := s.failAt[i+1]; err != nil {
+			continue
+		}
+		return s.puts[i], nil
+	}
+	return Result{}, errors.New("task not found")
+}
+
+type recordingLifecycle struct {
+	finished  []Result
+	finishErr error
+	onFinish  func(Result)
+	starts    int
+}
+
+func (l *recordingLifecycle) Start(_ context.Context, parent runtime.RunContext, _ string, _ DispatchRequest) (runtime.RunContext, error) {
+	l.starts++
+	return parent, nil
+}
+func (l *recordingLifecycle) Finish(_ context.Context, _, _ runtime.RunContext, _ DispatchRequest, result Result) error {
+	l.finished = append(l.finished, result)
+	if l.onFinish != nil {
+		l.onFinish(result)
+	}
+	return l.finishErr
+}
+
+func successfulRunnerFactory(output string) RunnerFactory {
+	return func(_ Definition, _ []string) (*loop.Runner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text(output))})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+}
+
+func registerWorker(t *testing.T, manager *Manager) {
+	t.Helper()
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func workerContext() context.Context {
+	return runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent", ThreadID: "thread"})
+}
+
+func TestChildPanicStillFinalizesAndPersistsTheTask(t *testing.T) {
+	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+		h, err := harness.New(harness.Options{Model: panickingModel{}})
+		if err != nil {
+			return nil, err
+		}
+		return h.Runner(), nil
+	}
+	store := NewMemoryTaskStore()
+	lifecycle := &recordingLifecycle{}
+	manager := NewManager(factory, store, time.Hour)
+	manager.SetLifecycle(lifecycle)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{
+		SubagentType: "worker", Prompt: "work", ToolCallID: "panic-task",
+	})
+	if err == nil || result.Status != message.SubagentFailed || !strings.Contains(result.Error, "panicked") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if len(lifecycle.finished) != 1 || lifecycle.finished[0].Status != message.SubagentFailed {
+		t.Fatalf("lifecycle results = %#v", lifecycle.finished)
+	}
+	persisted, err := store.Get(context.Background(), "panic-task")
+	if err != nil || persisted.Status != message.SubagentFailed {
+		t.Fatalf("persisted = %#v, error = %v", persisted, err)
+	}
+}
+
+func TestLifecycleFailurePreservesCompletedExecutionState(t *testing.T) {
+	var order []string
+	store := &flakyTaskStore{failAt: map[int]error{}, onPut: func(result Result) {
+		order = append(order, "store:"+result.Status)
+	}}
+	lifecycle := &recordingLifecycle{
+		finishErr: errors.New("mailbox finalization failed"),
+		onFinish:  func(result Result) { order = append(order, "lifecycle:"+result.Status) },
+	}
+	manager := NewManager(successfulRunnerFactory("done"), store, time.Hour)
+	manager.SetLifecycle(lifecycle)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "call-1"})
+	if err == nil || result.Status != message.SubagentCompleted || result.Error != "" || !strings.Contains(result.CoordinationError, "mailbox finalization failed") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if len(lifecycle.finished) != 1 || lifecycle.finished[0].Status != message.SubagentCompleted {
+		t.Fatalf("lifecycle results = %#v", lifecycle.finished)
+	}
+	if len(store.puts) != 2 || store.puts[0].Status != "running" || store.puts[1].Status != message.SubagentCompleted || store.puts[1].CoordinationError == "" {
+		t.Fatalf("stored states = %#v", store.puts)
+	}
+	wantOrder := []string{"store:running", "lifecycle:completed", "store:completed"}
+	if strings.Join(order, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("finalization order = %v, want %v", order, wantOrder)
+	}
+}
+
+func TestTaskToolKeepsCompletedStatusWhenCoordinationFails(t *testing.T) {
+	lifecycle := &recordingLifecycle{finishErr: errors.New("announcement unavailable")}
+	manager := NewManager(successfulRunnerFactory("done"), nil, time.Hour)
+	manager.SetLifecycle(lifecycle)
+	registerWorker(t, manager)
+
+	result, err := manager.TaskTool().Handler(workerContext(), tool.Call{
+		ID:   "call-coordination",
+		Name: "task",
+		Args: json.RawMessage(`{"description":"work","prompt":"work","subagent_type":"worker"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.HasPrefix(result.Content, "Task Succeeded. Result: done") {
+		t.Fatalf("tool result = %#v", result)
+	}
+	if result.AdditionalKwargs[message.SubagentStatusKey] != message.SubagentCompleted ||
+		!strings.Contains(result.AdditionalKwargs[message.SubagentErrorKey].(string), "announcement unavailable") {
+		t.Fatalf("structured result = %#v", result.AdditionalKwargs)
+	}
+}
+
+func TestTerminalStoreFailureRetriesFailedAfterLifecycle(t *testing.T) {
+	var order []string
+	store := &flakyTaskStore{
+		failAt: map[int]error{2: errors.New("redis unavailable")},
+		onPut:  func(result Result) { order = append(order, "store:"+result.Status) },
+	}
+	lifecycle := &recordingLifecycle{onFinish: func(result Result) {
+		order = append(order, "lifecycle:"+result.Status)
+	}}
+	manager := NewManager(successfulRunnerFactory("done"), store, time.Hour)
+	manager.SetLifecycle(lifecycle)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "call-1"})
+	if err == nil || result.Status != message.SubagentFailed || !strings.Contains(result.Error, "redis unavailable") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if len(lifecycle.finished) != 1 || lifecycle.finished[0].Status != message.SubagentCompleted {
+		t.Fatalf("lifecycle results = %#v", lifecycle.finished)
+	}
+	wantOrder := []string{"store:running", "lifecycle:completed", "store:completed", "store:failed"}
+	if strings.Join(order, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("finalization order = %v, want %v", order, wantOrder)
+	}
+}
+
+func TestFinalTerminalStoreRetryFailureIsReturned(t *testing.T) {
+	store := &flakyTaskStore{failAt: map[int]error{
+		2: errors.New("terminal write unavailable"),
+		3: errors.New("retry write unavailable"),
+	}}
+	manager := NewManager(successfulRunnerFactory("done"), store, time.Hour)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "call-1"})
+	if err == nil || result.Status != message.SubagentFailed {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	for _, want := range []string{"terminal write unavailable", "retry write unavailable"} {
+		if !strings.Contains(result.Error, want) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("result/error = %#v / %v, want %q", result, err, want)
+		}
+	}
+	if len(store.puts) != 3 || store.puts[1].Status != message.SubagentCompleted || store.puts[2].Status != message.SubagentFailed {
+		t.Fatalf("stored attempts = %#v", store.puts)
+	}
+}
+
+func TestSubagentStartHookDenialFailsClosed(t *testing.T) {
+	lifecycle := &recordingLifecycle{}
+	runner, err := hooks.NewRunner([]hooks.Hook{&hooks.FuncHook{
+		HookName: "policy",
+		OnEvents: []hooks.Event{hooks.EventSubagentStart},
+		Fn: func(context.Context, hooks.Payload) (hooks.Outcome, error) {
+			return hooks.Outcome{Deny: true, Message: "delegation disabled"}, nil
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(successfulRunnerFactory("must not run"), nil, time.Hour)
+	manager.SetHookRunner(runner)
+	manager.SetLifecycle(lifecycle)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "call-1"})
+	if err == nil || result.Status != message.SubagentFailed || !strings.Contains(result.Error, "delegation disabled") {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if lifecycle.starts != 0 || len(lifecycle.finished) != 0 {
+		t.Fatalf("denied dispatch reached lifecycle: starts=%d finished=%#v", lifecycle.starts, lifecycle.finished)
+	}
+}
+
+func TestSubagentLifecycleHooksReceiveFinalResultAndEndIsFailOpen(t *testing.T) {
+	var payloads []hooks.Payload
+	runner, err := hooks.NewRunner([]hooks.Hook{&hooks.FuncHook{
+		HookName: "observer",
+		OnEvents: []hooks.Event{hooks.EventSubagentStart, hooks.EventSubagentEnd},
+		Fn: func(_ context.Context, payload hooks.Payload) (hooks.Outcome, error) {
+			payloads = append(payloads, payload)
+			if payload.Event == hooks.EventSubagentEnd {
+				return hooks.Outcome{Deny: true, Message: "too late to deny"}, nil
+			}
+			return hooks.Outcome{}, nil
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(successfulRunnerFactory("done"), nil, time.Hour)
+	manager.SetHookRunner(runner)
+	registerWorker(t, manager)
+
+	result, err := manager.Dispatch(workerContext(), DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "call-1"})
+	if err != nil || result.Status != message.SubagentCompleted {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if len(payloads) != 2 || payloads[0].Event != hooks.EventSubagentStart || payloads[1].Event != hooks.EventSubagentEnd {
+		t.Fatalf("hook payloads = %#v", payloads)
+	}
+	start, end := payloads[0], payloads[1]
+	if start.TaskID != "call-1" || start.Subagent != "worker" || start.RunID != "parent" || start.ThreadID != "thread" {
+		t.Fatalf("start payload = %#v", start)
+	}
+	if end.TaskID != "call-1" || end.Status != message.SubagentCompleted || end.Output != "done" || end.IsError {
+		t.Fatalf("end payload = %#v", end)
+	}
+}
+
+func TestContextRunnerFactoryReceivesTrustedParentContext(t *testing.T) {
+	var gotRunID, gotType string
+	factory := func(ctx context.Context, def Definition, _ []string, req DispatchRequest) (*loop.Runner, error) {
+		parent, ok := runtime.RunContextFrom(ctx)
+		if !ok {
+			t.Fatalf("parent run context was not propagated")
+		}
+		gotRunID, gotType = parent.RunID, req.SubagentType
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("context child"))})
+		if err != nil {
+			return nil, err
+		}
+		if def.Name != "worker" {
+			t.Fatalf("definition = %#v", def)
+		}
+		return h.Runner(), nil
+	}
+	m := NewManagerWithContextFactory(factory, nil, 0)
+	if err := m.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "parent-run", ThreadID: "thread"})
+	if _, err := m.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotRunID != "parent-run" || gotType != "worker" {
+		t.Fatalf("factory context/request = %q/%q", gotRunID, gotType)
+	}
+}
+
+func TestDispatchAsyncPublishesEarlyFailure(t *testing.T) {
+	m := NewManager(nil, nil, 0)
+	events := make(chan runtime.Event, 2)
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID: "parent-run", ThreadID: "thread",
+		Publish: func(_ context.Context, event runtime.Event) int64 {
+			events <- event
+			return 1
+		},
+	})
+	id, err := m.DispatchAsync(ctx, DispatchRequest{SubagentType: "missing", Prompt: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case started := <-events:
+		if started.Type != runtime.EventSubagentStart {
+			t.Fatalf("event type = %q", started.Type)
+		}
+		event := <-events
+		if event.Type != runtime.EventSubagentResult {
+			t.Fatalf("event type = %q", event.Type)
+		}
+		var result Result
+		if err := json.Unmarshal(event.Data, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.TaskID != id || result.Status != "failed" || result.Error == "" {
+			t.Fatalf("result = %#v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async failure event")
+	}
+}
+
+func TestDispatchAsyncReplacesPendingAfterTerminalStoreRetry(t *testing.T) {
+	puts := make(chan Result, 4)
+	store := &flakyTaskStore{
+		// Put #1 is the async reservation. The first terminal write fails;
+		// persistTerminal must immediately write a durable failed state.
+		failAt: map[int]error{2: errors.New("transient task store failure")},
+		onPut: func(result Result) {
+			puts <- result
+		},
+	}
+	manager := NewManager(nil, store, time.Hour)
+	id, err := manager.DispatchAsync(context.Background(), DispatchRequest{
+		SubagentType: "missing", Prompt: "work", ToolCallID: "async-retry",
+	})
+	if err != nil || id != "async-retry" {
+		t.Fatalf("DispatchAsync() = %q, %v", id, err)
+	}
+	deadline := time.After(time.Second)
+	var terminal Result
+	terminalAttempts := 0
+	for {
+		select {
+		case result := <-puts:
+			if result.TaskID == id && result.Status == message.SubagentFailed && result.CompletedAt != nil {
+				terminal = result
+				terminalAttempts++
+			}
+		case <-deadline:
+			t.Fatalf("pending task never reached a terminal state; last=%#v", terminal)
+		}
+		// The first terminal attempt is deliberately rejected by the store;
+		// wait for the retry before reading through TaskStatus.
+		if terminalAttempts == 2 {
+			break
+		}
+	}
+	got, err := manager.TaskStatus(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != message.SubagentFailed || got.Status == "pending" || !strings.Contains(got.Error, "unknown subagent type") {
+		t.Fatalf("TaskStatus() = %#v; pending reservation was not replaced", got)
+	}
+}
+
+func TestRedisTaskStoreSharesStatusAcrossInstances(t *testing.T) {
+	server := miniredis.RunT(t)
+	clientA := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	clientB := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() {
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+
+	storeA := NewRedisTaskStore(clientA)
+	storeB := NewRedisTaskStore(clientB)
+	completedAt := time.Now().UTC().Truncate(time.Nanosecond)
+	want := Result{
+		TaskID: "call-cross-instance", Agent: "verification", Status: message.SubagentCompleted,
+		Output: "verified", StartedAt: completedAt.Add(-time.Second), CompletedAt: &completedAt,
+		Usage: model.Usage{InputTokens: 7, OutputTokens: 3},
+	}
+	if err := storeA.Put(context.Background(), want, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err := storeB.Get(context.Background(), want.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TaskID != want.TaskID || got.Agent != want.Agent || got.Status != want.Status ||
+		got.Output != want.Output || got.Usage != want.Usage || !got.StartedAt.Equal(want.StartedAt) ||
+		got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {
+		t.Fatalf("cross-instance result = %#v, want %#v", got, want)
 	}
 }

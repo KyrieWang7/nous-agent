@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	runtimedebug "runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
@@ -29,6 +31,7 @@ type Options struct {
 	Registry          *runtime.Registry
 	OwnRegistry       bool
 	AllowedTools      []string
+	Pricer            *runtime.Pricer
 }
 
 type Server struct {
@@ -42,7 +45,15 @@ type Server struct {
 	registry     *runtime.Registry
 	ownRegistry  bool
 	allowedTools []string
+	pricer       *runtime.Pricer
 	mux          *http.ServeMux
+
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	runsMu         sync.Mutex
+	runs           sync.WaitGroup
+	closing        bool
+	closeOnce      sync.Once
 }
 
 func New(opts Options) (*Server, error) {
@@ -73,7 +84,8 @@ func New(opts Options) (*Server, error) {
 		}
 		opts.OwnRegistry = true
 	}
-	s := &Server{agent: opts.Agent, store: opts.Store, bus: opts.Bus, events: opts.EventStore, persister: persister, heartbeat: opts.HeartbeatInterval, logger: opts.Logger, registry: opts.Registry, ownRegistry: opts.OwnRegistry, allowedTools: append([]string(nil), opts.AllowedTools...)}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	s := &Server{agent: opts.Agent, store: opts.Store, bus: opts.Bus, events: opts.EventStore, persister: persister, heartbeat: opts.HeartbeatInterval, logger: opts.Logger, registry: opts.Registry, ownRegistry: opts.OwnRegistry, allowedTools: append([]string(nil), opts.AllowedTools...), pricer: opts.Pricer, shutdownCtx: shutdownCtx, shutdownCancel: shutdownCancel}
 	s.mux = http.NewServeMux()
 	s.routes()
 	return s, nil
@@ -90,12 +102,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// Close flushes the event replay store. It is safe to call more than once.
+// Close stops run admission, cancels and drains active runs, then flushes the
+// event replay store. It is safe to call more than once.
 func (s *Server) Close() {
-	s.persister.Close()
-	if s.ownRegistry {
-		s.registry.Close()
+	s.closeOnce.Do(func() {
+		s.runsMu.Lock()
+		s.closing = true
+		s.runsMu.Unlock()
+		s.shutdownCancel()
+		s.runs.Wait()
+		s.persister.Close()
+		if s.ownRegistry {
+			s.registry.Close()
+		}
+	})
+}
+
+func (s *Server) beginRun() bool {
+	s.runsMu.Lock()
+	defer s.runsMu.Unlock()
+	if s.closing {
+		return false
 	}
+	s.runs.Add(1)
+	return true
 }
 
 func (s *Server) routes() {
@@ -281,6 +311,16 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	if !s.beginRun() {
+		writeError(w, http.StatusServiceUnavailable, errors.New("server is shutting down"))
+		return
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			s.runs.Done()
+		}
+	}()
 	tid := r.PathValue("tid")
 	if _, err := s.store.GetThread(r.Context(), tid); errors.Is(err, ErrThreadNotFound) {
 		_, _ = s.store.CreateThread(r.Context(), newThread(tid, nil), false)
@@ -302,7 +342,15 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err)
 		return
 	}
-	go s.execute(runCtx, run, body)
+	runCtx, cancelRun := context.WithCancel(runCtx)
+	stopShutdownCancel := context.AfterFunc(s.shutdownCtx, cancelRun)
+	go func() {
+		defer s.runs.Done()
+		defer cancelRun()
+		defer stopShutdownCancel()
+		s.execute(runCtx, run, body)
+	}()
+	handedOff = true
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -312,12 +360,39 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 	startedAt := time.Now()
+	runAgent := s.agent
+	allowedTools := s.allowedTools
+	pricer := s.pricer
+	if preparer, ok := s.agent.(RunPreparer); ok {
+		prepared, err := preparer.PrepareRun()
+		if err != nil {
+			s.executePreparationFailure(ctx, run, startedAt, err)
+			return
+		}
+		if prepared.Agent == nil {
+			s.executePreparationFailure(ctx, run, startedAt, errors.New("langgraphapi: prepared run has no agent"))
+			return
+		}
+		runAgent = prepared.Agent
+		allowedTools = append([]string(nil), prepared.AllowedTools...)
+		pricer = prepared.Pricer
+		if prepared.Release != nil {
+			defer prepared.Release()
+		}
+	}
 	keepAliveCtx, stopKeepAlive := context.WithCancel(ctx)
-	defer stopKeepAlive()
-	go s.registry.KeepAlive(keepAliveCtx, run.RunID, s.heartbeat)
+	keepAliveDone := make(chan struct{})
+	go func() {
+		defer close(keepAliveDone)
+		s.registry.KeepAlive(keepAliveCtx, run.RunID, s.heartbeat)
+	}()
+	defer func() {
+		stopKeepAlive()
+		<-keepAliveDone
+	}()
 	persistCtx := context.WithoutCancel(ctx)
 	s.publish(persistCtx, run, "metadata", map[string]string{"run_id": run.RunID})
-	journal := runtime.NewJournal(nil)
+	journal := runtime.NewJournal(pricer)
 	result := AgentResult{}
 	var runErr error
 
@@ -351,8 +426,9 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 		}
 	}
 	if runErr == nil {
-		ctx = runtime.WithRunContext(ctx, runtime.RunContext{RunID: run.RunID, ThreadID: run.ThreadID, AllowedTools: s.allowedTools, Journal: journal, Bus: s.bus, Publish: s.publishEvent})
-		result, runErr = s.agent.Run(ctx, AgentRequest{RunID: run.RunID, ThreadID: run.ThreadID, AssistantID: run.AssistantID, Prompt: prompt, ContentBlocks: contentBlocks, History: hist, Config: body.Config, Context: mergeMaps(thread.Values, body.Context)})
+		runValues := mergeRunValues(body.Config, thread.Values, body.Context)
+		ctx = runtime.WithRunContext(ctx, runtime.RunContext{RunID: run.RunID, EventRunID: run.RunID, ThreadID: run.ThreadID, AllowedTools: allowedTools, Values: runValues, Journal: journal, Bus: s.bus, Publish: s.publishEvent})
+		result, runErr = s.runAgent(ctx, runAgent, AgentRequest{RunID: run.RunID, ThreadID: run.ThreadID, AssistantID: run.AssistantID, Prompt: prompt, ContentBlocks: contentBlocks, History: hist, Config: body.Config, Context: mergeMaps(thread.Values, body.Context)})
 	}
 
 	status := "success"
@@ -368,6 +444,11 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 		if len(result.Messages) == 0 && result.Output != "" {
 			result.Messages = []message.Message{{Role: message.RoleAssistant, Content: result.Output}}
 		}
+		// Normalize task terminal metadata before either persistence or wire
+		// publication. Native runners already stamp this at the loop boundary;
+		// doing it here also protects custom Agent implementations.
+		result.Messages = normalizeTaskMessages(result.Messages)
+		result.Transcript = normalizeTaskMessages(result.Transcript)
 		toSave := result.Messages
 		if result.Compacted {
 			toSave = result.Transcript
@@ -419,16 +500,6 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 		}
 		s.publish(persistCtx, run, "error", map[string]any{"message": runErr.Error(), "type": fmt.Sprintf("%T", runErr)})
 	}
-	if _, err := s.store.UpdateRun(persistCtx, run.RunID, RunUpdate{Status: status, RiskLevel: result.RiskLevel}); err != nil {
-		finalErr := fmt.Errorf("saving terminal run state: %w", err)
-		if runErr == nil {
-			runErr = finalErr
-			status = "error"
-			s.publish(persistCtx, run, "error", map[string]any{"message": finalErr.Error(), "type": fmt.Sprintf("%T", finalErr)})
-		} else {
-			s.logger.Error("updating terminal run state", "run_id", run.RunID, "error", err)
-		}
-	}
 	totals := journal.Totals()
 	completion := RunCompletion{
 		RunID: run.RunID, ThreadID: run.ThreadID, Status: status,
@@ -438,6 +509,7 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 		MiddlewareTokens: totals.MiddlewareTokens, CostMicros: totals.CostMicros,
 		Duration: time.Since(startedAt), CompletedAt: time.Now().UTC(),
 	}
+	completionSaved := false
 	if err := s.store.SaveRunCompletion(persistCtx, completion); err != nil {
 		finalErr := fmt.Errorf("saving run completion: %w", err)
 		if runErr == nil {
@@ -448,7 +520,41 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 			s.logger.Error("saving run completion", "run_id", run.RunID, "error", err)
 		}
 	} else {
+		completionSaved = true
+	}
+
+	declaredRiskLevel := result.RiskLevel
+	result.RiskLevel = normalizedRunRiskLevel(declaredRiskLevel, status)
+	if _, err := s.store.UpdateRun(persistCtx, run.RunID, RunUpdate{Status: status, RiskLevel: result.RiskLevel}); err != nil {
+		finalErr := fmt.Errorf("saving terminal run state: %w", err)
+		if runErr == nil {
+			runErr = finalErr
+			status = "error"
+			result.RiskLevel = normalizedRunRiskLevel(declaredRiskLevel, status)
+			completion.Status = status
+			s.publish(persistCtx, run, "error", map[string]any{"message": finalErr.Error(), "type": fmt.Sprintf("%T", finalErr)})
+			if completionSaved {
+				if completionErr := s.store.SaveRunCompletion(persistCtx, completion); completionErr != nil {
+					s.logger.Error("reconciling run completion after terminal state failure", "run_id", run.RunID, "error", completionErr)
+				}
+			}
+		} else {
+			s.logger.Error("updating terminal run state", "run_id", run.RunID, "error", err)
+		}
+		if _, retryErr := s.store.UpdateRun(persistCtx, run.RunID, RunUpdate{Status: status, RiskLevel: result.RiskLevel}); retryErr != nil {
+			s.logger.Error("retrying terminal run state", "run_id", run.RunID, "status", status, "error", retryErr)
+		}
+	}
+
+	if completionSaved {
+		var usageMu sync.Mutex
+		persisted := totals
 		journal.SetOnChange(func(updated runtime.Totals) {
+			usageMu.Lock()
+			defer usageMu.Unlock()
+			if !accountingAdvanced(updated, persisted) {
+				return
+			}
 			late := completion
 			late.LLMCalls = updated.LLMCalls
 			late.InputTokens = updated.InputTokens
@@ -460,7 +566,9 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 			late.CostMicros = updated.CostMicros
 			if err := s.store.SaveRunCompletion(persistCtx, late); err != nil {
 				s.logger.Error("saving late subagent usage", "run_id", run.RunID, "error", err)
+				return
 			}
+			persisted = updated
 		})
 	}
 	runtimeStatus := runtime.StatusCompleted
@@ -472,6 +580,66 @@ func (s *Server) execute(ctx context.Context, run Run, body runCreate) {
 	}
 	_ = s.registry.Complete(persistCtx, run.RunID, runtimeStatus)
 	s.publish(persistCtx, run, "end", runtime.RunEnd{Status: status, Output: result.Output, Iterations: result.Iterations, RiskLevel: result.RiskLevel, Error: errorString(runErr)})
+}
+
+func (s *Server) runAgent(ctx context.Context, agent Agent, request AgentRequest) (result AgentResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.ErrorContext(ctx, "agent execution panicked", "panic", recovered, "stack", string(runtimedebug.Stack()))
+			result = AgentResult{}
+			err = errors.New("agent execution panicked")
+		}
+	}()
+	return agent.Run(ctx, request)
+}
+
+func (s *Server) executePreparationFailure(ctx context.Context, run Run, startedAt time.Time, err error) {
+	persistCtx := context.WithoutCancel(ctx)
+	s.publish(persistCtx, run, "metadata", map[string]string{"run_id": run.RunID})
+	_ = s.store.SaveRunCompletion(persistCtx, RunCompletion{
+		RunID: run.RunID, ThreadID: run.ThreadID, Status: "error",
+		Duration: time.Since(startedAt), CompletedAt: time.Now().UTC(),
+	})
+	_, _ = s.store.UpdateRun(persistCtx, run.RunID, RunUpdate{Status: "error", RiskLevel: "unknown"})
+	_ = s.registry.Complete(persistCtx, run.RunID, runtime.StatusFailed)
+	s.publish(persistCtx, run, "error", map[string]any{"message": err.Error(), "type": fmt.Sprintf("%T", err)})
+	s.publish(persistCtx, run, "end", runtime.RunEnd{Status: "error", Error: err.Error()})
+	s.logger.ErrorContext(ctx, "preparing agent run", "run_id", run.RunID, "elapsed", time.Since(startedAt), "error", err)
+}
+
+func normalizedRunRiskLevel(level, status string) string {
+	if level = strings.ToLower(strings.TrimSpace(level)); level != "" {
+		return level
+	}
+	if status == "success" {
+		return "pass"
+	}
+	return "unknown"
+}
+
+func accountingAdvanced(next, current runtime.Totals) bool {
+	if next.LLMCalls < current.LLMCalls ||
+		next.InputTokens < current.InputTokens ||
+		next.OutputTokens < current.OutputTokens ||
+		next.CachedInputTokens < current.CachedInputTokens ||
+		next.LeadTokens < current.LeadTokens ||
+		next.SubagentTokens < current.SubagentTokens ||
+		next.MiddlewareTokens < current.MiddlewareTokens ||
+		next.CostMicros < current.CostMicros {
+		return false
+	}
+	return next != current
+}
+
+func normalizeTaskMessages(in []message.Message) []message.Message {
+	if in == nil {
+		return nil
+	}
+	out := message.CloneAll(in)
+	for i := range out {
+		out[i] = message.StampSubagentStatus(out[i])
+	}
+	return out
 }
 
 func errorString(err error) string {

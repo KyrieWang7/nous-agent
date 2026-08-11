@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/acp"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/compaction"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/guardrail"
@@ -29,20 +32,34 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/openai"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/modelrouter"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/plugin"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/prompt"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/local"
+	remotesandbox "github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/remote"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/skill"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/subagent"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/swarm"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/telemetry"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool/builtin"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool/community"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
-const systemPrompt = `You are Nous, a pragmatic coding agent. Work directly in the provided workspace. Inspect before editing, preserve unrelated changes, use tools when needed, and report concrete results. Never claim a command succeeded unless its output proves it.`
+const (
+	sandboxVirtualRoot  = "/mnt/user-data"
+	delegatedTaskPrompt = `
+
+<delegated_task>
+You are a delegated subagent. Complete the assigned prompt directly, do not
+create nested tasks, and return concrete findings to the team lead. When Swarm
+messaging tools are available, use send_message with to="team-lead" to report
+or coordinate, and do not change team lifecycle.
+</delegated_task>`
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -59,7 +76,7 @@ func run() error {
 		return err
 	}
 
-	apiOpts := langgraphapi.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval}
+	apiOpts := langgraphapi.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval, Pricer: buildPricer(cfg.Models)}
 	apiOpts.Bus = runtime.NewMemoryBus(runtime.BusOptions{
 		RingCapacity:     cfg.Runtime.EventBufferSize,
 		SubscriberBuffer: cfg.Runtime.EventBufferSize,
@@ -115,8 +132,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer built.Close()
-	apiOpts.Agent = built.agent
+	reloadable, err := newReloadableAgent(*configPath, cfg, built, func(reloaded config.Config) (builtAgent, error) {
+		return buildAgent(reloaded, taskStore, pool)
+	})
+	if err != nil {
+		built.Close()
+		return err
+	}
+	defer reloadable.Close()
+	apiOpts.Agent = reloadable
 	apiOpts.AllowedTools = built.tools
 	api, err := langgraphapi.New(apiOpts)
 	if err != nil {
@@ -155,10 +179,11 @@ func openPool(databaseURL string) (*pgxpool.Pool, error) {
 }
 
 type builtAgent struct {
-	agent langgraphapi.Agent
-	tools []string
-	close []func() error
-	chain *middleware.Chain
+	agent  langgraphapi.Agent
+	tools  []string
+	pricer *runtime.Pricer
+	close  []func() error
+	chain  *middleware.Chain
 }
 
 func (b builtAgent) Close() {
@@ -167,12 +192,6 @@ func (b builtAgent) Close() {
 			slog.Warn("closing agent dependency", "error", err)
 		}
 	}
-}
-
-type fixedToolSet []string
-
-func (f fixedToolSet) Resolve(*middleware.State) ([]string, []string) {
-	return append([]string(nil), f...), nil
 }
 
 func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.Pool) (builtAgent, error) {
@@ -213,6 +232,16 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, err
 		}
 	}
+	router, err := modelrouter.New(modelrouter.Config{
+		Models:        map[modelrouter.Tier]model.Model{modelrouter.TierStandard: m},
+		NamedModels:   namedModels,
+		Stream:        true,
+		Compactor:     compactor,
+		OnStreamEvent: publishModelStreamEvent,
+	})
+	if err != nil {
+		return builtAgent{}, err
+	}
 
 	registry := tool.NewRegistry()
 	var closers []func() error
@@ -220,9 +249,17 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Sandbox.Enabled {
 		switch cfg.Sandbox.Provider {
 		case "local":
-			sandboxProvider = local.NewProvider(local.Options{BaseDir: cfg.Sandbox.BaseDir, ExecTimeout: cfg.Sandbox.ExecTimeout})
+			sandboxProvider = local.NewProvider(local.Options{BaseDir: cfg.Sandbox.BaseDir, VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.Sandbox.ExecTimeout})
 		case "docker":
 			sandboxProvider, err = newDockerSandbox(cfg.Sandbox)
+			if err != nil {
+				return builtAgent{}, err
+			}
+		case "remote":
+			sandboxProvider, err = remotesandbox.NewProvider(remotesandbox.Options{
+				BaseURL: cfg.Sandbox.RemoteURL, Headers: cfg.Sandbox.RemoteHeaders,
+				VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.Sandbox.ExecTimeout,
+			})
 			if err != nil {
 				return builtAgent{}, err
 			}
@@ -236,6 +273,26 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	}
 	if err := registry.Register(builtin.WriteTodos()); err != nil {
 		return builtAgent{}, err
+	}
+	for _, toolConfig := range cfg.Tools {
+		if toolConfig.Name != "web_search" && toolConfig.Name != "web_fetch" && toolConfig.Name != "image_search" {
+			continue
+		}
+		apiKey := toolConfig.APIKey
+		if apiKey == "" {
+			if toolConfig.Name == "web_fetch" {
+				apiKey = os.Getenv("JINA_API_KEY")
+			} else {
+				apiKey = os.Getenv("TAVILY_API_KEY")
+			}
+		}
+		definition, definitionErr := community.Definition(community.Options{Name: toolConfig.Name, APIKey: apiKey, MaxResults: toolConfig.MaxResults, Timeout: toolConfig.Timeout})
+		if definitionErr != nil {
+			return builtAgent{}, definitionErr
+		}
+		if err := registry.Register(definition); err != nil {
+			return builtAgent{}, err
+		}
 	}
 	for name, server := range cfg.Extensions.MCPServers {
 		if !server.Enabled {
@@ -267,16 +324,48 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		}
 		closers = append(closers, client.Close)
 	}
+	if cfg.Plugins.Enabled {
+		reserved := append(registry.Names(), "task", "team_create", "team_delete", "list_teammates", "send_message", "invoke_acp_agent")
+		contributions, pluginErr := plugin.Load(cfg.Plugins.Directories, reserved)
+		if pluginErr != nil {
+			return builtAgent{}, pluginErr
+		}
+		for _, contribution := range contributions {
+			if _, modeErr := permission.ParseMode(contribution.RequiredPermission); modeErr != nil {
+				return builtAgent{}, fmt.Errorf("agentd: plugin tool %q: %w", contribution.Definition.Name, modeErr)
+			}
+			if err := registry.Register(contribution.Definition); err != nil {
+				return builtAgent{}, err
+			}
+		}
+	}
+	if len(cfg.ACPAgents) > 0 {
+		agents := make(map[string]acp.AgentConfig, len(cfg.ACPAgents))
+		for name, agentConfig := range cfg.ACPAgents {
+			agents[name] = acp.AgentConfig{
+				Command: agentConfig.Command, Args: agentConfig.Args, Env: agentConfig.Env,
+				Description: agentConfig.Description, Model: agentConfig.Model,
+				AutoApprovePermissions: agentConfig.AutoApprovePermissions,
+			}
+		}
+		definition, acpErr := acp.Tool(acp.Options{Agents: agents, WorkRoot: filepath.Join(cfg.Sandbox.BaseDir, "acp-workspace")})
+		if acpErr != nil {
+			return builtAgent{}, acpErr
+		}
+		if err := registry.Register(definition); err != nil {
+			return builtAgent{}, err
+		}
+	}
 	policy, err := permission.NewPolicy(permission.Config{Mode: cfg.Permissions.Mode, ToolOverrides: cfg.Permissions.ToolOverrides})
 	if err != nil {
 		return builtAgent{}, err
 	}
 	var swarmManager *swarm.Manager
-	if cfg.Swarm.Enabled {
-		if pool == nil {
-			return builtAgent{}, errors.New("agentd: swarm requires runtime.database_url")
-		}
-		swarmManager, err = swarm.New(pool)
+	if cfg.Swarm.Enabled && pool == nil {
+		return builtAgent{}, errors.New("agentd: swarm requires runtime.database_url")
+	}
+	if pool != nil {
+		swarmManager, err = swarm.New(pool, swarm.Options{MaxTeamSize: cfg.Swarm.MaxTeamSize})
 		if err != nil {
 			return builtAgent{}, err
 		}
@@ -284,8 +373,27 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, err
 		}
 	}
+	var skillRegistry *skill.Registry
+	var promptSkills []prompt.Skill
+	if cfg.Skills.Enabled {
+		if cfg.Skills.Path == "" {
+			return builtAgent{}, errors.New("agentd: skills.path is required when skills are enabled")
+		}
+		skillRegistry, err = skill.LoadFiltered(cfg.Skills.Path, cfg.Skills.Disabled)
+		if err != nil {
+			return builtAgent{}, fmt.Errorf("agentd: loading skills: %w", err)
+		}
+		for _, meta := range skillRegistry.List() {
+			loaded, getErr := skillRegistry.Get(meta.Name)
+			if getErr != nil {
+				return builtAgent{}, getErr
+			}
+			promptSkills = append(promptSkills, prompt.Skill{Name: meta.Name, Description: meta.Description, Path: loaded.Path})
+		}
+	}
 	telemetryMiddleware := telemetry.New("nous-agent-go")
 	var hookMiddleware middleware.Middleware
+	var hookRunner *hooks.Runner
 	var configuredHooks []hooks.Hook
 	for _, hookConfig := range cfg.Hooks {
 		if !hookConfig.Enabled {
@@ -305,7 +413,8 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		})
 	}
 	if len(configuredHooks) > 0 {
-		hookRunner, runnerErr := hooks.NewRunner(configuredHooks, func(name string, err error) {
+		var runnerErr error
+		hookRunner, runnerErr = hooks.NewRunner(configuredHooks, func(name string, err error) {
 			slog.Warn("hook failed open", "hook", name, "error", err)
 		})
 		if runnerErr != nil {
@@ -331,12 +440,20 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			guardrailOutput = mw.NewGuardrailOutput(evaluator)
 		}
 	}
+	toolSet := runtimeToolSet{
+		registry:        registry,
+		policy:          policy,
+		defaultSubagent: cfg.Subagents.Enabled,
+		defaultSwarm:    cfg.Swarm.Enabled,
+	}
 	baseChain := func() []middleware.Middleware {
 		chain := []middleware.Middleware{
 			mw.NewThreadData(cfg.Sandbox.BaseDir, true),
 			mw.NewUploads(),
 			mw.NewTodo(),
+			router.RuntimeOptions(),
 			mw.NewViewImage(),
+			mw.NewSwarmSession(swarmManager),
 			telemetryMiddleware,
 			mw.NewDanglingToolCall(),
 			mw.NewPermission(policy, registry),
@@ -361,34 +478,60 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			mw.NewSafetyFinishReason(),
 		)
 		if swarmManager != nil {
-			chain = append(chain, mw.NewInboxPoller(swarmManager, cfg.Swarm.PollLimit))
+			chain = append(chain, mw.NewInboxPoller(swarmManager, cfg.Swarm.PollLimit, cfg.Swarm.MessagePollInterval))
 		}
 		return chain
 	}
-	if cfg.Subagents.Enabled {
-		manager := subagent.NewManager(func(def subagent.Definition, allowed []string) (*loop.Runner, error) {
-			filtered := allowed[:0]
-			for _, name := range allowed {
-				if name != "task" {
-					filtered = append(filtered, name)
-				}
-			}
-			childChain := append(baseChain(), mw.NewClarification())
-			childDeclared := append(baseMiddlewareNames(cfg, hookMiddleware != nil, swarmManager != nil), middleware.TerminalName)
-			child, err := harness.New(harness.Options{Model: m, Registry: registry, Middleware: childChain, DeclaredMiddleware: childDeclared, ToolSet: fixedToolSet(filtered), Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
-			if err != nil {
-				return nil, err
-			}
-			return child.Runner(), nil
-		}, taskStore, cfg.Subagents.TaskTTL, cfg.Subagents.MaxConcurrent)
-		for _, def := range subagent.Builtins() {
-			if err := manager.Register(def); err != nil {
-				return builtAgent{}, err
-			}
+	subagentDefs := subagent.Builtins()
+	promptSubagents := make([]prompt.Subagent, 0, len(subagentDefs))
+	for _, def := range subagentDefs {
+		promptSubagents = append(promptSubagents, prompt.Subagent{Name: def.Name, Description: def.Description})
+	}
+	promptACPAgents := make([]prompt.Subagent, 0, len(cfg.ACPAgents))
+	for name, agentConfig := range cfg.ACPAgents {
+		promptACPAgents = append(promptACPAgents, prompt.Subagent{Name: name, Description: agentConfig.Description})
+	}
+	promptOptions := prompt.ProductionOptions{
+		WorkspaceRoot: sandboxVirtualRoot,
+		Skills:        promptSkills,
+		Subagents:     promptSubagents,
+		ACPAgents:     promptACPAgents,
+		MaxConcurrent: cfg.Subagents.MaxConcurrent,
+	}
+	childPrompt := prompt.Production(promptOptions, prompt.RuntimeOptions{}) + delegatedTaskPrompt
+	manager := subagent.NewManager(func(def subagent.Definition, allowed []string) (*loop.Runner, error) {
+		childChain := baseChain()
+		childDeclared := baseMiddlewareNames(cfg, hookMiddleware != nil, swarmManager != nil)
+		if cfg.Skills.Enabled {
+			childChain = append(childChain, mw.NewSkillActivation(skillRegistry, registry, cfg.Skills.Force))
+			childDeclared = append(childDeclared, mw.NameSkillActivation)
 		}
-		if err := registry.Register(manager.TaskTool()); err != nil {
+		childChain = append(childChain, mw.NewClarification())
+		childDeclared = append(childDeclared, middleware.TerminalName)
+		child, err := harness.New(harness.Options{Sampler: router, Registry: registry, Middleware: childChain, DeclaredMiddleware: childDeclared, ToolSet: newRestrictedToolSet(toolSet, allowed), Publisher: subagentProgressPublisher{}, Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
+		if err != nil {
+			return nil, err
+		}
+		return child.Runner(), nil
+	}, taskStore, cfg.Subagents.TaskTTL, cfg.Subagents.MaxConcurrent)
+	manager.SetHookRunner(hookRunner)
+	if swarmManager != nil {
+		manager.SetLifecycle(newSwarmSubagentLifecycle(swarmManager))
+	}
+	manager.SetTimeoutResolver(func(parent runtime.RunContext, req subagent.DispatchRequest) time.Duration {
+		return subagentTimeout(cfg, parent, req)
+	})
+	for _, def := range subagentDefs {
+		if def.MaxTurns > cfg.Subagents.MaxTurns {
+			def.MaxTurns = cfg.Subagents.MaxTurns
+		}
+		def.SystemPrompt = childPrompt + fmt.Sprintf("\n\n<subagent_profile>\nName: %s\nPurpose: %s\n\n%s\n</subagent_profile>", def.Name, def.Description, def.SystemPrompt)
+		if err := manager.Register(def); err != nil {
 			return builtAgent{}, err
 		}
+	}
+	if err := registry.Register(telemetryMiddleware.InstrumentToolDefinition(manager.TaskTool())); err != nil {
+		return builtAgent{}, err
 	}
 	chain := baseChain()
 	if cfg.Memory.Enabled {
@@ -409,14 +552,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		chain = append(chain, mw.NewTitle(runtime.InstrumentModel(m, runtime.BucketMiddleware, "title"), cfg.Title.MaxWords, cfg.Title.MaxChars))
 	}
 	if cfg.Skills.Enabled {
-		if cfg.Skills.Path == "" {
-			return builtAgent{}, errors.New("agentd: skills.path is required when skills are enabled")
-		}
-		skills, err := skill.LoadFiltered(cfg.Skills.Path, cfg.Skills.Disabled)
-		if err != nil {
-			return builtAgent{}, fmt.Errorf("agentd: loading skills: %w", err)
-		}
-		chain = append(chain, mw.NewSkillActivation(skills, registry, cfg.Skills.Force))
+		chain = append(chain, mw.NewSkillActivation(skillRegistry, registry, cfg.Skills.Force))
 	}
 	chain = append(chain, mw.NewClarification())
 	declared := append(baseMiddlewareNames(cfg, hookMiddleware != nil, swarmManager != nil), middleware.TerminalName)
@@ -429,25 +565,39 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Skills.Enabled {
 		declared = append(declared, mw.NameSkillActivation)
 	}
-	router, err := modelrouter.New(modelrouter.Config{
-		Models:        map[modelrouter.Tier]model.Model{modelrouter.TierStandard: m},
-		NamedModels:   namedModels,
-		Stream:        true,
-		Compactor:     compactor,
-		OnStreamEvent: publishModelStreamEvent,
-	})
+	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, Middleware: chain, DeclaredMiddleware: declared, ToolSet: toolSet, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
 	if err != nil {
 		return builtAgent{}, err
 	}
-	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, Middleware: chain, DeclaredMiddleware: declared, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
-	if err != nil {
-		return builtAgent{}, err
+	promptBuilder := func(values map[string]any) string {
+		swarmEnabled := mapBool(values, valueSwarmEnabled, cfg.Swarm.Enabled)
+		subagentEnabled := mapBool(values, valueSubagentEnabled, cfg.Subagents.Enabled) || swarmEnabled
+		return prompt.Production(promptOptions, prompt.RuntimeOptions{Subagents: subagentEnabled, Swarm: swarmEnabled})
 	}
-	return builtAgent{agent: langgraphapi.HarnessAgent{Runner: h.Runner(), SystemPrompt: systemPrompt, Sandbox: sandboxProvider, InitialValues: map[string]any{"supports_vision": m.Info().SupportsVision}}, tools: registry.Names(), close: closers, chain: h.Chain()}, nil
+	initialValues := map[string]any{
+		valueSubagentEnabled:       cfg.Subagents.Enabled,
+		valueSwarmEnabled:          cfg.Swarm.Enabled,
+		modelrouter.ValueModelName: mc.Name,
+	}
+	return builtAgent{agent: langgraphapi.HarnessAgent{Runner: h.Runner(), SystemPrompt: promptBuilder(initialValues), SystemPromptBuilder: promptBuilder, Sandbox: sandboxProvider, InitialValues: initialValues}, tools: registry.Names(), pricer: buildPricer(cfg.Models), close: closers, chain: h.Chain()}, nil
+}
+
+func subagentTimeout(cfg config.Config, parent runtime.RunContext, req subagent.DispatchRequest) time.Duration {
+	if valueBool(parent.Values, valueSwarmEnabled) {
+		return cfg.Swarm.TeammateTimeout
+	}
+	name := strings.TrimSpace(req.SubagentType)
+	if name == "" {
+		name = strings.TrimSpace(req.Agent)
+	}
+	return cfg.Subagents.TimeoutFor(name)
 }
 
 func buildModel(mc config.ModelConfig) (model.Model, error) {
-	providerConfig := model.ProviderConfig{Name: mc.Name, Model: mc.Model, BaseURL: mc.BaseURL, APIKey: mc.APIKey, MaxTokens: mc.MaxTokens, ContextLength: mc.ContextLength, SupportsThinking: mc.SupportsThinking, SupportsVision: mc.SupportsVision, ExtraBody: mc.ExtraBody, Timeout: mc.Timeout}
+	providerConfig := model.ProviderConfig{Name: mc.Name, Model: mc.Model, BaseURL: mc.BaseURL, APIKey: mc.APIKey, MaxTokens: mc.MaxTokens, Temperature: mc.Temperature, ContextLength: mc.ContextLength, SupportsThinking: mc.SupportsThinking, SupportsReasoningEffort: mc.SupportsReasoningEffort, SupportsVision: mc.SupportsVision, ExtraBody: mc.ExtraBody, Timeout: mc.Timeout}
+	if mc.WhenThinkingEnabled != nil {
+		providerConfig.ThinkingExtraBody = mc.WhenThinkingEnabled.ExtraBody
+	}
 	switch mc.Provider {
 	case openai.Name:
 		return openai.New(providerConfig)
@@ -458,9 +608,26 @@ func buildModel(mc config.ModelConfig) (model.Model, error) {
 	}
 }
 
+func buildPricer(models []config.ModelConfig) *runtime.Pricer {
+	prices := make(map[string]runtime.Price, len(models)*2)
+	for _, configured := range models {
+		price := runtime.Price{
+			InputPerMillion:       configured.Pricing.InputPerMillionMicros,
+			OutputPerMillion:      configured.Pricing.OutputPerMillionMicros,
+			CachedInputPerMillion: configured.Pricing.CachedInputPerMillionMicros,
+		}
+		// Providers report the upstream model ID while runtime selection uses the
+		// configured alias. Register both so direct and fallback calls agree.
+		prices[configured.Name] = price
+		prices[configured.Model] = price
+	}
+	return runtime.NewPricer(prices, runtime.Price{})
+}
+
 func baseMiddlewareNames(cfg config.Config, hasHooks, hasSwarm bool) []string {
 	names := []string{
-		mw.NameThreadData, mw.NameUploads, mw.NameTodo, mw.NameViewImage,
+		mw.NameThreadData, mw.NameUploads, mw.NameTodo, modelrouter.NameRuntimeOptions,
+		mw.NameViewImage, mw.NameSwarmSession,
 		telemetry.Name, mw.NameDanglingToolCall, mw.NamePermission,
 		mw.NameSandboxAudit, mw.NameToolErrorHandling, mw.NameToolOutputBudget,
 		mw.NameRuntimeEvents, mw.NameTokenUsage,
@@ -481,30 +648,61 @@ func baseMiddlewareNames(cfg config.Config, hasHooks, hasSwarm bool) []string {
 	return names
 }
 
+func mapBool(values map[string]any, key string, fallback bool) bool {
+	value, ok := values[key]
+	if !ok || value == nil {
+		return fallback
+	}
+	enabled, ok := value.(bool)
+	return ok && enabled
+}
+
 func publishModelStreamEvent(ctx context.Context, st *middleware.State, ev model.StreamEvent) {
 	run, ok := runtime.RunContextFrom(ctx)
 	if !ok || run.Publish == nil {
 		return
 	}
 	messageID := fmt.Sprintf("%s:%d", st.RunID, st.Iteration)
+	if run.SubagentTaskID != "" {
+		// Child replies are projected as complete task_running messages after the
+		// model phase. Streaming their raw deltas here would mix them into the
+		// lead conversation and expose partial tool-call JSON.
+		return
+	}
+	eventRunID := run.EventStreamRunID()
 	var event runtime.Event
 	switch ev.Type {
 	case model.StreamStart:
-		event = runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventMessageStart, map[string]any{"message_id": messageID})
+		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventMessageStart, map[string]any{"message_id": messageID})
 	case model.StreamTextDelta:
 		if ev.Delta == "" {
 			return
 		}
-		event = runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventContentDelta, runtime.ContentDelta{Delta: ev.Delta, MessageID: messageID})
+		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventContentDelta, runtime.ContentDelta{Delta: ev.Delta, MessageID: messageID})
 	case model.StreamThinkingDelta:
 		if ev.Delta == "" {
 			return
 		}
-		event = runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventReasoningDelta, runtime.ReasoningDelta{Delta: ev.Delta, MessageID: messageID})
+		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventReasoningDelta, runtime.ReasoningDelta{Delta: ev.Delta, MessageID: messageID})
 	case model.StreamDone:
-		event = runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventMessageStop, map[string]any{"message_id": messageID})
+		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventMessageStop, map[string]any{"message_id": messageID})
 	default:
 		return
 	}
 	run.Publish(ctx, event)
+}
+
+type subagentProgressPublisher struct{}
+
+func (subagentProgressPublisher) PublishReply(ctx context.Context, st *middleware.State, _ bool) {
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Publish == nil || run.SubagentTaskID == "" || st == nil || st.ModelOutput == nil {
+		return
+	}
+	run.Publish(ctx, runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventSubagentProgress, runtime.SubagentProgress{
+		TaskID:       run.SubagentTaskID,
+		MessageID:    fmt.Sprintf("%s:%d", st.RunID, st.Iteration),
+		MessageIndex: st.Iteration + 1,
+		Message:      st.ModelOutput.Message,
+	}))
 }

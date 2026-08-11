@@ -1,328 +1,164 @@
 # Nous Agent
 
-生产级 AI Agent 框架。基于 LangGraph 构建，融合 DeerFlow 的中间件架构和 Claude Code 的多层记忆思想。
+Nous Agent 是一套有状态、可持久化、支持 Subagent 与 Swarm 协作的 Agent Harness 产品。生产主路径由 Go 实现：
 
-不是演示项目，不是 SDK 封装，而是一套完整的有状态、可持久化、自我学习的 Agent 运行时。
+- `agent-go/`：独立的 Agent Harness 内核，负责模型循环、中间件、工具、状态、事件与持久化。
+- `gateway-go/`：控制面与文件服务，负责模型目录、配置、Skills、上传、文档转换和 Swarm 查询。
+- `frontend/`：Next.js 客户端，通过稳定的 SSE 事件契约连接 Go 服务。
 
-## 为什么需要它
+`agent/` 与 `gateway/` 是迁移期保留的 Python legacy 实现，不再是默认开发或部署入口。Go Harness 不依赖 LangGraph；`/threads` 和 `/runs` 路由只承担现有前端的线协议兼容。
 
-大多数 Agent 框架只解决了"能跑起来"的问题。它们在以下场景崩溃：
+## 默认架构
 
-- SSE 断连 → 正在生成的内容丢失
-- 页面刷新 → 对话状态消失
-- 长对话 → 上下文溢出，无法恢复
-- 跨会话 → Agent 完全忘记之前的交互
-- 沙盒故障 → 整个系统挂起
-- LLM 服务限流 → 级联雪崩拖垮网关
-- 多租户并发 → 状态竞争、内存泄漏
-
-Nous Agent 解决了以上所有问题。
-
-## 架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     前端 (Next.js)                           │
-│         SSE 自动重连 + Last-Event-ID 断点续传                │
-└──────────────┬──────────────────────────────┬───────────────┘
-               │ POST /runs/stream            │ GET /runs/{id}/stream
-               │ (创建 + 流式)                │ (断线重连)
-               ▼                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    EventBus (核心总线)                        │
-│                                                             │
-│  ┌─────────────┐    ┌──────────────┐    ┌───────────────┐  │
-│  │  发布者      │───▶│  内存缓冲区   │───▶│   订阅者       │  │
-│  │ (Agent 任务) │    │   (deque)    │    │  (SSE Queue)  │  │
-│  └─────────────┘    └──────┬───────┘    └───────────────┘  │
-│                             │                               │
-│                    ┌────────▼────────┐                      │
-│                    │  Redis Streams   │                      │
-│                    │  (持久化双写)     │                      │
-│                    └─────────────────┘                      │
-└─────────────────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Agent 运行时 (LangGraph)                        │
-│                                                             │
-│  中间件链 + 遥测审计 + 熔断保护：                              │
-│  线程数据 → 上传 → 沙盒 → 权限 → 护栏 → 动态上下文            │
-│  → LLM 熔断 → 审计 → 工具错误 → 摘要压缩 → 上下文紧缩         │
-│  → Todo 管理 → Token 分账 → 标题生成 → 记忆提取               │
-│  → 视觉注入 → 延迟工具 → 子任务限流 → 循环检测                 │
-│  → Swarm 收件箱 → 澄清拦截                                   │
-└──────────────┬──────────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────┐  ┌──────────────┐  ┌────────────────┐
-│   PostgreSQL          │  │    Redis     │  │   沙盒          │
-│ 检查点 + 记忆 + 遥测  │  │  事件总线    │  │  本地/Docker    │
-└──────────────────────┘  └──────────────┘  └────────────────┘
+```text
+Browser
+  |
+  | http://localhost:7775
+  v
+Next.js frontend
+  |-- /api/langgraph/* --> Go Agent Harness :7776
+  `-- /api/* -----------> Go Gateway       :7777
+                              |
+                   PostgreSQL / Redis (optional)
 ```
 
-## 核心设计
+默认端口：
 
-### EventBus — SSE 断连不丢数据
+| 服务 | 实现 | 端口 | 启动方式 |
+| --- | --- | ---: | --- |
+| Frontend | Next.js | 7775 | 本地 `npm run dev` |
+| Agent Harness | Go | 7776 | Docker + Air 热重载 |
+| Gateway | Go | 7777 | Docker |
+| Legacy Agent | Python | 17776 | `legacy` profile |
+| Legacy Gateway | Python | 17777 | `legacy` profile |
 
-将 Agent 执行与 SSE 推送完全解耦：
+## 核心能力
 
-- Agent 在后台 `asyncio.Task` 中独立运行（生产者）
-- SSE 端点从 EventBus 订阅事件（消费者）
-- **浏览器刷新 / 切换会话 → 后台任务继续运行至完成**
-- 重连时回放缓冲区中的历史事件 + 从断点续传
-- Redis Streams 双写 → 服务重启后仍可恢复
+- 自有模型循环与中间件链，不依赖 Python 或 LangGraph 运行时。
+- OpenAI-compatible 与 Anthropic 模型路由，支持按 run 选择模型与 thinking 配置。
+- SSE 流式响应、事件回放、取消、断线重连和 PostgreSQL/Redis 持久化。
+- 沙箱文件系统、权限控制、Hooks、MCP、Skills、Todo、摘要压缩和 Guardrails。
+- 配置化 Web 工具、命令插件、ACP v1 Agent，以及远程/Kubernetes 沙箱服务。
+- Subagent 生命周期、并发限制、状态事件和父子 Token 归因。
+- Swarm 团队、可信身份、定向消息、逐成员广播回执和收件箱轮询。
+- Go 原生 PDF、DOCX、PPTX、XLSX 转 Markdown；旧 Office 格式由 Gateway 镜像内的 LibreOffice 归一化。
 
-### 沙箱隔离 — 多租户安全
+前端兼容事件名保持为 `metadata`、`values`、`messages`、`custom`、`error`、`end`。运行时内部保留更细的 `content_delta`、`reasoning_delta`、工具、任务、用量和审计事件。
 
-生产级沙箱，借鉴 DeerFlow 的隔离设计：
-
-| 能力 | 实现 |
-|------|------|
-| 路径穿越防御 | `resolved_path.relative_to(local_root)` 阻断 `../` 和符号链接逃逸 |
-| 写保护机制 | `read_only=True` 挂载属性，越权写入报 EROFS |
-| 线程安全 | `threading.Lock` 保护所有缓存操作 |
-| LRU 驱逐 | `OrderedDict` 缓存上限 256，自动淘汰非活跃实例 |
-| 反向解析隔离 | `_agent_written_paths` 仅对 agent 写入的文件做路径还原 |
-| Per-thread 隔离 | 每个 thread_id 独立沙箱实例，防止跨会话数据泄漏 |
-
-### 遥测与 Token 分账审计 (RunJournal)
-
-精细化的多层成本归因系统：
-
-```
-┌─────────────────────────────────────────────┐
-│           RunJournal (Callback Handler)      │
-│                                             │
-│  on_chat_model_start → 采集首个 HumanMessage │
-│  on_llm_end → Token 分桶路由：               │
-│                                             │
-│    tag: lead_agent    → lead_agent_tokens    │
-│    tag: subagent:*    → subagent_tokens      │
-│    tag: middleware:*  → middleware_tokens     │
-│                                             │
-│  去重: _counted_llm_run_ids                  │
-│  延迟: latency_ms per LLM call              │
-│  缓冲: async batch flush → PostgreSQL        │
-└─────────────────────────────────────────────┘
-```
-
-每次 run 完成后自动写入 `run_completions` 表，支持按 thread/user 查询历史消耗。前端通过 SSE `run_completion` 事件实时获取分账数据。
-
-### LLM 容错与熔断器 (Circuit Breaker)
-
-抵御级联雪崩的三层防护：
-
-```
-请求 → [Circuit Breaker 检查] → [LLM 调用] → [成功 → reset]
-              │                       │
-              │ OPEN: fast-fail       │ 失败 → classify
-              ▼                       ▼
-         返回友好提示         ┌─ quota/auth → 不重试，返回提示
-                             ├─ busy/transient → 重试 (指数退避)
-                             └─ 连续失败 ≥ 阈值 → 熔断 (OPEN)
-```
-
-| 状态 | 行为 |
-|------|------|
-| **Closed** | 正常放行所有请求 |
-| **Open** | 快速失败，不调用 LLM，保护网关 |
-| **Half-Open** | 放行单次探测请求，成功 → Closed，失败 → Open |
-
-支持解析 `Retry-After-Ms` / `Retry-After` 响应头，自适应退避。
-
-### Prefix-Cache 优化 (DynamicContextMiddleware)
-
-通过冰冻快照模式使 System Prompt 保持 100% 静态：
-
-```
-传统方式 (每轮变化，cache miss):
-  SystemMessage: "...当前日期: 2026-05-22..."  ← 每天变化
-
-Nous Agent (冰冻快照，cache hit 95%+):
-  SystemMessage: "..."                        ← 完全静态
-  HumanMessage[hidden]: "<system-reminder>    ← 首轮注入，此后冻结
-    <memory>用户偏好 Python</memory>
-    <current_date>2026-05-22, Friday</current_date>
-  </system-reminder>"
-  HumanMessage: "用户的第一条消息"
-```
-
-跨午夜时自动在当前 turn 前追加轻量 date-update，不破坏已冻结的前缀。
-
-### 安全守卫中间件
-
-**SandboxAuditMiddleware** — Bash 命令安全审计：
-
-- Quote-Aware 复合命令拆分（字符级扫描，正确处理 `"safe" && rm -rf /`）
-- 14 条高危模式检测（fork bomb、LD_PRELOAD、/dev/tcp、base64 pipe 等）
-- 两阶段分类：整体扫描 + 逐子命令分析
-- 输入卫生检查：空命令 / NULL 字节 / 超长（>10K）拦截
-- 高危命令 → 返回 error ToolMessage（不执行），Agent 继续运行
-
-**LoopDetectionMiddleware** — 循环检测与打破：
-
-- Stable Key 桶化（read_file 行号按 200 行 bucket 归并）
-- Per-tool-type 频次限制（默认 warn=30, hard=50）+ 工具豁免覆盖
-- Schema-Safe 注入：修改 AIMessage.content 而非插入 HumanMessage
-- Hard Stop 清理：清空 tool_calls + additional_kwargs + 改 finish_reason="stop"
-
-**TodoMiddleware** — 待办管理与逃避防御：
-
-- Context-Loss 防御：`write_todos` 滑出窗口时自动注入 `<system_reminder>`
-- Premature-Exit 拦截：todos 未完成时阻止 Agent 退出，`jump_to: model`
-- Schema-Safe：completion reminder 通过 `wrap_model_call` 注入，不污染持久化消息
-
-### 记忆系统 — 多层记忆提取
-
-融合 DeerFlow 的 LLM 驱动记忆和 Claude Code 的分层思想：
-
-| 层级 | 实现 | 生命周期 |
-|------|------|---------|
-| 工作记忆 | LangGraph State（prompt buffer） | 当前请求 |
-| 情景记忆 | PostgreSQL `user_memory_sections` + `user_memory_facts` | 永久 / 按用户隔离 |
-| 程序记忆 | config.yaml + skills 定义 | 项目级 |
-
-记忆增强特性：
-- **纠错检测** — 用户说"不对/你理解错了" → 提取 correction fact（置信度 ≥ 0.95）
-- **正面确认检测** — 用户说"完全正确/就是这样" → 提取 preference fact
-- **上传过滤** — `<uploaded_files>` 标签不会污染长期记忆
-- **事实去重** — 大小写无关匹配，避免重复写入
-- **Token 预算注入** — 按置信度排序，渐进式填充至 max_tokens 上限
+Harness 会在每个新 run 前检测模型、MCP、Skill、插件与 YAML 配置变化，并以完整 generation 热切换；进行中的 run 不受影响。监听地址、PostgreSQL URL 和 Redis URL 属于进程级配置，修改后需要重启。
 
 ## 快速开始
 
-### 前置条件
-
-- Python 3.12+，[uv](https://docs.astral.sh/uv/)
-- Node.js 20+，pnpm
-- Docker（PostgreSQL + Redis）
-
-### 1. 安装
-
-```bash
-git clone https://github.com/aspect-build/nous-agent.git
-cd nous-agent
-
-# 后端
-cd agent && uv sync && cd ..
-
-# 前端
-cd frontend && pnpm install && cd ..
-```
-
-### 2. 配置
+前置条件：Docker、Node.js 20+、pnpm。只有直接在宿主机运行或测试 Go 服务时才需要 Go 1.25。
 
 ```bash
 cp .env.example .env
-# 编辑 .env：填入 API Key（OPENAI_API_KEY / MINIMAX_API_KEY / DEEPSEEK_API_KEY）
-# REDIS_URL 已预配置为本地 Docker Redis
+# 在 .env 中配置所选模型对应的 API Key。
+# Swarm 或持久化运行还需配置 DATABASE_URL；Redis 可选。
+
+make install
+make dev
 ```
 
-### 3. 启动
+打开 [http://localhost:7775](http://localhost:7775)。`make dev` 会：
+
+1. 构建并启动 `agent-go:7776` 与 `gateway-go:7777`。
+2. 在本地以前台方式启动 Frontend `:7775`。
+3. 通过 Air 监听 `agent-go/` 下的 Go、YAML 与 JSON 变更并自动重编译 Agent。
+
+常用命令：
 
 ```bash
-# 基础设施（PostgreSQL + Redis 需要先运行）
-docker compose up -d
-
-# Agent API
-cd agent && uv run uvicorn src.server:app --port 7776 --reload
-
-# 前端
-cd frontend && pnpm dev
+make backend         # 只启动 Go 后端
+make frontend        # 只启动本地前端
+make logs            # 跟随两个 Go 服务日志
+make stop            # 停止 Go 后端与本地前端
+make compose-config  # 仅验证 Compose，不启动服务
 ```
 
-打开 http://localhost:3000 开始对话。
+也可以直接使用 Compose；默认不会启动任何 Python 服务：
 
-## 配置说明
-
-| 文件 | 用途 |
-|------|------|
-| `.env` | API Key、数据库 URL、Redis URL |
-| `agent/config.yaml` | 模型、工具、沙盒、记忆、Swarm、熔断器配置 |
-| `agent/extensions_config.json` | MCP 服务器、技能开关 |
-
-### config.yaml 核心配置
-
-```yaml
-models:
-  - name: deepseek-v4-flash
-    supports_thinking: true
-
-sandbox:
-  enabled: true              # false = 关闭文件/bash 工具
-  use: src.sandbox.local:LocalSandboxProvider
-
-memory:
-  enabled: true
-  debounce_seconds: 30       # 批量记忆更新去抖
-  injection_enabled: true    # 注入 system prompt
-  max_injection_tokens: 2000
-  model_name: deepseek-v4-flash
-
-circuit_breaker:
-  failure_threshold: 5       # 连续失败 N 次后熔断
-  recovery_timeout_sec: 30   # 熔断后等待 N 秒再探测
-
-swarm:
-  enabled: false             # 多 Agent 团队模式
-  max_team_size: 5
+```bash
+docker compose up -d --build
+cd frontend
+GATEWAY_BASE_URL=http://127.0.0.1:7777 \
+HARNESS_BASE_URL=http://127.0.0.1:7776 \
+npm run dev
 ```
 
-## 项目结构
+## 配置与持久化
 
+| 文件或变量 | 用途 |
+| --- | --- |
+| `.env` | API Key、`DATABASE_URL`、`REDIS_URL` 与端口覆盖 |
+| `agent-go/config.example.yaml` | 模型、沙箱、权限、Subagent、Swarm、摘要与运行时配置 |
+| `gateway_config` volume | Gateway 管理的扩展配置 |
+| `gateway_custom_skills` volume | Gateway 管理的自定义 Skills |
+| `agent_go_data` volume | Harness 工作区与 Gateway 上传文件共享存储 |
+
+无 `DATABASE_URL` 和 `REDIS_URL` 时，Agent 可使用进程内存完成基础本地对话。生产、多实例、持久化历史与 Swarm 必须配置 PostgreSQL；多实例取消和事件恢复建议同时配置 Redis。
+
+应用 Go 数据库迁移：
+
+```bash
+make migrate
+make migrate-current
 ```
+
+## Subagent 与 Swarm
+
+Subagent 与 Swarm 以 Go 实现为准。Subagent 使用受限并发的子 Harness，子任务事件通过现有 `custom` 事件投影为 `task_started`、`task_running`、`task_completed`、`task_failed` 或 `task_timed_out`。
+
+Swarm 身份来自可信的 run context，模型不能伪造 `team_id` 或发送者。广播消息使用逐成员回执，不会被第一个轮询者独占。Swarm 依赖 PostgreSQL，并需在 Harness 配置或 run 能力中启用。
+
+## Legacy Python
+
+Python 版本仅用于迁移期对照、兼容回归和故障回退。它们位于独立 `legacy` profile，并使用不会与 Go 默认端口冲突的 `17776/17777`。启动前需要在 `.env` 中配置 legacy 使用的 `LANGGRAPH_PG_URI`：
+
+```bash
+make install-legacy
+make dev-legacy
+
+# 或只启动 Python 后端
+docker compose --profile legacy up -d --build agent gateway
+```
+
+停止 legacy 服务：
+
+```bash
+make stop-legacy
+```
+
+## 验证
+
+```bash
+cd agent-go
+go test ./...
+go test -race ./...
+go vet ./...
+go run ./internal/tools/layercheck
+
+cd ../gateway-go
+go test ./...
+go test -race ./...
+go vet ./...
+
+cd ../frontend
+pnpm typecheck
+```
+
+## 目录
+
+```text
 nous-agent/
-├── agent/src/
-│   ├── core/
-│   │   ├── event_bus.py        # EventBus（SSE 事件总线）
-│   │   ├── task_registry.py    # 后台任务生命周期管理
-│   │   ├── redis_stream.py     # Redis Streams 持久化层
-│   │   └── stream.py           # astream → SSE 格式转换
-│   ├── agents/
-│   │   ├── lead_agent/         # 主 Agent + 中间件链
-│   │   ├── memory/             # 记忆提取（队列 + 更新器 + 提示词）
-│   │   └── middlewares/        # 所有中间件实现
-│   │       ├── sandbox_audit_middleware.py       # Bash 命令安全审计
-│   │       ├── loop_detection_middleware.py      # 循环检测与打破
-│   │       ├── todo_middleware.py                # 待办管理 + 逃避防御
-│   │       ├── dynamic_context_middleware.py     # Prefix-Cache 优化
-│   │       ├── llm_error_handling_middleware.py  # 熔断器 + 自适应重试
-│   │       ├── memory_middleware.py              # 记忆提取 + 去抖
-│   │       └── ...                              # 其他 20+ 中间件
-│   ├── runtime/
-│   │   ├── journal.py          # RunJournal — Token 分账审计
-│   │   └── event_store.py      # 遥测事件持久化 (PostgreSQL)
-│   ├── api/runs.py             # SSE 流式 + 断线重连端点
-│   ├── sandbox/                # 本地 + Docker 沙盒
-│   │   └── local/
-│   │       ├── local_sandbox.py          # 路径穿越防御 + 写保护
-│   │       └── local_sandbox_provider.py # 线程安全 LRU 缓存
-│   ├── subagents/              # 子任务执行器
-│   ├── swarm/                  # 多 Agent 协作
-│   ├── tools/                  # 内置 + 社区 + MCP 工具
-│   └── server.py               # FastAPI 入口
-├── sandbox/src/                # 独立沙盒包
-│   ├── local_sandbox.py        # 生产级沙盒实现
-│   ├── path_mapping.py         # PathMapping 数据结构
-│   ├── exceptions.py           # 结构化异常体系
-│   └── providers/
-│       └── local_provider.py   # Thread-safe LRU Provider
-├── frontend/src/
-│   └── core/threads/
-│       ├── transport.ts        # SSE + 重连传输层
-│       └── hooks.ts            # useSSEStream（自动重连）
+├── agent-go/       # 主 Agent Harness
+├── gateway-go/     # 主 Gateway
+├── frontend/       # Next.js UI
+├── agent/          # legacy Python Harness
+├── gateway/        # legacy Python Gateway
 ├── docker-compose.yml
-└── config.yaml
+└── Makefile
 ```
-
-## 设计来源
-
-| 来源 | 借鉴内容 |
-|------|---------|
-| **DeerFlow** | 中间件链、沙箱隔离（LRU + 路径穿越防御）、RunJournal Token 分账、Circuit Breaker 熔断器、Prefix-Cache 冰冻快照、TodoMiddleware 逃避防御、LoopDetection Schema-Safe 注入、SandboxAudit Quote-Aware 拆分、EventBus 架构 |
-| **Claude Code** | 多层记忆哲学（工作/情景/语义分离）、按作用域管理记忆生命周期 |
-| **LangGraph Platform** | Checkpoint 状态持久化、astream 协议、SSE 线格式 |
 
 ## 协议
 

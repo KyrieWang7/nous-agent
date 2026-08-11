@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -22,8 +24,63 @@ import (
 
 type agentFunc func(context.Context, AgentRequest) (AgentResult, error)
 
+type wireProtocolContract struct {
+	SSESuccessOrder []string `json:"sse_success_order"`
+	SSEFailureOrder []string `json:"sse_failure_order"`
+}
+
+func loadWireProtocolContract(t *testing.T) wireProtocolContract {
+	t.Helper()
+	path := filepath.Join("..", "..", "..", "contracts", "harness_protocol_contract.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract wireProtocolContract
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatal(err)
+	}
+	return contract
+}
+
 func (f agentFunc) Run(ctx context.Context, req AgentRequest) (AgentResult, error) {
 	return f(ctx, req)
+}
+
+func TestAgentPanicBecomesTerminalErrorEvents(t *testing.T) {
+	store := NewMemoryStore()
+	if _, err := store.CreateThread(context.Background(), newThread("thread-panic", nil), false); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Agent: agentFunc(func(context.Context, AgentRequest) (AgentResult, error) {
+			panic("model adapter panic")
+		}),
+		Store:             store,
+		HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+
+	request := httptest.NewRequest(http.MethodPost, "/threads/thread-panic/runs/stream", strings.NewReader(`{
+		"input":{"messages":[{"type":"human","content":"hello"}]},
+		"on_disconnect":"continue"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	srv.ServeHTTP(response, request)
+
+	events := readSSE(t, io.NopCloser(strings.NewReader(response.Body.String())))
+	assertEventOrder(t, events, loadWireProtocolContract(t).SSEFailureOrder...)
+	runs, err := store.ListRuns(context.Background(), "thread-panic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "error" || runs[0].RiskLevel != "unknown" {
+		t.Fatalf("runs = %#v", runs)
+	}
 }
 
 func TestThreadStateAndHistoryContract(t *testing.T) {
@@ -47,7 +104,18 @@ func TestThreadStateAndHistoryContract(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	events := readSSE(t, resp.Body)
-	assertEventOrder(t, events, "metadata", "values", "messages", "custom", "end")
+	assertEventOrder(t, events, loadWireProtocolContract(t).SSESuccessOrder...)
+	var endPayload map[string]any
+	for _, event := range events {
+		if event.Event == "end" {
+			if err := json.Unmarshal(event.Data, &endPayload); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if endPayload["risk_level"] != "pass" {
+		t.Fatalf("end risk_level = %v, want pass", endPayload["risk_level"])
+	}
 
 	state := requestJSON(t, s.URL+"/threads/thread-1/state", http.MethodGet, "")
 	next, nextOK := state["next"].([]any)
@@ -154,6 +222,58 @@ func TestWireMessagePreservesComplexContent(t *testing.T) {
 	}
 }
 
+func TestWireMessagePreservesSubagentStatus(t *testing.T) {
+	t.Parallel()
+
+	wire := toWireMessage(message.Message{
+		Role:    message.RoleTool,
+		Name:    "task",
+		Content: "Task failed. Error: child crashed",
+		AdditionalKwargs: map[string]any{
+			message.SubagentStatusKey: message.SubagentFailed,
+			message.SubagentErrorKey:  "child crashed",
+		},
+	})
+	if got := wire.AdditionalKwargs[message.SubagentStatusKey]; got != message.SubagentFailed {
+		t.Fatalf("status = %v, want %q", got, message.SubagentFailed)
+	}
+	if got := wire.AdditionalKwargs[message.SubagentErrorKey]; got != "child crashed" {
+		t.Fatalf("error = %v, want child crashed", got)
+	}
+}
+
+func TestWireMessageStampsLegacyTaskResult(t *testing.T) {
+	t.Parallel()
+
+	wire := toWireMessage(message.Message{
+		Role:    message.RoleTool,
+		Name:    "task",
+		Content: "Task Succeeded. Result: child output",
+	})
+	if got := wire.AdditionalKwargs[message.SubagentStatusKey]; got != message.SubagentCompleted {
+		t.Fatalf("status = %v, want %q", got, message.SubagentCompleted)
+	}
+}
+
+func TestNormalizeTaskMessagesStampsPersistedTranscript(t *testing.T) {
+	t.Parallel()
+	in := []message.Message{{
+		Role:    message.RoleTool,
+		Name:    "task",
+		Content: "Task failed. Error: persisted child failure",
+	}}
+	out := normalizeTaskMessages(in)
+	if got := out[0].AdditionalKwargs[message.SubagentStatusKey]; got != message.SubagentFailed {
+		t.Fatalf("status = %v, want %q", got, message.SubagentFailed)
+	}
+	if got := out[0].AdditionalKwargs[message.SubagentErrorKey]; got != "persisted child failure" {
+		t.Fatalf("error = %v, want persisted child failure", got)
+	}
+	if in[0].AdditionalKwargs != nil {
+		t.Fatalf("normalization mutated caller input: %#v", in[0])
+	}
+}
+
 func TestNativeRoutesUseTheSameEventTypes(t *testing.T) {
 	t.Parallel()
 	s := newTestServer(t, agentFunc(func(_ context.Context, req AgentRequest) (AgentResult, error) {
@@ -214,6 +334,113 @@ func TestRuntimeDeltaProjectsToMessagesEvent(t *testing.T) {
 	}
 	if len(data) != 2 || data[0]["id"] != "run-1:0" || data[0]["content"] != "hello" {
 		t.Fatalf("data = %#v", data)
+	}
+}
+
+func TestSubagentStartProjectsToFrontendTaskStartedEvent(t *testing.T) {
+	t.Parallel()
+	e := runtime.MustEvent("run-1", "thread-1", runtime.EventSubagentStart, map[string]any{
+		"task_id":       "task-1",
+		"description":   "Inspect repository",
+		"subagent_type": "explore",
+	})
+	w, err := decodeWireEvent(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Event != "custom" {
+		t.Fatalf("event = %q, want custom", w.Event)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["type"] != "task_started" || payload["task_id"] != "task-1" || payload["description"] != "Inspect repository" || payload["subagent_type"] != "explore" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestSubagentProgressProjectsToFrontendTaskRunningEvent(t *testing.T) {
+	t.Parallel()
+	e := runtime.MustEvent("run-1", "thread-1", runtime.EventSubagentProgress, runtime.SubagentProgress{
+		TaskID:       "call-1",
+		MessageID:    "run-1:call-1:2",
+		MessageIndex: 3,
+		Message: message.Message{
+			Role:    message.RoleAssistant,
+			Content: "inspecting",
+			ToolCalls: []message.ToolCall{{
+				ID: "tool-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`),
+			}},
+		},
+	})
+	w, err := decodeWireEvent(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Event != "custom" {
+		t.Fatalf("event = %q, want custom", w.Event)
+	}
+	var payload struct {
+		Type          string      `json:"type"`
+		TaskID        string      `json:"task_id"`
+		Message       wireMessage `json:"message"`
+		MessageIndex  int         `json:"message_index"`
+		TotalMessages int         `json:"total_messages"`
+	}
+	if err := json.Unmarshal(w.Data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Type != "task_running" || payload.TaskID != "call-1" || payload.MessageIndex != 3 || payload.TotalMessages != 3 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Message.ID != "run-1:call-1:2" || payload.Message.Type != "ai" || payload.Message.Content != "inspecting" {
+		t.Fatalf("message = %#v", payload.Message)
+	}
+	if len(payload.Message.ToolCalls) != 1 || payload.Message.ToolCalls[0].Name != "read_file" {
+		t.Fatalf("tool calls = %#v", payload.Message.ToolCalls)
+	}
+}
+
+func TestSubagentResultProjectsToFrontendTerminalEvents(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		status     string
+		wantType   string
+		wantResult string
+	}{
+		{name: "completed", status: "completed", wantType: "task_completed", wantResult: "done"},
+		{name: "failed", status: "failed", wantType: "task_failed", wantResult: "child error"},
+		{name: "timed out", status: "timed_out", wantType: "task_timed_out", wantResult: "deadline"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := runtime.MustEvent("run-1", "thread-1", runtime.EventSubagentResult, map[string]any{
+				"task_id": "task-1",
+				"status":  tc.status,
+				"output":  map[string]string{"completed": "done"}[tc.status],
+				"error":   map[string]string{"failed": "child error", "timed_out": "deadline"}[tc.status],
+			})
+			w, err := decodeWireEvent(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(w.Data, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["type"] != tc.wantType || payload["task_id"] != "task-1" {
+				t.Fatalf("payload = %#v", payload)
+			}
+			key := "error"
+			if tc.status == "completed" {
+				key = "result"
+			}
+			if payload[key] != tc.wantResult {
+				t.Fatalf("payload[%q] = %v, want %q", key, payload[key], tc.wantResult)
+			}
+		})
 	}
 }
 
@@ -406,6 +633,147 @@ func TestHistoryPersistenceFailureProducesErrorAndFailedRun(t *testing.T) {
 	}
 }
 
+type failingCompletionStore struct{ *MemoryStore }
+
+func (s failingCompletionStore) SaveRunCompletion(context.Context, RunCompletion) error {
+	return errors.New("completion store unavailable")
+}
+
+func TestCompletionPersistenceFailureCannotLeaveSuccessfulRun(t *testing.T) {
+	store := failingCompletionStore{NewMemoryStore()}
+	_, _ = store.CreateThread(context.Background(), newThread("thread-completion-fail", nil), false)
+	srv, err := New(Options{Agent: agentFunc(func(context.Context, AgentRequest) (AgentResult, error) {
+		return AgentResult{Messages: []message.Message{{Role: message.RoleAssistant, Content: "answer"}}}, nil
+	}), Store: store, HeartbeatInterval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Post(ts.URL+"/threads/thread-completion-fail/runs/stream", "application/json", strings.NewReader(`{"input":{"messages":[{"type":"human","content":"hello"}]},"on_disconnect":"continue"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := readSSE(t, resp.Body)
+	assertEventOrder(t, events, "metadata", "values", "messages", "custom", "error", "end")
+	runs, err := store.ListRuns(context.Background(), "thread-completion-fail")
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs = %#v, error = %v", runs, err)
+	}
+	if runs[0].Status != "error" {
+		t.Fatalf("run status = %q, want error", runs[0].Status)
+	}
+}
+
+type failSuccessfulTerminalStore struct {
+	*MemoryStore
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *failSuccessfulTerminalStore) UpdateRun(ctx context.Context, id string, update RunUpdate) (Run, error) {
+	s.mu.Lock()
+	if update.Status == "success" && !s.failed {
+		s.failed = true
+		s.mu.Unlock()
+		return Run{}, errors.New("terminal run store unavailable")
+	}
+	s.mu.Unlock()
+	return s.MemoryStore.UpdateRun(ctx, id, update)
+}
+
+func TestTerminalRunFailureReconcilesCompletionAndRun(t *testing.T) {
+	store := &failSuccessfulTerminalStore{MemoryStore: NewMemoryStore()}
+	_, _ = store.CreateThread(context.Background(), newThread("thread-terminal-fail", nil), false)
+	srv, err := New(Options{Agent: agentFunc(func(context.Context, AgentRequest) (AgentResult, error) {
+		return AgentResult{Messages: []message.Message{{Role: message.RoleAssistant, Content: "answer"}}}, nil
+	}), Store: store, HeartbeatInterval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Post(ts.URL+"/threads/thread-terminal-fail/runs/stream", "application/json", strings.NewReader(`{"input":{"messages":[{"type":"human","content":"hello"}]},"on_disconnect":"continue"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := readSSE(t, resp.Body)
+	assertEventOrder(t, events, "metadata", "values", "messages", "custom", "error", "end")
+	runs, err := store.ListRuns(context.Background(), "thread-terminal-fail")
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs = %#v, error = %v", runs, err)
+	}
+	if runs[0].Status != "error" {
+		t.Fatalf("run status = %q, want error", runs[0].Status)
+	}
+	completion, ok := store.RunCompletion(runs[0].RunID)
+	if !ok || completion.Status != "error" {
+		t.Fatalf("completion = %#v, ok = %t", completion, ok)
+	}
+}
+
+func TestServerCloseCancelsAndWaitsForActiveRuns(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	agent := agentFunc(func(ctx context.Context, _ AgentRequest) (AgentResult, error) {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		<-release
+		return AgentResult{}, ctx.Err()
+	})
+	srv, err := New(Options{Agent: agent, HeartbeatInterval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/threads/thread-close/runs/stream", strings.NewReader(`{"input":{"messages":[{"type":"human","content":"wait"}]},"on_disconnect":"continue"}`))
+		request.Header.Set("Content-Type", "application/json")
+		srv.ServeHTTP(response, request)
+		requestDone <- response
+	}()
+	<-started
+
+	closeDone := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closeDone)
+	}()
+	<-cancelled
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before the active run exited")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the active run exited")
+	}
+	response := <-requestDone
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "event: end") {
+		t.Fatalf("run response status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	rejected := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/threads/thread-close/runs/stream", strings.NewReader(`{"input":{"messages":[]}}`))
+	request.Header.Set("Content-Type", "application/json")
+	srv.ServeHTTP(rejected, request)
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("run admitted after Close: status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+}
+
 func TestMemoryStoreSavesRunCompletion(t *testing.T) {
 	store := NewMemoryStore()
 	want := RunCompletion{RunID: "run-1", ThreadID: "thread-1", Status: "success", LLMCalls: 2, LeadTokens: 9}
@@ -415,6 +783,25 @@ func TestMemoryStoreSavesRunCompletion(t *testing.T) {
 	got, ok := store.RunCompletion("run-1")
 	if !ok || got.LLMCalls != 2 || got.LeadTokens != 9 {
 		t.Fatalf("completion = %#v, ok = %t", got, ok)
+	}
+}
+
+func TestAccountingAdvancedRejectsStaleSnapshots(t *testing.T) {
+	current := runtime.Totals{LLMCalls: 2, InputTokens: 20, OutputTokens: 10, SubagentTokens: 12}
+	newer := current
+	newer.LLMCalls++
+	newer.InputTokens += 4
+	newer.SubagentTokens += 4
+	if !accountingAdvanced(newer, current) {
+		t.Fatal("newer accounting snapshot was rejected")
+	}
+	stale := current
+	stale.LLMCalls--
+	if accountingAdvanced(stale, current) {
+		t.Fatal("stale accounting snapshot was accepted")
+	}
+	if accountingAdvanced(current, current) {
+		t.Fatal("equal accounting snapshot was accepted")
 	}
 }
 

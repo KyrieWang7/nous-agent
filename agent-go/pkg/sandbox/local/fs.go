@@ -4,19 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 )
-
-// maxFileBytes 是单次 ReadFile 的上限。
-//
-// 没有上限时一个 2 GB 的文件会直接吃满内存，而模型无论如何读不完 ——
-// 超限应当报错而不是静默截断，静默截断会让模型基于半个文件做判断。
-const maxFileBytes = 8 << 20
 
 // localFS 把虚拟路径映射到宿主路径，并拦截一切越界访问。
 type localFS struct {
@@ -123,25 +119,37 @@ func underRoot(p, root string) bool {
 }
 
 // ReadFile 实现 sandbox.FS。
-func (l *localFS) ReadFile(_ context.Context, path string) ([]byte, error) {
+func (l *localFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	host, err := l.Resolve(path)
 	if err != nil {
 		return nil, err
 	}
 
-	info, err := os.Stat(host)
+	file, err := os.Open(host)
+	if err != nil {
+		return nil, wrapStat(path, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	info, err := file.Stat()
 	if err != nil {
 		return nil, wrapStat(path, err)
 	}
 	if info.IsDir() {
 		return nil, fmt.Errorf("sandbox: %q is a directory", path)
 	}
-	if info.Size() > maxFileBytes {
-		return nil, fmt.Errorf("sandbox: %q is %d bytes, over the %d byte limit", path, info.Size(), maxFileBytes)
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("sandbox: %q is not a regular file", path)
+	}
+	if info.Size() > sandbox.MaxReadFileBytes {
+		return nil, fmt.Errorf("sandbox: %q is %d bytes, over the %d byte limit", path, info.Size(), sandbox.MaxReadFileBytes)
 	}
 
-	data, err := os.ReadFile(host)
+	data, err := sandbox.ReadAllLimited(ctx, file, sandbox.MaxReadFileBytes)
 	if err != nil {
+		if errors.Is(err, sandbox.ErrReadLimit) {
+			return nil, fmt.Errorf("sandbox: %q grew over the %d byte limit while being read: %w", path, sandbox.MaxReadFileBytes, err)
+		}
 		return nil, fmt.Errorf("sandbox: reading %q: %w", path, err)
 	}
 	return data, nil
@@ -163,19 +171,48 @@ func (l *localFS) WriteFile(_ context.Context, path string, data []byte) error {
 }
 
 // List 实现 sandbox.FS。
-func (l *localFS) List(_ context.Context, path string) ([]sandbox.Entry, error) {
+func (l *localFS) List(ctx context.Context, path string) ([]sandbox.Entry, error) {
+	entries, _, err := l.list(ctx, path, 0)
+	return entries, err
+}
+
+func (l *localFS) ListLimit(ctx context.Context, path string, limit int) ([]sandbox.Entry, bool, error) {
+	if limit <= 0 {
+		return nil, false, errors.New("sandbox: list limit must be positive")
+	}
+	return l.list(ctx, path, limit)
+}
+
+func (l *localFS) list(ctx context.Context, path string, limit int) ([]sandbox.Entry, bool, error) {
 	host, err := l.Resolve(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	entries, err := os.ReadDir(host)
+	dir, err := os.Open(host)
 	if err != nil {
-		return nil, wrapStat(path, err)
+		return nil, false, wrapStat(path, err)
 	}
+	defer func() { _ = dir.Close() }()
+	readCount := -1
+	if limit > 0 {
+		readCount = limit + 1
+	}
+	entries, err := dir.ReadDir(readCount)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, wrapStat(path, err)
+	}
+	truncated := limit > 0 && len(entries) > limit
+	if truncated {
+		entries = entries[:limit]
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
 	out := make([]sandbox.Entry, 0, len(entries))
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		entry := sandbox.Entry{Name: e.Name(), IsDir: e.IsDir()}
 		if info, err := e.Info(); err == nil {
 			entry.Size = info.Size()
@@ -183,7 +220,7 @@ func (l *localFS) List(_ context.Context, path string) ([]sandbox.Entry, error) 
 		}
 		out = append(out, entry)
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // Stat 实现 sandbox.FS。

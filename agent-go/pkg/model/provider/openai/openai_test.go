@@ -89,6 +89,22 @@ func TestNew_RequiresModel(t *testing.T) {
 	}
 }
 
+func TestNew_ReportsReasoningEffortCapability(t *testing.T) {
+	t.Parallel()
+
+	m, err := openai.New(model.ProviderConfig{
+		Name:                    "reasoning-model",
+		Model:                   "reasoning-model",
+		SupportsReasoningEffort: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Info().SupportsReasoningEffort {
+		t.Fatal("reasoning effort capability was not exposed")
+	}
+}
+
 func TestComplete_SendsExpectedRequest(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +143,34 @@ func TestComplete_SendsExpectedRequest(t *testing.T) {
 	first, _ := msgs[0].(map[string]any)
 	if first["role"] != "system" || first["content"] != "you are terse" {
 		t.Errorf("system message = %v", first)
+	}
+}
+
+func TestComplete_UsesConfiguredTemperatureAndAllowsRequestOverride(t *testing.T) {
+	t.Parallel()
+
+	configured := 0.0
+	override := 0.25
+	tests := []struct {
+		name string
+		req  model.Request
+		want float64
+	}{
+		{name: "configured explicit zero", want: configured},
+		{name: "request override", req: model.Request{Temperature: &override}, want: override},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, cap := stub(t, jsonResponse(okResponse), model.ProviderConfig{Temperature: &configured})
+			if _, err := m.Complete(context.Background(), tt.req); err != nil {
+				t.Fatal(err)
+			}
+			if got := cap.payload(t)["temperature"]; got != tt.want {
+				t.Fatalf("temperature = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -242,6 +286,73 @@ func TestComplete_PassesExtraBodyThrough(t *testing.T) {
 	thinking, ok := cap.payload(t)["thinking"].(map[string]any)
 	if !ok || thinking["type"] != "enabled" {
 		t.Fatalf("extra body was not passed through: %s", cap.body)
+	}
+}
+
+func TestComplete_ThinkingExtraBodyIsConditional(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		thinking     bool
+		wantMode     string
+		wantThinking bool
+	}{
+		{name: "disabled", thinking: false, wantMode: "ordinary"},
+		{name: "enabled", thinking: true, wantMode: "thinking", wantThinking: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, cap := stub(t, jsonResponse(okResponse), model.ProviderConfig{
+				ExtraBody: map[string]any{
+					"always_present": true,
+					"mode":           "ordinary",
+				},
+				ThinkingExtraBody: map[string]any{
+					"thinking": map[string]any{"type": "enabled"},
+					"mode":     "thinking",
+				},
+			})
+
+			if _, err := m.Complete(context.Background(), model.Request{Thinking: tt.thinking}); err != nil {
+				t.Fatal(err)
+			}
+			payload := cap.payload(t)
+			if payload["always_present"] != true || payload["mode"] != tt.wantMode {
+				t.Fatalf("payload merge = %#v", payload)
+			}
+			thinking, present := payload["thinking"].(map[string]any)
+			if present != tt.wantThinking {
+				t.Fatalf("thinking present = %v, want %v; payload = %#v", present, tt.wantThinking, payload)
+			}
+			if present && thinking["type"] != "enabled" {
+				t.Fatalf("thinking = %#v", thinking)
+			}
+		})
+	}
+}
+
+func TestComplete_RequestExtraBodyOverridesConfiguredThinkingBody(t *testing.T) {
+	t.Parallel()
+
+	m, cap := stub(t, jsonResponse(okResponse), model.ProviderConfig{
+		ExtraBody:         map[string]any{"mode": "ordinary"},
+		ThinkingExtraBody: map[string]any{"mode": "thinking", "model": "hijacked"},
+	})
+	if _, err := m.Complete(context.Background(), model.Request{
+		Thinking:  true,
+		ExtraBody: map[string]any{"mode": "request"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload := cap.payload(t)
+	if payload["mode"] != "request" {
+		t.Fatalf("mode = %v, want request", payload["mode"])
+	}
+	if payload["model"] != "test-model" {
+		t.Fatalf("structural model field was overridden: %v", payload["model"])
 	}
 }
 

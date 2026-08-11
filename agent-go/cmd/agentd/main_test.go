@@ -10,13 +10,16 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	mw "github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware/builtin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/subagent"
 )
 
 func TestAgentHTTPStreamEndToEnd(t *testing.T) {
@@ -99,16 +102,19 @@ func TestAgentHTTPStreamEndToEnd(t *testing.T) {
 	}
 }
 
-func TestPublishModelStreamEventUsesParentRunEnvelopeForChildState(t *testing.T) {
+func TestChildModelStreamUsesOnlyTaskProgressChannel(t *testing.T) {
 	t.Parallel()
 
-	var published runtime.Event
+	var published []runtime.Event
 	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
-		RunID:    "parent-run",
-		ThreadID: "parent-thread",
+		RunID:          "parent-run:task-1",
+		ParentRunID:    "parent-run",
+		EventRunID:     "parent-run",
+		ThreadID:       "parent-thread",
+		SubagentTaskID: "task-1",
 		Publish: func(_ context.Context, event runtime.Event) int64 {
-			published = event
-			return 1
+			published = append(published, event)
+			return int64(len(published))
 		},
 	})
 	st := middleware.NewState(middleware.StateInit{
@@ -118,16 +124,115 @@ func TestPublishModelStreamEventUsesParentRunEnvelopeForChildState(t *testing.T)
 	st.Iteration = 2
 
 	publishModelStreamEvent(ctx, st, model.StreamEvent{Type: model.StreamTextDelta, Delta: "hello"})
-
-	if published.RunID != "parent-run" || published.ThreadID != "parent-thread" {
-		t.Fatalf("event envelope = %s/%s, want parent-run/parent-thread", published.RunID, published.ThreadID)
+	if len(published) != 0 {
+		t.Fatalf("child delta leaked into the lead stream: %#v", published)
 	}
-	var payload runtime.ContentDelta
-	if err := json.Unmarshal(published.Data, &payload); err != nil {
+
+	st.ModelOutput = &model.Response{Message: message.Message{
+		Role:    message.RoleAssistant,
+		Content: "checking files",
+		ToolCalls: []message.ToolCall{{
+			ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`),
+		}},
+	}}
+	subagentProgressPublisher{}.PublishReply(ctx, st, true)
+	if len(published) != 1 {
+		t.Fatalf("progress events = %d, want 1", len(published))
+	}
+	event := published[0]
+	if event.Type != runtime.EventSubagentProgress || event.RunID != "parent-run" || event.ThreadID != "parent-thread" {
+		t.Fatalf("event = %#v", event)
+	}
+	var payload runtime.SubagentProgress
+	if err := json.Unmarshal(event.Data, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.MessageID != "parent-run:task-1:2" {
-		t.Fatalf("message id = %q, want child run identity", payload.MessageID)
+	if payload.TaskID != "task-1" || payload.MessageID != "parent-run:task-1:2" || payload.MessageIndex != 3 {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Message.Content != "checking files" || len(payload.Message.ToolCalls) != 1 {
+		t.Fatalf("message = %#v", payload.Message)
+	}
+}
+
+func TestBuildAgentRegistersRuntimeCapabilitiesAndBuildsPromptPerRun(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Models = []config.ModelConfig{{Name: "stub", Provider: "openai-compatible", Model: "stub", BaseURL: "http://127.0.0.1:1", ContextLength: 1000}}
+	cfg.DefaultModel = "stub"
+	cfg.Sandbox.Enabled = false
+	cfg.Subagents.Enabled = false
+	cfg.Swarm.Enabled = false
+	cfg.Title.Enabled = false
+	cfg.Summarization.Enabled = false
+
+	built, err := buildAgent(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer built.Close()
+	if !slices.Contains(built.tools, "task") {
+		t.Fatalf("registered tools = %v; task must remain a server capability", built.tools)
+	}
+	agent, ok := built.agent.(langgraphapi.HarnessAgent)
+	if !ok || agent.SystemPromptBuilder == nil {
+		t.Fatalf("agent = %T, want HarnessAgent with a prompt builder", built.agent)
+	}
+	plain := agent.SystemPromptBuilder(map[string]any{valueSubagentEnabled: false, valueSwarmEnabled: false})
+	if strings.Contains(plain, "<available_subagents>") || strings.Contains(plain, "Swarm Mode") {
+		t.Fatalf("plain prompt exposes disabled orchestration:\n%s", plain)
+	}
+	swarmPrompt := agent.SystemPromptBuilder(map[string]any{valueSwarmEnabled: true})
+	for _, section := range []string{"<available_subagents>", "Swarm Mode"} {
+		if !strings.Contains(swarmPrompt, section) {
+			t.Fatalf("swarm prompt is missing %q:\n%s", section, swarmPrompt)
+		}
+	}
+}
+
+func TestBuildAgentFailsFastWhenDefaultSwarmHasNoDatabase(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Models = []config.ModelConfig{{Name: "stub", Provider: "openai-compatible", Model: "stub", BaseURL: "http://127.0.0.1:1", ContextLength: 1000}}
+	cfg.DefaultModel = "stub"
+	cfg.Sandbox.Enabled = false
+	cfg.Swarm.Enabled = true
+	cfg.Title.Enabled = false
+	cfg.Summarization.Enabled = false
+
+	_, err := buildAgent(cfg, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "runtime.database_url") {
+		t.Fatalf("error = %v, want missing swarm database failure", err)
+	}
+}
+
+func TestSubagentTimeoutUsesProfileOverrideAndSwarmPolicy(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Subagents.Agents = map[string]config.SubagentProfileConfig{
+		"explore": {Timeout: 5 * time.Minute},
+	}
+	req := subagent.DispatchRequest{SubagentType: "explore"}
+	if got := subagentTimeout(cfg, runtime.RunContext{}, req); got != 5*time.Minute {
+		t.Fatalf("profile timeout = %s", got)
+	}
+	parent := runtime.RunContext{Values: map[string]any{valueSwarmEnabled: true}}
+	if got := subagentTimeout(cfg, parent, req); got != cfg.Swarm.TeammateTimeout {
+		t.Fatalf("swarm timeout = %s", got)
+	}
+}
+
+func TestBuildPricerUsesConfiguredAliasAndProviderModelID(t *testing.T) {
+	pricer := buildPricer([]config.ModelConfig{{
+		Name:  "fast",
+		Model: "provider-model-v1",
+		Pricing: config.ModelPricingConfig{
+			InputPerMillionMicros:  1_000_000,
+			OutputPerMillionMicros: 2_000_000,
+		},
+	}})
+	usage := model.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}
+	for _, name := range []string{"fast", "provider-model-v1"} {
+		if got := pricer.CostMicros(name, usage); got != 3_000_000 {
+			t.Fatalf("CostMicros(%q) = %d, want 3000000", name, got)
+		}
 	}
 }
 

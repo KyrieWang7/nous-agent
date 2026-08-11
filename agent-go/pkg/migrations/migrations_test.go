@@ -13,7 +13,7 @@ import (
 	"github.com/ory/dockertest/v3"
 )
 
-const latestVersion = 4
+const latestVersion = 6
 
 func TestUpMigratesFreshDatabaseAndIsIdempotent(t *testing.T) {
 	databaseURL, db := startPostgres(t)
@@ -35,6 +35,20 @@ func TestUpMigratesFreshDatabaseAndIsIdempotent(t *testing.T) {
 	}
 	if !exists {
 		t.Fatal("latest schema is missing agent_swarm_message_receipts")
+	}
+	var lifecycleColumns bool
+	if err := db.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name='agent_swarm_teams' AND column_name='description'
+		) AND EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name='agent_swarm_team_members' AND column_name='joined_at'
+		)`).Scan(&lifecycleColumns); err != nil {
+		t.Fatal(err)
+	}
+	if !lifecycleColumns {
+		t.Fatal("latest schema is missing swarm lifecycle columns")
 	}
 }
 

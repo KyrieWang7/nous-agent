@@ -8,9 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +25,7 @@ import (
 type Options struct {
 	Image          string
 	BaseDir        string
+	VirtualRoot    string
 	Shell          string
 	ExecTimeout    time.Duration
 	MaxOutputBytes int
@@ -39,6 +43,12 @@ func NewProvider(opts Options) *Provider {
 	if opts.BaseDir == "" {
 		opts.BaseDir = filepath.Join(os.TempDir(), "nous-agent-docker")
 	}
+	opts.VirtualRoot = strings.TrimSpace(opts.VirtualRoot)
+	if opts.VirtualRoot == "" {
+		opts.VirtualRoot = "/workspace"
+	} else {
+		opts.VirtualRoot = path.Clean(opts.VirtualRoot)
+	}
 	if opts.Shell == "" {
 		opts.Shell = "/bin/sh"
 	}
@@ -54,6 +64,9 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 	if key == "" {
 		return nil, errors.New("docker sandbox: key is empty")
 	}
+	if !path.IsAbs(p.opts.VirtualRoot) {
+		return nil, fmt.Errorf("docker sandbox: virtual root must be absolute: %q", p.opts.VirtualRoot)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h := p.handles[key]; h != nil {
@@ -64,15 +77,19 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, err
 	}
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("docker sandbox: resolve root: %w", err)
+	}
 	name := "nous-agent-" + safe
 	_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
-	cmd := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-v", root+":/workspace:rw", p.opts.Image, "sleep", "infinity")
+	cmd := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-v", root+":"+p.opts.VirtualRoot+":rw", p.opts.Image, "sleep", "infinity")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("docker sandbox: start: %w: %s", err, out)
 	}
 	h := &handle{name: name, root: root, opts: p.opts}
-	h.fs = &hostFS{root: root}
+	h.fs = &hostFS{root: root, virtualRoot: p.opts.VirtualRoot}
 	p.handles[key] = h
 	return h, nil
 }
@@ -98,7 +115,7 @@ type handle struct {
 }
 
 func (h *handle) ID() string     { return h.name }
-func (h *handle) Root() string   { return "/workspace" }
+func (h *handle) Root() string   { return h.opts.VirtualRoot }
 func (h *handle) FS() sandbox.FS { return h.fs }
 func (h *handle) Exec(ctx context.Context, c sandbox.Command) (*sandbox.ExecResult, error) {
 	timeout := c.Timeout
@@ -107,13 +124,13 @@ func (h *handle) Exec(ctx context.Context, c sandbox.Command) (*sandbox.ExecResu
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	work := "/workspace"
+	work := h.opts.VirtualRoot
 	if c.WorkDir != "" {
-		clean, err := cleanVirtual(c.WorkDir)
+		clean, err := cleanVirtual(c.WorkDir, h.opts.VirtualRoot)
 		if err != nil {
 			return nil, err
 		}
-		work = "/workspace/" + clean
+		work = path.Join(h.opts.VirtualRoot, clean)
 	}
 	args := []string{"exec", "-w", work}
 	for _, env := range c.Env {
@@ -145,19 +162,63 @@ func (h *handle) Exec(ctx context.Context, c sandbox.Command) (*sandbox.ExecResu
 	return nil, err
 }
 
-type hostFS struct{ root string }
+type hostFS struct {
+	root        string
+	virtualRoot string
+}
 
 func (f *hostFS) Resolve(path string) (string, error) {
-	clean, err := cleanVirtual(path)
+	clean, err := cleanVirtual(path, f.virtualRoot)
 	if err != nil {
 		return "", err
 	}
-	resolved := filepath.Join(f.root, clean)
-	rel, err := filepath.Rel(f.root, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	root, err := filepath.EvalSymlinks(f.root)
+	if err != nil {
+		return "", fmt.Errorf("docker sandbox: resolve root: %w", err)
+	}
+	resolved := filepath.Clean(filepath.Join(root, filepath.FromSlash(clean)))
+	if !underRoot(resolved, root) {
+		return "", sandbox.ErrEscape
+	}
+	resolved, err = resolveSymlinks(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !underRoot(resolved, root) {
 		return "", sandbox.ErrEscape
 	}
 	return resolved, nil
+}
+
+func resolveSymlinks(value string) (string, error) {
+	existing := value
+	var missing []string
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", fmt.Errorf("docker sandbox: cannot resolve %q", value)
+		}
+		missing = append([]string{filepath.Base(existing)}, missing...)
+		existing = parent
+	}
+
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	if len(missing) == 0 {
+		return resolved, nil
+	}
+	return filepath.Join(append([]string{resolved}, missing...)...), nil
+}
+
+func underRoot(value, root string) bool {
+	return value == root || strings.HasPrefix(value, root+string(filepath.Separator))
 }
 func (f *hostFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
@@ -167,7 +228,29 @@ func (f *hostFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(p)
+	file, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("docker sandbox: %q is a directory", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("docker sandbox: %q is not a regular file", path)
+	}
+	if info.Size() > sandbox.MaxReadFileBytes {
+		return nil, fmt.Errorf("docker sandbox: %q is %d bytes, over the %d byte limit", path, info.Size(), sandbox.MaxReadFileBytes)
+	}
+	data, err := sandbox.ReadAllLimited(ctx, file, sandbox.MaxReadFileBytes)
+	if errors.Is(err, sandbox.ErrReadLimit) {
+		return nil, fmt.Errorf("docker sandbox: %q grew over the %d byte limit while being read: %w", path, sandbox.MaxReadFileBytes, err)
+	}
+	return data, err
 }
 func (f *hostFS) WriteFile(ctx context.Context, path string, data []byte) error {
 	if err := ctx.Err(); err != nil {
@@ -183,26 +266,53 @@ func (f *hostFS) WriteFile(ctx context.Context, path string, data []byte) error 
 	return os.WriteFile(p, data, 0o640)
 }
 func (f *hostFS) List(ctx context.Context, path string) ([]sandbox.Entry, error) {
+	entries, _, err := f.list(ctx, path, 0)
+	return entries, err
+}
+func (f *hostFS) ListLimit(ctx context.Context, path string, limit int) ([]sandbox.Entry, bool, error) {
+	if limit <= 0 {
+		return nil, false, errors.New("docker sandbox: list limit must be positive")
+	}
+	return f.list(ctx, path, limit)
+}
+func (f *hostFS) list(ctx context.Context, path string, limit int) ([]sandbox.Entry, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	p, err := f.Resolve(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	entries, err := os.ReadDir(p)
+	dir, err := os.Open(p)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	defer func() { _ = dir.Close() }()
+	readCount := -1
+	if limit > 0 {
+		readCount = limit + 1
+	}
+	entries, err := dir.ReadDir(readCount)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	truncated := limit > 0 && len(entries) > limit
+	if truncated {
+		entries = entries[:limit]
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	out := make([]sandbox.Entry, 0, len(entries))
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		info, err := e.Info()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, sandbox.Entry{Name: e.Name(), IsDir: e.IsDir(), Size: info.Size(), Mode: info.Mode().String()})
 	}
-	return out, nil
+	return out, truncated, nil
 }
 func (f *hostFS) Stat(ctx context.Context, path string) (sandbox.Entry, error) {
 	if err := ctx.Err(); err != nil {
@@ -218,15 +328,32 @@ func (f *hostFS) Stat(ctx context.Context, path string) (sandbox.Entry, error) {
 	}
 	return sandbox.Entry{Name: info.Name(), IsDir: info.IsDir(), Size: info.Size(), Mode: info.Mode().String()}, nil
 }
-func cleanVirtual(path string) (string, error) {
-	path = strings.TrimPrefix(filepath.Clean(path), string(filepath.Separator))
-	if path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
-		return "", sandbox.ErrEscape
-	}
-	if path == "." {
+func cleanVirtual(value, virtualRoot string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return "", nil
 	}
-	return path, nil
+	cleaned := path.Clean(value)
+	if path.IsAbs(cleaned) {
+		root := path.Clean(virtualRoot)
+		switch {
+		case cleaned == root:
+			return "", nil
+		case root == "/":
+			cleaned = strings.TrimPrefix(cleaned, "/")
+		case strings.HasPrefix(cleaned, root+"/"):
+			cleaned = strings.TrimPrefix(cleaned, root+"/")
+		default:
+			return "", sandbox.ErrEscape
+		}
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", sandbox.ErrEscape
+	}
+	if cleaned == "." {
+		return "", nil
+	}
+	return cleaned, nil
 }
 func sanitize(s string) string {
 	var b strings.Builder

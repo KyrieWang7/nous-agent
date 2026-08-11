@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,51 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 )
+
+func TestCompleteIgnoresOpenAICompatibleExtraBody(t *testing.T) {
+	var payload map[string]any
+	temperature := 0.2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"m1","model":"claude","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer srv.Close()
+
+	m, err := New(model.ProviderConfig{
+		Name:             "a",
+		Model:            "claude",
+		BaseURL:          srv.URL,
+		SupportsThinking: true,
+		Temperature:      &temperature,
+		ExtraBody:        map[string]any{"openai_only": true},
+		ThinkingExtraBody: map[string]any{
+			"deepseek_only": true,
+			"thinking":      map[string]any{"type": "deepseek-enabled"},
+			"temperature":   1.0,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Complete(context.Background(), model.Request{Thinking: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := payload["openai_only"]; ok {
+		t.Fatalf("ordinary OpenAI extra_body leaked into Anthropic request: %#v", payload)
+	}
+	if _, ok := payload["deepseek_only"]; ok {
+		t.Fatalf("conditional DeepSeek extra_body leaked into Anthropic request: %#v", payload)
+	}
+	if payload["temperature"] != temperature {
+		t.Fatalf("temperature = %v, want %v", payload["temperature"], temperature)
+	}
+	thinking, ok := payload["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" {
+		t.Fatalf("native Anthropic thinking was overridden: %#v", payload["thinking"])
+	}
+}
 
 func TestCompleteMapsThinkingToolsAndStop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

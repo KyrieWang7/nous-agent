@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import type { PromptInputMessage } from "@/components/ai-elements/prompt-input";
 import type {
   AIMessage as AIMessageType,
-  Message,
-  ToolCallWithResult,
+  MessageContentComplex,
 } from "@/core/types";
 import type { ThreadStream } from "@/core/types/thread";
 
@@ -27,6 +26,16 @@ import {
   mergeSSEValuesMessages,
 } from "./merge-messages";
 import { MessageManager } from "./message-manager";
+import { isThreadNotFoundError } from "./thread-lifecycle";
+import {
+  FAIL_CLOSED_RESPONSE,
+  classifyRiskLevel,
+  parseMessageReplacement,
+  rawRiskLevel,
+  replaceAssistantMessage,
+  shouldFailClosedRunEnd,
+  type RunRiskVerdict,
+} from "./sse-events";
 import { fetchActiveRunId, reconnectSSE, streamSSE } from "./transport";
 import type {
   AgentThread,
@@ -47,11 +56,22 @@ function useThreadHistory(
     values: AgentThreadState | null;
     isLoading: boolean;
     tokenUsage: TokenUsage | null;
-  }>({ values: null, isLoading: !isNewThread && !!threadId, tokenUsage: null });
+    notFound: boolean;
+  }>({
+    values: null,
+    isLoading: !isNewThread && !!threadId,
+    tokenUsage: null,
+    notFound: false,
+  });
 
   useEffect(() => {
     if (isNewThread || !threadId) {
-      setState({ values: null, isLoading: false, tokenUsage: null });
+      setState({
+        values: null,
+        isLoading: false,
+        tokenUsage: null,
+        notFound: false,
+      });
       return;
     }
 
@@ -74,13 +94,29 @@ function useThreadHistory(
           };
         }
         if (threadState?.values) {
-          setState({ values: threadState.values, isLoading: false, tokenUsage: tu });
+          setState({
+            values: threadState.values,
+            isLoading: false,
+            tokenUsage: tu,
+            notFound: false,
+          });
         } else {
-          setState({ values: null, isLoading: false, tokenUsage: tu });
+          setState({
+            values: null,
+            isLoading: false,
+            tokenUsage: tu,
+            notFound: false,
+          });
         }
       })
-      .catch(() => {
-        if (!cancelled) setState({ values: null, isLoading: false, tokenUsage: null });
+      .catch((error: unknown) => {
+        if (!cancelled)
+          setState({
+            values: null,
+            isLoading: false,
+            tokenUsage: null,
+            notFound: isThreadNotFoundError(error),
+          });
       });
 
     return () => {
@@ -106,6 +142,10 @@ interface SSEStreamState {
   isLoading: boolean;
   error: unknown;
   tokenUsage: TokenUsage | null;
+  /** Raw provider value, retained for audit/debugging. */
+  riskLevel: string | null;
+  /** Stable client-side classification used for safety decisions. */
+  riskVerdict: RunRiskVerdict | null;
 }
 
 const EMPTY_STATE: AgentThreadState = {
@@ -125,6 +165,8 @@ function useSSEStream(
     isLoading: false,
     error: undefined,
     tokenUsage: initialTokenUsage,
+    riskLevel: null,
+    riskVerdict: null,
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -135,12 +177,38 @@ function useSSEStream(
   const activeRunIdRef = useRef<string | null>(null);
   // Track if we're currently reconnecting to avoid double reconnect
   const reconnectingRef = useRef(false);
+  // The Go replacement payload predates message IDs. Keep the active streamed
+  // AI ID so the compensation can still target the right transcript entry.
+  const activeMessageIdRef = useRef<string | null>(null);
+  const replacementReceivedRef = useRef(false);
+  const guardrailBlockedRef = useRef(false);
+  const previousThreadIdRef = useRef(threadId);
+
+  useEffect(() => {
+    if (previousThreadIdRef.current === threadId) return;
+    previousThreadIdRef.current = threadId;
+    abortRef.current?.abort();
+    msgManagerRef.current.clear();
+    activeRunIdRef.current = null;
+    setState({
+      values: EMPTY_STATE,
+      isLoading: false,
+      error: undefined,
+      tokenUsage: null,
+      riskLevel: null,
+      riskVerdict: null,
+    });
+  }, [threadId]);
 
   useEffect(() => {
     if (initialValues) {
       setState((prev) => {
         if (prev.isLoading) return prev;
-        return { ...prev, values: initialValues, tokenUsage: initialTokenUsage ?? prev.tokenUsage };
+        return {
+          ...prev,
+          values: initialValues,
+          tokenUsage: initialTokenUsage ?? prev.tokenUsage,
+        };
       });
     }
   }, [initialValues, initialTokenUsage]);
@@ -157,12 +225,21 @@ function useSSEStream(
 
         // There's an active run — reconnect to its stream
         reconnectingRef.current = true;
-        setState((prev) => ({ ...prev, isLoading: true, error: undefined }));
+        setState((prev) => ({
+          ...prev,
+          isLoading: true,
+          error: undefined,
+          riskLevel: null,
+          riskVerdict: null,
+        }));
 
         const ac = new AbortController();
         abortRef.current = ac;
         activeRunIdRef.current = activeRunId;
         msgManagerRef.current.clear();
+        activeMessageIdRef.current = null;
+        replacementReceivedRef.current = false;
+        guardrailBlockedRef.current = false;
 
         try {
           for await (const { event, data } of reconnectSSE(
@@ -191,7 +268,7 @@ function useSSEStream(
       }
     };
 
-    tryReconnect();
+    void tryReconnect();
     return () => {
       cancelled = true;
     };
@@ -201,19 +278,32 @@ function useSSEStream(
 
   // --- Shared event processing logic ---
   const processSSEEvent = useCallback((event: string, data: unknown) => {
-    if (event === "metadata") {
+    const dataRecord =
+      data && typeof data === "object"
+        ? (data as Record<string, unknown>)
+        : null;
+    // Some adapters preserve runtime event names inside a custom envelope.
+    // Normalize only terminal events so Python's task custom events retain
+    // their existing callback behavior.
+    const effectiveEvent =
+      event === "custom" &&
+      (dataRecord?.type === "run_end" || dataRecord?.type === "end")
+        ? "end"
+        : event;
+
+    if (effectiveEvent === "metadata") {
       const meta = data as { run_id?: string };
       if (meta.run_id) {
         activeRunIdRef.current = meta.run_id;
       }
-    } else if (event === "values") {
+    } else if (effectiveEvent === "values") {
       const newValues = data as AgentThreadState;
       msgManagerRef.current.clear();
       flushSync(() => {
         setState((prev) => {
           const prevMsgs = prev.values.messages ?? [];
-          const newMsgs = ((newValues.messages ?? []) as Message[]).map(
-            (m) => (m.id ? m : { ...m, id: crypto.randomUUID() }),
+          const newMsgs = (newValues.messages ?? []).map((m) =>
+            m.id ? m : { ...m, id: crypto.randomUUID() },
           );
           return {
             ...prev,
@@ -225,13 +315,19 @@ function useSSEStream(
           };
         });
       });
-    } else if (event === "messages") {
+    } else if (effectiveEvent === "messages") {
       const [chunk, meta] = data as [
         Record<string, unknown>,
         Record<string, unknown> | undefined,
       ];
       const messageId = msgManagerRef.current.add(chunk, meta);
       if (messageId) {
+        const chunkType = (typeof chunk.type === "string" ? chunk.type : "")
+          .replace("MessageChunk", "")
+          .toLowerCase();
+        if (chunkType === "ai" || chunkType === "assistant") {
+          activeMessageIdRef.current = messageId;
+        }
         flushSync(() => {
           setState((prev) => {
             const prevMessages = (prev.values.messages ?? []).slice();
@@ -253,8 +349,19 @@ function useSSEStream(
           });
         });
       }
-    } else if (event === "custom") {
-      const customData = data as Record<string, unknown>;
+    } else if (
+      effectiveEvent === "custom" ||
+      effectiveEvent === "message_replace"
+    ) {
+      const customData: Record<string, unknown> = {
+        ...((data && typeof data === "object" ? data : {}) as Record<
+          string,
+          unknown
+        >),
+        ...(effectiveEvent === "message_replace"
+          ? { type: "message_replace" }
+          : {}),
+      };
       if (customData.type === "token_usage") {
         setState((prev) => {
           const incoming: TokenUsage = {
@@ -266,7 +373,102 @@ function useSSEStream(
           return { ...prev, tokenUsage: incoming };
         });
       }
+      if (customData.type === "guardrail_blocked") {
+        guardrailBlockedRef.current = true;
+      }
+      const replacement = parseMessageReplacement(customData);
+      if (replacement) {
+        replacementReceivedRef.current = true;
+        let replacedMessageId: string | null = null;
+        flushSync(() => {
+          setState((prev) => {
+            const result = replaceAssistantMessage(
+              prev.values.messages ?? [],
+              replacement,
+              activeMessageIdRef.current,
+            );
+            replacedMessageId = result.messageId;
+            if (result.messageId) {
+              activeMessageIdRef.current = result.messageId;
+            }
+            return {
+              ...prev,
+              values: { ...prev.values, messages: result.messages },
+            };
+          });
+        });
+        if (replacedMessageId) {
+          // Keep the accumulator in lock-step with React state. Otherwise a
+          // late delta can append the rejected model text again.
+          if (
+            !msgManagerRef.current.replaceContent(
+              replacedMessageId,
+              replacement.content,
+            )
+          ) {
+            msgManagerRef.current.clear();
+          }
+        }
+      }
       onCustomEventRef.current?.(customData);
+    } else if (effectiveEvent === "end" || effectiveEvent === "run_end") {
+      const endData =
+        data && typeof data === "object"
+          ? (data as Record<string, unknown>)
+          : {};
+      const verdict = classifyRiskLevel(endData);
+      const raw = rawRiskLevel(endData);
+      const mustFailClosed = shouldFailClosedRunEnd(
+        endData,
+        guardrailBlockedRef.current,
+        replacementReceivedRef.current,
+      );
+
+      if (mustFailClosed) {
+        let replacedMessageId: string | null = null;
+        flushSync(() => {
+          setState((prev) => {
+            const result = replaceAssistantMessage(
+              prev.values.messages ?? [],
+              {
+                content: FAIL_CLOSED_RESPONSE,
+                messageId: activeMessageIdRef.current ?? undefined,
+              },
+              activeMessageIdRef.current,
+            );
+            replacedMessageId = result.messageId;
+            if (result.messageId) activeMessageIdRef.current = result.messageId;
+            return {
+              ...prev,
+              values: { ...prev.values, messages: result.messages },
+              isLoading: false,
+              error: new Error("Run safety verdict is missing or blocked"),
+              riskLevel: raw ?? "unknown",
+              riskVerdict: verdict,
+            };
+          });
+        });
+        if (replacedMessageId) {
+          msgManagerRef.current.replaceContent(
+            replacedMessageId,
+            FAIL_CLOSED_RESPONSE,
+          );
+        }
+        toast.error("The response could not be verified by the safety policy.");
+      } else {
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          riskLevel: raw,
+          riskVerdict: verdict,
+        }));
+      }
+      onCustomEventRef.current?.({
+        ...endData,
+        type: "run_end",
+        risk_level: raw ?? "unknown",
+        risk_verdict: verdict,
+      });
     } else if (event === "error") {
       const errData = data as {
         error?: { message?: string };
@@ -303,30 +505,36 @@ function useSSEStream(
       abortRef.current = ac;
       msgManagerRef.current.clear();
       activeRunIdRef.current = null;
+      activeMessageIdRef.current = null;
+      replacementReceivedRef.current = false;
+      guardrailBlockedRef.current = false;
 
       setState((prev) => {
         const base = prev.values ?? EMPTY_STATE;
         const optimistic = options?.optimisticValues
           ? ({ ...base, ...options.optimisticValues(base) } as AgentThreadState)
           : base;
-        return { ...prev, values: optimistic, isLoading: true, error: undefined };
+        return {
+          ...prev,
+          values: optimistic,
+          isLoading: true,
+          error: undefined,
+          riskLevel: null,
+          riskVerdict: null,
+        };
       });
 
       try {
-        for await (const { event, data } of streamSSE(
-          threadId,
-          "lead_agent",
-          {
-            input,
-            config: {
-              ...options?.config,
-              configurable: { thread_id: threadId },
-            },
-            context: options?.context,
-            command: options?.command,
-            signal: ac.signal,
+        for await (const { event, data } of streamSSE(threadId, "lead_agent", {
+          input,
+          config: {
+            ...options?.config,
+            configurable: { thread_id: threadId },
           },
-        )) {
+          context: options?.context,
+          command: options?.command,
+          signal: ac.signal,
+        })) {
           processSSEEvent(event, data);
           if (event === "error") return;
         }
@@ -356,10 +564,12 @@ function useSSEStream(
 
   return {
     values: state.values,
-    messages: (state.values.messages ?? []) as Message[],
+    messages: state.values.messages ?? [],
     isLoading: state.isLoading,
     error: state.error,
     tokenUsage: state.tokenUsage,
+    riskLevel: state.riskLevel,
+    riskVerdict: state.riskVerdict,
     submit,
     stop,
   };
@@ -391,7 +601,7 @@ export function useThreadStream({
           id: taskId,
           status: "in_progress",
           description: (data.description as string) ?? "",
-          subagent_type: "general-purpose",
+          subagent_type: (data.subagent_type as string) ?? "general-purpose",
           prompt: "",
         });
       } else if (type === "task_running") {
@@ -418,7 +628,12 @@ export function useThreadStream({
   );
 
   const history = useThreadHistory(threadId, isNewThread);
-  const stream = useSSEStream(threadId, history.values, history.tokenUsage, handleCustomEvent);
+  const stream = useSSEStream(
+    threadId,
+    history.values,
+    history.tokenUsage,
+    handleCustomEvent,
+  );
 
   const wasLoadingRef = useRef(false);
   useEffect(() => {
@@ -426,7 +641,7 @@ export function useThreadStream({
       const vals = stream.values;
       onFinish?.(vals);
       if (threadId && vals.title) {
-        gwUpdateThread(threadId, { title: vals.title }).catch(() => {});
+        gwUpdateThread(threadId, { title: vals.title }).catch(() => undefined);
       }
       void queryClient.invalidateQueries({ queryKey: ["gateway-threads"] });
     }
@@ -468,6 +683,7 @@ export function useThreadStream({
       messages: stream.messages,
       isLoading: stream.isLoading,
       isThreadLoading: history.isLoading,
+      threadNotFound: history.notFound,
       error: stream.error,
       tokenUsage: stream.tokenUsage,
       submit: submitFn,
@@ -476,12 +692,12 @@ export function useThreadStream({
       toolCalls: [],
       getToolCalls: () => [],
       branch: "",
-      setBranch: () => {},
+      setBranch: () => undefined,
       history: [],
       experimental_branchTree: { type: "sequence" as const, items: [] },
       getMessagesMetadata: () => undefined,
       assistantId: "lead_agent",
-      joinStream: async () => {},
+      joinStream: async () => undefined,
     }),
     [stream, history.isLoading, submitFn],
   );
@@ -508,7 +724,7 @@ export function useSubmitThread({
   const callback = useCallback(
     async (message: PromptInputMessage) => {
       const text = message.text.trim();
-      let attachedContents: any[] = [];
+      const attachedContents: MessageContentComplex[] = [];
       let attachedText = "";
 
       if (message.files && message.files.length > 0) {
@@ -550,12 +766,12 @@ export function useSubmitThread({
 
           if (files.length > 0) {
             const uploadRes = await uploadFiles(threadId, files);
-            if (uploadRes && uploadRes.files) {
+            if (uploadRes?.files) {
               for (const fileInfo of uploadRes.files) {
                 const originalFile = files.find(
                   (f) => f.name === fileInfo.filename,
                 );
-                const mediaType = originalFile?.type || "";
+                const mediaType = originalFile?.type ?? "";
 
                 if (mediaType.startsWith("image/") && originalFile) {
                   const base64DataUri = await new Promise<string>(
@@ -593,6 +809,7 @@ export function useSubmitThread({
       }
 
       if (isNewThread && threadId) {
+        await getAPIClient().threads.create(threadId);
         try {
           await gwCreateThread({
             id: threadId,
@@ -617,7 +834,7 @@ export function useSubmitThread({
         {
           optimisticValues(prev: AgentThreadState) {
             const prevMessages = Array.isArray(prev?.messages)
-              ? (prev.messages as Message[])
+              ? prev.messages
               : [];
             return {
               ...prev,
@@ -678,7 +895,7 @@ export function useDeleteThread() {
   return useMutation({
     mutationFn: async ({ threadId }: { threadId: string }) => {
       await apiClient.threads.delete(threadId);
-      await gwDeleteThread(threadId).catch(() => {});
+      await gwDeleteThread(threadId).catch(() => undefined);
     },
     onSuccess(_, { threadId }) {
       queryClient.setQueriesData(
@@ -703,7 +920,7 @@ export function useRenameThread() {
       title: string;
     }) => {
       await apiClient.threads.updateState(threadId, { values: { title } });
-      await gwUpdateThread(threadId, { title }).catch(() => {});
+      await gwUpdateThread(threadId, { title }).catch(() => undefined);
     },
     onSuccess(_, { threadId, title }) {
       queryClient.setQueriesData(

@@ -48,7 +48,7 @@ func (Uploads) BeforeAgent(_ context.Context, st *middleware.State) error {
 	var b strings.Builder
 	b.WriteString("<uploaded_files>\n")
 	for _, name := range names {
-		fmt.Fprintf(&b, "- %s\n  Path: %s\n", name, filepath.ToSlash(filepath.Join("/workspace/user-data/uploads", name)))
+		fmt.Fprintf(&b, "- %s\n  Path: %s\n", name, filepath.ToSlash(filepath.Join("/mnt/user-data/uploads", name)))
 	}
 	b.WriteString("</uploaded_files>")
 	st.History.Append(message.Message{Role: message.RoleSystem, Content: b.String()})

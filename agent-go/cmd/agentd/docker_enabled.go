@@ -9,5 +9,5 @@ import (
 )
 
 func newDockerSandbox(cfg config.SandboxConfig) (sandbox.Provider, error) {
-	return dockersandbox.NewProvider(dockersandbox.Options{BaseDir: cfg.BaseDir, ExecTimeout: cfg.ExecTimeout}), nil
+	return dockersandbox.NewProvider(dockersandbox.Options{BaseDir: cfg.BaseDir, VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.ExecTimeout}), nil
 }

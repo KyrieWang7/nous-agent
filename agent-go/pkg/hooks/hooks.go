@@ -46,7 +46,11 @@ type Payload struct {
 	IsError  bool            `json:"is_error,omitempty"`
 	ThreadID string          `json:"thread_id,omitempty"`
 	RunID    string          `json:"run_id,omitempty"`
+	TaskID   string          `json:"task_id,omitempty"`
 	Subagent string          `json:"subagent,omitempty"`
+	Status   string          `json:"status,omitempty"`
+	Output   string          `json:"output,omitempty"`
+	Error    string          `json:"error,omitempty"`
 }
 
 // Outcome 是一个 hook 的判定。

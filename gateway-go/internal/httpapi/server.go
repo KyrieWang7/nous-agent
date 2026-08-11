@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/catalog"
@@ -20,15 +21,33 @@ import (
 )
 
 type Server struct {
-	catalog *catalog.Catalog
-	files   *files.Manager
-	store   *store.Store
-	origins map[string]struct{}
-	handler http.Handler
+	catalog                *catalog.Catalog
+	files                  *files.Manager
+	store                  *store.Store
+	swarm                  swarmQueries
+	swarmPollInterval      time.Duration
+	swarmHeartbeatInterval time.Duration
+	origins                map[string]struct{}
+	handler                http.Handler
+}
+
+type swarmQueries interface {
+	Teams(context.Context, string) ([]store.Team, error)
+	TeamExists(context.Context, string) (bool, error)
+	Members(context.Context, string) ([]store.Member, error)
+	Messages(context.Context, string, int64, int) ([]store.Message, error)
 }
 
 func New(catalog *catalog.Catalog, files *files.Manager, store *store.Store, origins []string) *Server {
-	s := &Server{catalog: catalog, files: files, store: store, origins: make(map[string]struct{})}
+	s := &Server{
+		catalog:                catalog,
+		files:                  files,
+		store:                  store,
+		swarm:                  store,
+		swarmPollInterval:      time.Second,
+		swarmHeartbeatInterval: 15 * time.Second,
+		origins:                make(map[string]struct{}),
+	}
 	for _, origin := range origins {
 		s.origins[origin] = struct{}{}
 	}
@@ -366,7 +385,7 @@ func (s *Server) memoryStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) teams(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.Teams(r.Context(), r.URL.Query().Get("thread_id"))
+	items, err := s.swarm.Teams(r.Context(), r.URL.Query().Get("thread_id"))
 	if err != nil {
 		problem(w, 500, err)
 		return
@@ -374,7 +393,7 @@ func (s *Server) teams(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"teams": items})
 }
 func (s *Server) members(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.Members(r.Context(), r.PathValue("id"))
+	items, err := s.swarm.Members(r.Context(), r.PathValue("id"))
 	if err != nil {
 		problem(w, 500, err)
 		return
@@ -390,7 +409,18 @@ func (s *Server) swarmStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
-	members, err := s.store.Members(r.Context(), r.PathValue("id"))
+	teamID := r.PathValue("id")
+	exists, err := s.swarm.TeamExists(r.Context(), teamID)
+	if err != nil {
+		sse(w, "error", 0, map[string]string{"error": err.Error()})
+		flusher.Flush()
+		return
+	}
+	if !exists {
+		writeTeamDeleted(w, flusher, teamID)
+		return
+	}
+	members, err := s.swarm.Members(r.Context(), teamID)
 	if err != nil {
 		sse(w, "error", 0, map[string]string{"error": err.Error()})
 		flusher.Flush()
@@ -402,8 +432,8 @@ func (s *Server) swarmStream(w http.ResponseWriter, r *http.Request) {
 	if value := r.Header.Get("Last-Event-ID"); value != "" {
 		after, _ = strconv.ParseInt(value, 10, 64)
 	}
-	ticker := time.NewTicker(time.Second)
-	heartbeat := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(s.swarmPollInterval)
+	heartbeat := time.NewTicker(s.swarmHeartbeatInterval)
 	defer ticker.Stop()
 	defer heartbeat.Stop()
 	for {
@@ -411,23 +441,146 @@ func (s *Server) swarmStream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			messages, err := s.store.Messages(r.Context(), r.PathValue("id"), after, 100)
+			wroteEvent := false
+			messageStatuses := make(map[string]struct{})
+			exists, err := s.swarm.TeamExists(r.Context(), teamID)
 			if err != nil {
 				sse(w, "error", 0, map[string]string{"error": err.Error()})
 				flusher.Flush()
 				continue
 			}
-			for _, message := range messages {
-				after = message.ID
-				sse(w, "message", message.ID, message)
+			if !exists {
+				writeTeamDeleted(w, flusher, teamID)
+				return
 			}
-			if len(messages) > 0 {
+			messages, err := s.swarm.Messages(r.Context(), teamID, after, 100)
+			if err != nil {
+				sse(w, "error", 0, map[string]string{"error": err.Error()})
+				wroteEvent = true
+			} else {
+				for _, message := range messages {
+					after = message.ID
+					sse(w, "message", message.ID, message)
+					if event, ok := statusFromSwarmMessage(message); ok {
+						sse(w, "status", 0, event)
+						messageStatuses[event.AgentName] = struct{}{}
+					}
+					wroteEvent = true
+				}
+			}
+
+			currentMembers, err := s.swarm.Members(r.Context(), teamID)
+			if err != nil {
+				sse(w, "error", 0, map[string]string{"error": err.Error()})
+				wroteEvent = true
+			} else if !sameMembers(members, currentMembers) {
+				statusEvents := changedMemberStatuses(members, currentMembers, messageStatuses)
+				members = currentMembers
+				sse(w, "team_update", 0, members)
+				for _, event := range statusEvents {
+					sse(w, "status", 0, event)
+				}
+				wroteEvent = true
+			}
+			if wroteEvent {
 				flusher.Flush()
 			}
 		case now := <-heartbeat.C:
 			sse(w, "heartbeat", 0, map[string]string{"timestamp": now.UTC().Format(time.RFC3339)})
 			flusher.Flush()
 		}
+	}
+}
+
+func writeTeamDeleted(w http.ResponseWriter, flusher http.Flusher, teamID string) {
+	sse(w, "team_deleted", 0, map[string]string{"team_id": teamID})
+	flusher.Flush()
+}
+
+func sameMembers(left, right []store.Member) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Name != right[i].Name || left[i].Status != right[i].Status ||
+			!sameOptionalString(left[i].Model, right[i].Model) ||
+			!sameOptionalTime(left[i].JoinedAt, right[i].JoinedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameOptionalString(left, right *string) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func sameOptionalTime(left, right *time.Time) bool {
+	return left == nil && right == nil || left != nil && right != nil && left.Equal(*right)
+}
+
+type swarmStatusEvent struct {
+	AgentName string `json:"agent_name"`
+	Status    string `json:"status"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+func changedMemberStatuses(previous, current []store.Member, suppressed map[string]struct{}) []swarmStatusEvent {
+	previousStatuses := make(map[string]string, len(previous))
+	for _, member := range previous {
+		previousStatuses[member.Name] = member.Status
+	}
+	events := make([]swarmStatusEvent, 0)
+	for _, member := range current {
+		if _, ok := suppressed[member.Name]; ok {
+			continue
+		}
+		if previousStatuses[member.Name] == member.Status || !frontendSwarmStatus(member.Status) {
+			continue
+		}
+		events = append(events, swarmStatusEvent{AgentName: member.Name, Status: member.Status})
+	}
+	return events
+}
+
+func statusFromSwarmMessage(message store.Message) (swarmStatusEvent, bool) {
+	if message.From != "system" {
+		return swarmStatusEvent{}, false
+	}
+	prefixes := []struct {
+		prefix string
+		status string
+	}{
+		{prefix: "[Joined]", status: "active"},
+		{prefix: "[Completed]", status: "completed"},
+		{prefix: "[Failed]", status: "failed"},
+		{prefix: "[Timeout]", status: "timeout"},
+	}
+	for _, candidate := range prefixes {
+		if !strings.HasPrefix(message.Content, candidate.prefix) {
+			continue
+		}
+		detail := strings.TrimSpace(strings.TrimPrefix(message.Content, candidate.prefix))
+		name := detail
+		if candidate.status == "active" {
+			name, _, _ = strings.Cut(name, " started working on:")
+		}
+		name, _, _ = strings.Cut(name, ":")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return swarmStatusEvent{}, false
+		}
+		return swarmStatusEvent{AgentName: name, Status: candidate.status, Detail: message.Content}, true
+	}
+	return swarmStatusEvent{}, false
+}
+
+func frontendSwarmStatus(status string) bool {
+	switch status {
+	case "active", "running", "completed", "failed", "timeout":
+		return true
+	default:
+		return false
 	}
 }
 

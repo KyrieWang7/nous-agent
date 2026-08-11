@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,14 +214,9 @@ func (r *Router) Sample(ctx context.Context, st *middleware.State) (*model.Respo
 }
 
 func (r *Router) sampleNamed(ctx context.Context, name string, st *middleware.State) (*model.Response, bool, error) {
-	m, ok := r.cfg.NamedModels[name]
-	if !ok {
-		available := make([]string, 0, len(r.cfg.NamedModels))
-		for candidate := range r.cfg.NamedModels {
-			available = append(available, candidate)
-		}
-		sort.Strings(available)
-		return nil, false, fmt.Errorf("modelrouter: unknown model %q; available: %v", name, available)
+	m, err := r.namedModel(name)
+	if err != nil {
+		return nil, false, err
 	}
 
 	b := r.breakerFor("model:" + name)
@@ -242,14 +238,31 @@ func selectedModelName(st *middleware.State) string {
 	if st == nil || st.Values == nil {
 		return ""
 	}
-	name, _ := st.Values["model_name"].(string)
-	return name
+	name, _ := st.Values[ValueModelName].(string)
+	return strings.TrimSpace(name)
+}
+
+func (r *Router) namedModel(name string) (model.Model, error) {
+	m, ok := r.cfg.NamedModels[name]
+	if ok {
+		return m, nil
+	}
+	available := make([]string, 0, len(r.cfg.NamedModels))
+	for candidate := range r.cfg.NamedModels {
+		available = append(available, candidate)
+	}
+	sort.Strings(available)
+	return nil, fmt.Errorf("modelrouter: unknown model %q; available: %v", name, available)
 }
 
 // sampleWithRecovery 在单个模型上完成限流退避与上下文超限重发。
 func (r *Router) sampleWithRecovery(
 	ctx context.Context, m model.Model, st *middleware.State,
 ) (*model.Response, bool, error) {
+	if err := applyRuntimeOptions(st, m); err != nil {
+		return nil, false, err
+	}
+
 	var (
 		rateRetries    int
 		contextRetries int
@@ -342,7 +355,10 @@ func (r *Router) sampleOnce(
 		if !ok {
 			break
 		}
-		if ev.Type == model.StreamTextDelta && ev.Delta != "" {
+		// Any user-visible model bytes make retry/fallback unsafe. Reasoning is
+		// streamed on its own channel, but it is still already visible to the
+		// client and must not be followed by a second model attempt.
+		if (ev.Type == model.StreamTextDelta || ev.Type == model.StreamThinkingDelta) && ev.Delta != "" {
 			streamed = true
 		}
 		if r.cfg.OnStreamEvent != nil {
@@ -371,10 +387,18 @@ func (r *Router) tierFor(st *middleware.State) Tier {
 }
 
 func hasImage(st *middleware.State) bool {
-	if st.ModelInput == nil {
+	if st == nil {
 		return false
 	}
-	for _, m := range st.ModelInput.Messages {
+	var messages []message.Message
+	if st.ModelInput != nil {
+		messages = st.ModelInput.Messages
+	} else if st.History != nil {
+		// BeforeAgent runs before ModelInput is built. Looking at History keeps
+		// capability middleware and the sampler on the same vision-tier choice.
+		messages = st.History.All()
+	}
+	for _, m := range messages {
 		for _, b := range m.ContentBlocks {
 			if b.Type == "image" {
 				return true

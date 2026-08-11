@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getSwarmStreamURL } from "./api";
+import { ServerEventCursor, ServerEventDecoder } from "./sse";
 import type {
   SwarmMessage,
   SwarmStatusEvent,
@@ -26,10 +27,9 @@ const INITIAL_STATE: SwarmState = {
 
 export function useSwarmStream(teamId: string | null): SwarmState {
   const [state, setState] = useState<SwarmState>(INITIAL_STATE);
-  const retryRef = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
+  const generationRef = useRef(0);
 
-  const handleEvent = useCallback((event: string, data: unknown) => {
+  const handleEvent = useCallback((event: string, data: unknown): boolean => {
     switch (event) {
       case "team_update": {
         const members = data as SwarmTeamMember[];
@@ -45,89 +45,131 @@ export function useSwarmStream(teamId: string | null): SwarmState {
         const st = data as SwarmStatusEvent;
         setState((s) => ({
           ...s,
-          statuses: { ...s.statuses, [st.agent_name]: st.status as TeammateDisplayStatus },
+          statuses: {
+            ...s.statuses,
+            [st.agent_name]: st.status as TeammateDisplayStatus,
+          },
         }));
         break;
       }
       case "team_deleted":
-        setState((s) => ({ ...s, members: [], connected: false }));
-        break;
+        setState((s) => ({
+          ...s,
+          members: [],
+          statuses: {},
+          connected: false,
+          error: null,
+        }));
+        return true;
       case "error": {
         const err = data as { error: string };
         setState((s) => ({ ...s, error: err.error }));
         break;
       }
     }
+    return false;
   }, []);
 
-  const connect = useCallback(async () => {
+  useEffect(() => {
+    const generation = ++generationRef.current;
+    setState(INITIAL_STATE);
     if (!teamId) return;
 
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+    let stopped = false;
+    let terminal = false;
+    let retryCount = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | undefined;
+    const cursor = new ServerEventCursor();
 
-    try {
-      const res = await fetch(getSwarmStreamURL(teamId), {
-        signal: controller.signal,
-        headers: { Accept: "text/event-stream" },
-      });
+    const isCurrent = () => !stopped && generationRef.current === generation;
 
-      if (!res.ok) throw new Error(`SSE failed: ${res.status}`);
-
-      setState((s) => ({ ...s, connected: true, error: null }));
-      retryRef.current = 0;
-
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let currentEvent: string | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (line.startsWith("event:")) {
-            currentEvent = line.slice(6).trim();
-          } else if (line.startsWith("data:") && currentEvent) {
-            const raw = line.slice(5).trim();
-            if (!raw) continue;
-            try {
-              handleEvent(currentEvent, JSON.parse(raw));
-            } catch {
-              // ignore parse errors
-            }
-            currentEvent = null;
-          } else if (line.trim() === "") {
-            currentEvent = null;
+    const applyFrames = (
+      frames: ReturnType<ServerEventDecoder["push"]>,
+    ): void => {
+      for (const frame of frames) {
+        if (!isCurrent() || !cursor.accept(frame.id)) continue;
+        try {
+          if (handleEvent(frame.event, JSON.parse(frame.data))) {
+            terminal = true;
+            controller?.abort();
+            return;
           }
+        } catch {
+          // A malformed frame is isolated; the next complete SSE frame remains valid.
         }
       }
-    } catch (err: unknown) {
-      if (controller.signal.aborted) return;
-      const message = err instanceof Error ? err.message : "Connection lost";
-      setState((s) => ({ ...s, connected: false, error: message }));
+    };
 
-      if (retryRef.current < 10) {
-        const delay = Math.min(1000 * 2 ** retryRef.current, 30000);
-        retryRef.current++;
-        setTimeout(() => { connect(); }, delay);
+    const scheduleRetry = (connect: () => Promise<void>): void => {
+      if (!isCurrent() || terminal || retryCount >= 10) return;
+      const delay = Math.min(1000 * 2 ** retryCount, 30000);
+      retryCount++;
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        if (isCurrent() && !terminal) void connect();
+      }, delay);
+    };
+
+    const connect = async (): Promise<void> => {
+      if (!isCurrent() || terminal) return;
+      controller = new AbortController();
+      const requestHeaders: Record<string, string> = {
+        Accept: "text/event-stream",
+      };
+      if (cursor.value) requestHeaders["Last-Event-ID"] = cursor.value;
+
+      try {
+        const response = await fetch(getSwarmStreamURL(teamId), {
+          signal: controller.signal,
+          headers: requestHeaders,
+        });
+        if (!response.ok) throw new Error(`SSE failed: ${response.status}`);
+        if (!response.body) throw new Error("SSE response has no body");
+        if (!isCurrent()) return;
+
+        setState((current) => ({ ...current, connected: true, error: null }));
+        retryCount = 0;
+
+        const reader = response.body.getReader();
+        const textDecoder = new TextDecoder();
+        const eventDecoder = new ServerEventDecoder();
+        while (isCurrent() && !terminal) {
+          const { done, value } = await reader.read();
+          if (done) {
+            applyFrames(eventDecoder.push(textDecoder.decode()));
+            applyFrames(eventDecoder.finish());
+            break;
+          }
+          applyFrames(
+            eventDecoder.push(textDecoder.decode(value, { stream: true })),
+          );
+        }
+      } catch (error: unknown) {
+        if (!isCurrent() || controller.signal.aborted || terminal) return;
+        const message =
+          error instanceof Error ? error.message : "Connection lost";
+        setState((current) => ({
+          ...current,
+          connected: false,
+          error: message,
+        }));
+        scheduleRetry(connect);
+        return;
       }
-    }
-  }, [teamId, handleEvent]);
 
-  useEffect(() => {
-    if (teamId) {
-      setState(INITIAL_STATE);
-      connect();
-    }
-    return () => { abortRef.current?.abort(); };
-  }, [teamId, connect]);
+      if (!isCurrent() || terminal || controller.signal.aborted) return;
+      setState((current) => ({ ...current, connected: false }));
+      scheduleRetry(connect);
+    };
+
+    void connect();
+    return () => {
+      stopped = true;
+      controller?.abort();
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+    };
+  }, [teamId, handleEvent]);
 
   return state;
 }

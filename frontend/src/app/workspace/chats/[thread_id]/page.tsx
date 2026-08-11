@@ -1,7 +1,7 @@
 "use client";
 
 import { FilesIcon, XIcon } from "lucide-react";
-import { useParams, useSearchParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
@@ -45,6 +45,7 @@ import { cn } from "@/lib/utils";
 
 export default function ChatPage() {
   const { t } = useI18n();
+  const router = useRouter();
   const [settings, setSettings] = useLocalSettings();
   const { setOpen: setSidebarOpen } = useSidebar();
   const {
@@ -68,7 +69,10 @@ export default function ChatPage() {
   const setInputRef = useRef(promptInputController.textInput.setInput);
   setInputRef.current = promptInputController.textInput.setInput;
   useEffect(() => {
-    if (inputInitialValue && inputInitialValue !== lastInitialValueRef.current) {
+    if (
+      inputInitialValue &&
+      inputInitialValue !== lastInitialValueRef.current
+    ) {
       lastInitialValueRef.current = inputInitialValue;
       setTimeout(() => {
         setInputRef.current(inputInitialValue);
@@ -124,6 +128,11 @@ export default function ChatPage() {
       }
     },
   });
+  useEffect(() => {
+    if (thread.threadNotFound && threadIdFromPath !== "new") {
+      router.replace("/workspace/chats/new");
+    }
+  }, [router, thread.threadNotFound, threadIdFromPath]);
   useEffect(() => {
     if (thread.isLoading) setFinalState(null);
   }, [thread.isLoading]);
@@ -202,12 +211,14 @@ export default function ChatPage() {
 
   // Subagent panel state
   const { tasks: subtasks } = useSubtaskContext();
-  const subagentEnabled =
-    settings.context.mode === "ultra" || swarmEnabled;
+  const subagentEnabled = settings.context.mode === "ultra" || swarmEnabled;
   const hasSubtasks = Object.keys(subtasks).length > 0;
   const [subagentPanelDismissed, setSubagentPanelDismissed] = useState(false);
   const subagentPanelOpen =
-    subagentEnabled && hasSubtasks && !swarmPanelOpen && !subagentPanelDismissed;
+    subagentEnabled &&
+    hasSubtasks &&
+    !swarmPanelOpen &&
+    !subagentPanelDismissed;
 
   useEffect(() => {
     if (!swarmEnabled || !threadId || swarmDismissedRef.current) return;
@@ -241,8 +252,7 @@ export default function ChatPage() {
       thinking_enabled: settings.context.mode !== "flash",
       is_plan_mode:
         settings.context.mode === "pro" || settings.context.mode === "ultra",
-      subagent_enabled:
-        settings.context.mode === "ultra" || swarmEnabled,
+      subagent_enabled: settings.context.mode === "ultra" || swarmEnabled,
       swarm_enabled: swarmEnabled,
       reasoning_effort:
         settings.context.mode === "ultra"

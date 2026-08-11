@@ -7,6 +7,8 @@ package runtime
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 )
 
 // EventType 是事件类型。与设计文档 §12.4 的清单一一对应。
@@ -26,11 +28,15 @@ const (
 	EventSkillActivated EventType = "skill_activated"
 	EventSubagentStart  EventType = "subagent_start"
 	EventSubagentResult EventType = "subagent_result"
-	EventGuardrailBlock EventType = "guardrail_blocked"
-	EventUsage          EventType = "usage"
-	EventMessageStop    EventType = "message_stop"
-	EventRunEnd         EventType = "run_end"
-	EventError          EventType = "error"
+	// EventSubagentProgress carries a child model's in-flight AI message. It is
+	// projected to the frontend's task_running custom event, never to the
+	// parent's messages stream.
+	EventSubagentProgress EventType = "subagent_progress"
+	EventGuardrailBlock   EventType = "guardrail_blocked"
+	EventUsage            EventType = "usage"
+	EventMessageStop      EventType = "message_stop"
+	EventRunEnd           EventType = "run_end"
+	EventError            EventType = "error"
 )
 
 // Category 决定事件在存储压力下的取舍。
@@ -54,7 +60,8 @@ const (
 // categoryOf 返回事件类型的默认分类。
 func categoryOf(t EventType) Category {
 	switch t {
-	case EventMessageReplace, EventGuardrailBlock, EventRunEnd, EventError, EventRunStart, EventStateValues, EventMessage:
+	case EventMessageReplace, EventGuardrailBlock, EventSubagentStart, EventSubagentResult,
+		EventRunEnd, EventError, EventRunStart, EventStateValues, EventMessage:
 		return CategoryAudit
 	case EventUsage:
 		return CategoryUsage
@@ -146,8 +153,9 @@ type ReasoningDelta struct {
 
 // MessageReplace 是 message_replace 的负载：让客户端整段替换已渲染的文本。
 type MessageReplace struct {
-	Content string `json:"content"`
-	Reason  string `json:"reason,omitempty"`
+	Content   string `json:"content"`
+	MessageID string `json:"message_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // ToolStart 是 tool_start 的负载。
@@ -165,12 +173,22 @@ type ToolResult struct {
 	IsError    bool   `json:"is_error,omitempty"`
 }
 
+// SubagentProgress is the trusted child-stream envelope. Message deliberately
+// uses the canonical transcript type; the HTTP adapter converts it to the
+// LangGraph AIMessage wire shape and adds the task_id.
+type SubagentProgress struct {
+	TaskID       string          `json:"task_id"`
+	MessageID    string          `json:"message_id"`
+	MessageIndex int             `json:"message_index"`
+	Message      message.Message `json:"message"`
+}
+
 // RunEnd 是 run_end 的负载。
 type RunEnd struct {
 	Status     string `json:"status"`
 	Output     string `json:"output,omitempty"`
 	Iterations int    `json:"iterations"`
-	RiskLevel  string `json:"risk_level,omitempty"`
+	RiskLevel  string `json:"risk_level"`
 	Error      string `json:"error,omitempty"`
 }
 

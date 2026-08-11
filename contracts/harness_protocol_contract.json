@@ -1,0 +1,12 @@
+{
+  "task_required_fields": ["description", "prompt", "subagent_type"],
+  "runtime_context_fields": [
+    "thinking_enabled",
+    "reasoning_effort",
+    "subagent_enabled",
+    "swarm_enabled"
+  ],
+  "task_event_sequence": ["task_started", "task_running", "task_completed"],
+  "sse_success_order": ["metadata", "values", "messages", "custom", "end"],
+  "sse_failure_order": ["metadata", "error", "end"]
+}

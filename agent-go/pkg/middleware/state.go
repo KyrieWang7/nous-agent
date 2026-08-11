@@ -70,6 +70,10 @@ type State struct {
 
 	ModelInput  *model.Request
 	ModelOutput *model.Response
+	// UsageRecorded is set by the kernel before AfterModel. The legacy
+	// TokenUsage listener checks it so models without CallID are not billed
+	// twice while direct middleware tests and third-party runners still work.
+	UsageRecorded bool
 
 	// ToolCall / ToolResult / ToolExecErr 只在 BeforeTool / AfterTool 阶段有值。
 	ToolCall    *tool.Call

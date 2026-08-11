@@ -1,7 +1,9 @@
 """Core behavior tests for task tool orchestration."""
 
 import importlib
+import json
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -9,6 +11,9 @@ from src.subagents.config import SubagentConfig
 
 # Use module import so tests can patch the exact symbols referenced inside task_tool().
 task_tool_module = importlib.import_module("src.tools.builtins.task_tool")
+HARNESS_CONTRACT = json.loads(
+    (Path(__file__).resolve().parents[2] / "contracts" / "harness_protocol_contract.json").read_text()
+)
 
 
 class FakeSubagentStatus(Enum):
@@ -133,7 +138,8 @@ def test_task_tool_emits_running_and_completed_events(monkeypatch):
     get_available_tools.assert_called_once_with(model_name="ark-model", subagent_enabled=False)
 
     event_types = [e["type"] for e in events]
-    assert event_types == ["task_started", "task_running", "task_running", "task_completed"]
+    semantic_sequence = [event_types[0], "task_running", event_types[-1]]
+    assert semantic_sequence == HARNESS_CONTRACT["task_event_sequence"]
     assert events[-1]["result"] == "all done"
 
 

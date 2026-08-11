@@ -20,6 +20,7 @@ const (
 	GroupFileRead  = "file:read"
 	GroupFileWrite = "file:write"
 	GroupBash      = "bash"
+	maxListEntries = 1_000
 )
 
 // LS 返回列目录工具。
@@ -58,7 +59,7 @@ func handleLS(ctx context.Context, call tool.Call) (*tool.Result, error) {
 		return nil, err
 	}
 
-	entries, err := h.FS().List(ctx, args.Path)
+	entries, truncated, err := sandbox.ListWithLimit(ctx, h.FS(), args.Path, maxListEntries)
 	if err != nil {
 		return errResult(err), nil
 	}
@@ -73,6 +74,9 @@ func handleLS(ctx context.Context, call tool.Call) (*tool.Result, error) {
 			continue
 		}
 		sb.WriteString(fmt.Sprintf("%s (%d bytes)\n", e.Name, e.Size))
+	}
+	if truncated {
+		sb.WriteString(fmt.Sprintf("\n(entries truncated after %d results)\n", maxListEntries))
 	}
 	return &tool.Result{Content: strings.TrimRight(sb.String(), "\n")}, nil
 }

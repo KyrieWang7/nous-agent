@@ -33,6 +33,10 @@ type Limits struct {
 	// 按 token 限额会让 vision 与 fast 同价。
 	MaxCostMicros int64
 
+	// MaxTokens is the aggregate per-run token ceiling across the lead agent,
+	// middleware model calls, and all child agents. <= 0 means unbounded.
+	MaxTokens int
+
 	// StopReinjectionLimit 是停止门拦截后的最大续跑次数。<= 0 时用默认值。
 	//
 	// 没有这个上限，一个总是不满意的 Stop hook 就是一台无限烧钱的机器。
@@ -47,6 +51,7 @@ type Tracker struct {
 	limits  Limits
 	started time.Time
 	cost    atomic.Int64
+	tokens  atomic.Int64
 }
 
 // NewTracker 返回从此刻开始计时的 Tracker。
@@ -64,6 +69,21 @@ func (t *Tracker) CostMicros() int64 {
 	return t.cost.Load()
 }
 
+// ObserveSpend imports a monotonic aggregate snapshot, typically from the
+// run Journal shared by the lead and child agents.
+func (t *Tracker) ObserveSpend(tokens, costMicros int64) {
+	storeMax(&t.tokens, tokens)
+	storeMax(&t.cost, costMicros)
+}
+
+func storeMax(dst *atomic.Int64, value int64) {
+	for current := dst.Load(); value > current; current = dst.Load() {
+		if dst.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
 // Check 在每轮迭代开始时调用，iteration 是即将执行的轮次序号（从 0 起）。
 //
 // 检查顺序是刻意的：轮次上限最常见也最好懂，先报它能让绝大多数
@@ -74,6 +94,9 @@ func (t *Tracker) Check(iteration int) error {
 	}
 	if t.limits.Deadline > 0 && time.Since(t.started) >= t.limits.Deadline {
 		return ErrDeadline
+	}
+	if t.limits.MaxTokens > 0 && t.tokens.Load() >= int64(t.limits.MaxTokens) {
+		return ErrBudgetExhausted
 	}
 	if t.limits.MaxCostMicros > 0 && t.cost.Load() > t.limits.MaxCostMicros {
 		return ErrBudgetExhausted

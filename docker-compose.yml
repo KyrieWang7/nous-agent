@@ -1,81 +1,120 @@
-services:
-  # ==========================================================================
-  # Agent API (LangGraph Server) — port 7776
-  # ==========================================================================
-  agent:
-    build:
-      context: ./agent
-      dockerfile: Dockerfile
-    container_name: nous-agent-server
-    restart: unless-stopped
-    ports:
-      - "7776:7776"
-    volumes:
-      # Mount source code for hot-reload
-      - ./agent/src:/app/src
-      - ./agent/config.yaml:/app/config.yaml
-      - ./agent/extensions_config.json:/app/extensions_config.json
-      - ./agent/skills:/app/skills
-      # Shared data directory (threads, artifacts, uploads)
-      - agent_data:/app/.deer-flow
-    env_file:
-      - .env
-    environment:
-      - LANGGRAPH_PG_URI=postgresql://nous-ai:Nous%402026%21@host.docker.internal:5432/nous_ai_db
-      - REDIS_URL=redis://:Nous%402026%21@host.docker.internal:6379/0
-    command: ["uv", "run", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "7776", "--reload", "--reload-dir", "src"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+name: nous-agent
 
-  # ==========================================================================
-  # Go Agent Harness (optional profile) — container :7776, host :7778
-  # ==========================================================================
+services:
+  # Primary Agent Harness. Dockerfile.dev runs Air, so Go and YAML changes reload.
   agent-go:
-    profiles: ["go-harness"]
     build:
       context: ./agent-go
       dockerfile: Dockerfile.dev
     container_name: nous-agent-go-server
     restart: unless-stopped
     ports:
-      - "7778:7776"
+      - "${AGENT_PORT:-7776}:7776"
     volumes:
       - ./agent-go:/app
       - ./agent/skills/public:/agent/skills/public:ro
       - gateway_custom_skills:/agent/skills/custom:ro
       - gateway_config:/app/extensions
       - agent_go_data:/app/.nous-agent
-    env_file:
-      - .env
     environment:
-      - NOUS_AGENT_ADDR=:7776
-      - DATABASE_URL=postgresql://nous-ai:Nous%402026%21@host.docker.internal:5432/nous_ai_db?sslmode=disable
-      - REDIS_URL=redis://:Nous%402026%21@host.docker.internal:6379/0
-      - NOUS_EXTENSIONS_CONFIG_PATH=/app/extensions/extensions.json
-      - NOUS_SKILLS_PATH=/agent/skills
+      NOUS_AGENT_ADDR: ":7776"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      REDIS_URL: "${REDIS_URL:-}"
+      NOUS_EXTENSIONS_CONFIG_PATH: /app/extensions/extensions.json
+      NOUS_SKILLS_PATH: /agent/skills
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      TUYOO_BASE_URL: "${TUYOO_BASE_URL:-}"
+      TUYOO_API_KEY: "${TUYOO_API_KEY:-}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      JINA_API_KEY: "${JINA_API_KEY:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ==========================================================================
-  # Gateway API — port 7777
-  # ==========================================================================
+  # Primary control plane and file conversion service.
+  gateway-go:
+    build:
+      context: ./gateway-go
+      dockerfile: Dockerfile
+    container_name: nous-agent-go-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-7777}:7777"
+    environment:
+      GATEWAY_ADDR: ":7777"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      NOUS_HARNESS_CONFIG_PATH: /etc/nous-agent/config.yaml
+      NOUS_EXTENSIONS_CONFIG_PATH: /config/extensions.json
+      NOUS_SKILLS_ROOT: /agent/skills
+      NOUS_WORKSPACE_ROOT: /data/workspaces
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:7775,http://127.0.0.1:7775}"
+    volumes:
+      - ./agent-go/config.example.yaml:/etc/nous-agent/config.yaml:ro
+      - ./agent/skills/public:/agent/skills/public:ro
+      - gateway_custom_skills:/agent/skills/custom
+      - gateway_config:/config
+      - agent_go_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Legacy Python Harness. It is excluded from the default Compose project.
+  agent:
+    profiles: ["legacy"]
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: nous-agent-python-legacy
+    restart: unless-stopped
+    ports:
+      - "${LEGACY_AGENT_PORT:-17776}:7776"
+    volumes:
+      - ./agent/src:/app/src
+      - ./agent/config.yaml:/app/config.yaml
+      - ./agent/extensions_config.json:/app/extensions_config.json
+      - ./agent/skills:/app/skills
+      - agent_data:/app/.deer-flow
+    environment:
+      LANGGRAPH_PG_URI: "${LANGGRAPH_PG_URI:-}"
+      REDIS_URL: "${REDIS_URL:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      TUYOO_BASE_URL: "${TUYOO_BASE_URL:-}"
+      TUYOO_API_KEY: "${TUYOO_API_KEY:-}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      JINA_API_KEY: "${JINA_API_KEY:-}"
+    command: ["uv", "run", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "7776", "--reload", "--reload-dir", "src"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Legacy Python Gateway. Use only for compatibility checks during migration.
   gateway:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: gateway/Dockerfile
-    container_name: nous-agent-gateway
+    container_name: nous-agent-python-gateway-legacy
     restart: unless-stopped
     ports:
-      - "7777:7777"
-    env_file:
-      - .env
+      - "${LEGACY_GATEWAY_PORT:-17777}:7777"
     environment:
-      - LANGGRAPH_PG_URI=postgresql://nous-ai:Nous%402026%21@host.docker.internal:5432/nous_ai_db
-      - REDIS_URL=redis://:Nous%402026%21@host.docker.internal:6379/0
-      - DEER_FLOW_CONFIG_PATH=/app/agent/config.yaml
-      - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/agent/extensions_config.json
-      - DEER_FLOW_HOME=/app/.deer-flow
-      - NOUS_HARNESS_CONFIG_PATH=/app/agent-go/config.yaml
+      LANGGRAPH_PG_URI: "${LANGGRAPH_PG_URI:-}"
+      REDIS_URL: "${REDIS_URL:-}"
+      DEER_FLOW_CONFIG_PATH: /app/agent/config.yaml
+      DEER_FLOW_EXTENSIONS_CONFIG_PATH: /app/agent/extensions_config.json
+      DEER_FLOW_HOME: /app/.deer-flow
+      NOUS_HARNESS_CONFIG_PATH: /app/agent-go/config.yaml
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      TUYOO_BASE_URL: "${TUYOO_BASE_URL:-}"
+      TUYOO_API_KEY: "${TUYOO_API_KEY:-}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      JINA_API_KEY: "${JINA_API_KEY:-}"
     volumes:
       - ./gateway/src:/app/gateway/src
       - ./agent/src:/app/agent/src
@@ -88,76 +127,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ==========================================================================
-  # Go Gateway API (optional replacement) — container :7777, host :7780
-  # ==========================================================================
-  gateway-go:
-    profiles: ["go-gateway"]
-    build:
-      context: ./gateway-go
-      dockerfile: Dockerfile
-    container_name: nous-agent-go-gateway
-    restart: unless-stopped
-    ports:
-      - "7780:7777"
-    env_file:
-      - .env
-    environment:
-      - GATEWAY_ADDR=:7777
-      - DATABASE_URL=postgresql://nous-ai:Nous%402026%21@host.docker.internal:5432/nous_ai_db?sslmode=disable
-      - NOUS_HARNESS_CONFIG_PATH=/etc/nous-agent/config.yaml
-      - NOUS_EXTENSIONS_CONFIG_PATH=/config/extensions.json
-      - NOUS_SKILLS_ROOT=/agent/skills
-      - NOUS_WORKSPACE_ROOT=/data/workspaces
-    volumes:
-      - ./agent-go/config.example.yaml:/etc/nous-agent/config.yaml:ro
-      - ./agent/skills/public:/agent/skills/public:ro
-      - gateway_custom_skills:/agent/skills/custom
-      - gateway_config:/config
-      - agent_go_data:/data
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  # ==========================================================================
-  # Infrastructure (optional — use `docker compose --profile infra up` for fresh setup)
-  # ==========================================================================
-  # postgres:
-  #   image: postgres:16-alpine
-  #   container_name: nous-agent-postgres
-  #   restart: unless-stopped
-  #   profiles: ["infra"]
-  #   environment:
-  #     POSTGRES_USER: nous-ai
-  #     POSTGRES_PASSWORD: password
-  #     POSTGRES_DB: nous_ai_db
-  #   ports:
-  #     - "55432:5432"
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U nous-ai -d nous_ai_db"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 5
-
-  # minio:
-  #   image: minio/minio:latest
-  #   container_name: nous-agent-minio
-  #   restart: unless-stopped
-  #   profiles: ["infra"]
-  #   environment:
-  #     MINIO_ROOT_USER: nous-ai
-  #     MINIO_ROOT_PASSWORD: password
-  #   command: server /data --console-address ":9001"
-  #   ports:
-  #     - "9000:9000"
-  #     - "9001:9001"
-  #   volumes:
-  #     - minio_data:/data
-
 volumes:
-  postgres_data:
-  minio_data:
   agent_data:
   agent_go_data:
   gateway_config:

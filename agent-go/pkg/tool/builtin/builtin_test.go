@@ -44,7 +44,7 @@ func run(t *testing.T, ctx context.Context, d tool.Definition, args string) *too
 func TestMetadata_ReadOnlyToolsAreConcurrencySafe(t *testing.T) {
 	t.Parallel()
 
-	readers := []tool.Definition{builtin.LS(), builtin.ReadFile()}
+	readers := []tool.Definition{builtin.LS(), builtin.Glob(), builtin.Grep(), builtin.ReadFile()}
 	for _, d := range readers {
 		if !d.Concurrent() {
 			t.Errorf("%s should be read-only and concurrency-safe: %+v", d.Name, d.Metadata)
@@ -90,8 +90,8 @@ func TestAll_RegistersCleanly(t *testing.T) {
 	if err := r.RegisterAll(builtin.All()...); err != nil {
 		t.Fatalf("RegisterAll() error = %v", err)
 	}
-	if got := len(r.Names()); got != 6 {
-		t.Fatalf("registered %d tools, want 6: %v", got, r.Names())
+	if got := len(r.Names()); got != 9 {
+		t.Fatalf("registered %d tools, want 9: %v", got, r.Names())
 	}
 }
 
@@ -163,6 +163,144 @@ func TestLS_EscapeBecomesErrorResult(t *testing.T) {
 	res := run(t, ctx, builtin.LS(), `{"path":"../../etc"}`)
 	if !res.IsError {
 		t.Fatalf("ls outside the sandbox should be an error result, got %q", res.Content)
+	}
+}
+
+// --- glob / grep ---
+
+func TestGlob_DoublestarFindsNestedFiles(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	for name, content := range map[string]string{
+		"src/main.go":        "package main\n",
+		"src/deep/helper.go": "package helper\n",
+		"src/deep/readme.md": "docs\n",
+	} {
+		if err := h.FS().WriteFile(ctx, name, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := run(t, ctx, builtin.Glob(), `{"pattern":"**/*.go","path":"src"}`)
+	if res.IsError {
+		t.Fatalf("glob failed: %s", res.Content)
+	}
+	for _, want := range []string{"src/main.go", "src/deep/helper.go"} {
+		if !strings.Contains(res.Content, want) {
+			t.Errorf("glob output missing %q:\n%s", want, res.Content)
+		}
+	}
+	if strings.Contains(res.Content, "readme.md") {
+		t.Fatalf("glob included a non-matching file: %s", res.Content)
+	}
+}
+
+func TestGlob_RejectsEscapingSearchRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := newCtx(t)
+	res := run(t, ctx, builtin.Glob(), `{"pattern":"**/*","path":"../outside"}`)
+	if !res.IsError || !strings.Contains(res.Content, "escapes") {
+		t.Fatalf("glob escape result = %#v", res)
+	}
+}
+
+func TestGrep_SearchesRegexAndFiltersFiles(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	for name, content := range map[string]string{
+		"pkg/a.go": "package a\nfunc Target() {}\n",
+		"pkg/b.go": "package b\nfunc Other() {}\n",
+		"pkg/a.md": "Target should not be returned\n",
+	} {
+		if err := h.FS().WriteFile(ctx, name, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"func\\s+Target","path":"pkg","glob":"**/*.go"}`)
+	if res.IsError {
+		t.Fatalf("grep failed: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "pkg/a.go:2:func Target() {}") {
+		t.Fatalf("grep output = %q", res.Content)
+	}
+	if strings.Contains(res.Content, "a.md") || strings.Contains(res.Content, "b.go") {
+		t.Fatalf("grep returned a non-match: %s", res.Content)
+	}
+}
+
+func TestGrep_InvalidRegexIsModelError(t *testing.T) {
+	t.Parallel()
+
+	ctx, _ := newCtx(t)
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"["}`)
+	if !res.IsError || !strings.Contains(res.Content, "invalid pattern") {
+		t.Fatalf("grep invalid-regex result = %#v", res)
+	}
+}
+
+func TestGrep_SingleFileGlobUsesBaseName(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	if err := h.FS().WriteFile(ctx, "pkg/a.go", []byte("const Needle = true\n")); err != nil {
+		t.Fatal(err)
+	}
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"Needle","path":"pkg/a.go","glob":"*.go"}`)
+	if res.IsError || !strings.Contains(res.Content, "pkg/a.go:1:") {
+		t.Fatalf("grep single-file result = %#v", res)
+	}
+}
+
+func TestGrep_NormalizesBackslashesInSearchPath(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	if err := h.FS().WriteFile(ctx, "pkg/a.go", []byte("const Needle = true\n")); err != nil {
+		t.Fatal(err)
+	}
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"Needle","path":"pkg\\a.go"}`)
+	if res.IsError || !strings.Contains(res.Content, "pkg/a.go:1:") {
+		t.Fatalf("grep normalized-path result = %#v", res)
+	}
+}
+
+func TestGrep_TruncatesAfterResultLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	var content strings.Builder
+	for i := 0; i <= 200; i++ {
+		content.WriteString("Needle\n")
+	}
+	if err := h.FS().WriteFile(ctx, "many.txt", []byte(content.String())); err != nil {
+		t.Fatal(err)
+	}
+
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"Needle","path":"many.txt"}`)
+	if res.IsError || !strings.Contains(res.Content, "results truncated after 200 matches") {
+		t.Fatalf("grep truncation result = %#v", res)
+	}
+	matchBlock := strings.SplitN(res.Content, "\n\n", 2)[0]
+	if got := len(strings.Split(matchBlock, "\n")); got != 200 {
+		t.Fatalf("grep returned %d matches, want 200", got)
+	}
+}
+
+func TestGrep_DoesNotInventLineAfterTrailingNewline(t *testing.T) {
+	t.Parallel()
+
+	ctx, h := newCtx(t)
+	if err := h.FS().WriteFile(ctx, "line.txt", []byte("content\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	res := run(t, ctx, builtin.Grep(), `{"pattern":"^$","path":"line.txt"}`)
+	if res.IsError || res.Content != "(no matches)" {
+		t.Fatalf("grep trailing-newline result = %#v", res)
 	}
 }
 

@@ -136,6 +136,9 @@ func (p *Policy) Mode(toolName string) Mode {
 // 是否危险）归 SandboxAudit 中间件，两者职责不同不该混在一处。
 func (p *Policy) Authorize(ctx context.Context, d tool.Definition, args json.RawMessage) Decision {
 	mode := p.Mode(d.Name)
+	if ok, reason := meetsRequiredPermission(mode, d.Metadata.RequiredPermission); !ok {
+		return Decision{Reason: fmt.Sprintf("%s requires permission %s: %s", d.Name, d.Metadata.RequiredPermission, reason)}
+	}
 
 	switch mode {
 	case ModeDangerFullAccess, ModeAllow:
@@ -149,7 +152,7 @@ func (p *Policy) Authorize(ctx context.Context, d tool.Definition, args json.Raw
 			"%s modifies state and the current permission mode is %s", d.Name, mode)}
 
 	case ModeWorkspaceWrite:
-		if d.Metadata.IsReadOnly || d.Metadata.RequiresSandbox {
+		if d.Metadata.IsReadOnly || d.Metadata.RequiresSandbox || d.Metadata.IsAgentState {
 			return Decision{Allowed: true}
 		}
 		return Decision{Reason: fmt.Sprintf(
@@ -208,11 +211,30 @@ func (p *Policy) AllowedTools(r *tool.Registry, candidates []string) []string {
 		}
 		// 这里不做 ModePrompt 的确认：披露与调用是两件事，
 		// prompt 模式下工具应当可见，只是调用时需要确认。
-		if p.Mode(name) == ModePrompt || p.Authorize(context.Background(), d, nil).Allowed {
+		mode := p.Mode(name)
+		meetsRequired, _ := meetsRequiredPermission(mode, d.Metadata.RequiredPermission)
+		if (mode == ModePrompt && meetsRequired) || p.Authorize(context.Background(), d, nil).Allowed {
 			out = append(out, name)
 		}
 	}
 	return out
+}
+
+func meetsRequiredPermission(current Mode, required string) (bool, string) {
+	if strings.TrimSpace(required) == "" {
+		return true, ""
+	}
+	minimum, err := ParseMode(required)
+	if err != nil {
+		return false, err.Error()
+	}
+	rank := map[Mode]int{
+		ModeReadOnly: 0, ModeWorkspaceWrite: 1, ModePrompt: 2, ModeAllow: 3, ModeDangerFullAccess: 4,
+	}
+	if rank[current] < rank[minimum] {
+		return false, fmt.Sprintf("current mode %s is below the required mode", current)
+	}
+	return true, ""
 }
 
 // ParseMode 把配置里的字符串解析为 Mode，未知值返回 error。

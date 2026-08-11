@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 )
@@ -57,6 +58,10 @@ func projectRuntimeEvent(e runtime.Event) (wireEvent, error) {
 		return makeWireEvent("end", payload), nil
 	case runtime.EventRunStart:
 		return makeWireEvent("metadata", meta), nil
+	case runtime.EventSubagentProgress:
+		return projectSubagentProgress(e)
+	case runtime.EventSubagentStart, runtime.EventSubagentResult:
+		return projectSubagentEvent(e, payload), nil
 	default:
 		custom := map[string]any{"type": string(e.Type)}
 		for k, v := range payload {
@@ -64,6 +69,82 @@ func projectRuntimeEvent(e runtime.Event) (wireEvent, error) {
 		}
 		return makeWireEvent("custom", custom), nil
 	}
+}
+
+func projectSubagentProgress(e runtime.Event) (wireEvent, error) {
+	var progress runtime.SubagentProgress
+	if err := json.Unmarshal(e.Data, &progress); err != nil {
+		return wireEvent{}, err
+	}
+	wire := toWireMessage(progress.Message)
+	if progress.MessageID != "" {
+		wire.ID = progress.MessageID
+	}
+	return makeWireEvent("custom", map[string]any{
+		"type":           "task_running",
+		"task_id":        progress.TaskID,
+		"message":        wire,
+		"message_index":  progress.MessageIndex,
+		"total_messages": progress.MessageIndex,
+	}), nil
+}
+
+// projectSubagentEvent bridges the native runtime lifecycle names to the
+// task_* custom events consumed by the existing frontend. The runtime event
+// remains unchanged in storage/replay; only its HTTP projection is adapted.
+func projectSubagentEvent(e runtime.Event, payload map[string]any) wireEvent {
+	taskID, _ := payload["task_id"].(string)
+	if e.Type == runtime.EventSubagentStart {
+		typ, _ := payload["subagent_type"].(string)
+		if typ == "" {
+			typ, _ = payload["agent"].(string)
+		}
+		custom := map[string]any{
+			"type":          "task_started",
+			"task_id":       taskID,
+			"description":   payloadString(payload, "description"),
+			"subagent_type": typ,
+		}
+		return makeWireEvent("custom", custom)
+	}
+
+	status := strings.ToLower(payloadString(payload, "status"))
+	switch status {
+	case "completed", "success", "succeeded":
+		return makeWireEvent("custom", map[string]any{
+			"type":    "task_completed",
+			"task_id": taskID,
+			"result":  payloadString(payload, "output"),
+		})
+	case "timed_out", "timeout", "polling_timed_out":
+		errText := payloadString(payload, "error")
+		return makeWireEvent("custom", map[string]any{
+			"type":    "task_timed_out",
+			"task_id": taskID,
+			"error":   errText,
+		})
+	case "failed", "error", "cancelled", "canceled":
+		errText := payloadString(payload, "error")
+		if errText == "" && (status == "cancelled" || status == "canceled") {
+			errText = "Task cancelled by user."
+		}
+		return makeWireEvent("custom", map[string]any{
+			"type":    "task_failed",
+			"task_id": taskID,
+			"error":   errText,
+		})
+	default:
+		custom := map[string]any{"type": string(e.Type)}
+		for key, value := range payload {
+			custom[key] = value
+		}
+		return makeWireEvent("custom", custom)
+	}
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
 }
 
 func writeSSE(w http.ResponseWriter, id int64, event wireEvent) error {

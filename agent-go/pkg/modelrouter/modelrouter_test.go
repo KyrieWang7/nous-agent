@@ -684,6 +684,31 @@ func TestSample_DoesNotRetryAfterBytesStreamed(t *testing.T) {
 	}
 }
 
+func TestSample_DoesNotRetryAfterThinkingStreamed(t *testing.T) {
+	t.Parallel()
+
+	standard := faux.New(faux.Thinking("private reasoning", ""))
+	fast := faux.New(faux.Text("should not be reached"))
+	r := mustRouter(t, modelrouter.Config{
+		Models: map[modelrouter.Tier]model.Model{
+			modelrouter.TierStandard: streamFailAfterDeltas{inner: standard},
+			modelrouter.TierFast:     fast,
+		},
+		Stream: true,
+	})
+
+	_, streamed, err := r.Sample(context.Background(), newState(user("hi")))
+	if err == nil {
+		t.Fatal("Sample() succeeded despite a stream failure")
+	}
+	if !streamed {
+		t.Error("streamed = false after a reasoning delta was published")
+	}
+	if fast.CallCount() != 0 {
+		t.Error("a response with streamed reasoning was retried on another tier")
+	}
+}
+
 // --- 取消 ---
 
 func TestSample_CancellationIsNotTreatedAsProviderFailure(t *testing.T) {
