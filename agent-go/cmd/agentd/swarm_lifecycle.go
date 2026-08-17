@@ -101,8 +101,8 @@ func swarmTerminalOutcome(result subagent.Result) (status, label, detail string)
 	case message.SubagentCompleted:
 		return swarm.MemberStatusCompleted, "Completed", result.Output
 	case message.SubagentTimedOut, message.SubagentPollingTimedOut:
-		// Keep the persisted member vocabulary compatible while preserving the
-		// distinct timeout signal consumed by the Swarm message stream.
+		// Member storage projects timeout variants to failed while the Swarm
+		// message stream preserves the distinct timeout label.
 		return swarm.MemberStatusFailed, "Timeout", result.Error
 	default:
 		return swarm.MemberStatusFailed, "Failed", result.Error

@@ -15,11 +15,11 @@ const config = {
     return [
       // Gateway API (models, MCP, skills, memory, uploads, artifacts)
       {
-        source: "/api/:first((?!(?:drama|langgraph)(?:/|$))[^/]+)",
+        source: "/api/:first((?!(?:agent|drama)(?:/|$))[^/]+)",
         destination: `${gatewayUrl}/api/:first`,
       },
       {
-        source: "/api/:first((?!(?:drama|langgraph)(?:/|$))[^/]+)/:rest*",
+        source: "/api/:first((?!(?:agent|drama)(?:/|$))[^/]+)/:rest*",
         destination: `${gatewayUrl}/api/:first/:rest*`,
       },
     ];

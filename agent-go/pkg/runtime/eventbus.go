@@ -126,8 +126,12 @@ func (b *MemoryBus) Publish(ctx context.Context, e Event) int64 {
 	rc := b.channelFor(e.RunID)
 
 	rc.mu.Lock()
-	rc.seq++
-	e.Seq = rc.seq
+	if e.Seq > rc.seq {
+		rc.seq = e.Seq
+	} else {
+		rc.seq++
+		e.Seq = rc.seq
+	}
 	if e.Category == "" {
 		e.Category = categoryOf(e.Type)
 	}

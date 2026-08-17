@@ -33,15 +33,16 @@ func (p DisconnectPolicy) Valid() bool {
 type RunStatus string
 
 const (
-	StatusRunning   RunStatus = "running"
-	StatusCompleted RunStatus = "completed"
-	StatusCancelled RunStatus = "cancelled"
-	StatusFailed    RunStatus = "failed"
+	StatusRunning     RunStatus = "running"
+	StatusCompleted   RunStatus = "completed"
+	StatusCancelled   RunStatus = "cancelled"
+	StatusFailed      RunStatus = "failed"
+	StatusInterrupted RunStatus = "interrupted"
 )
 
 // Terminal 报告该状态是否已终结。
 func (s RunStatus) Terminal() bool {
-	return s == StatusCompleted || s == StatusCancelled || s == StatusFailed
+	return s == StatusCompleted || s == StatusCancelled || s == StatusFailed || s == StatusInterrupted
 }
 
 // RunRecord 是 run 的元数据，跨实例可见。

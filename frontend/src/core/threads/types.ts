@@ -14,13 +14,29 @@ export interface AgentThreadState extends Record<string, unknown> {
 
 export interface AgentThread extends Thread<AgentThreadState> {}
 
-export interface AgentThreadContext extends Record<string, unknown> {
-  thread_id: string;
+export interface AgentRunIntent extends Record<string, unknown> {
   model_name: string | undefined;
-  thinking_enabled: boolean;
-  is_plan_mode: boolean;
-  subagent_enabled: boolean;
+  mode: "flash" | "thinking" | "pro" | "ultra" | undefined;
   swarm_enabled: boolean;
-  reasoning_effort?: "low" | "medium" | "high" | undefined;
 }
 
+export interface UserQuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface PendingUserQuestion {
+  id: string;
+  run_id: string;
+  thread_id: string;
+  header: string;
+  question: string;
+  detail?: string;
+  options: UserQuestionOption[];
+  intent?: string;
+  status: "pending";
+}
+
+export interface AgentThreadContext extends AgentRunIntent {
+  thread_id: string;
+}

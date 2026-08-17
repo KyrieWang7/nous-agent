@@ -29,49 +29,101 @@ type rule struct {
 var rules = []rule{
 	{
 		from:      "pkg/message",
-		forbidden: []string{"pkg/loop", "pkg/middleware", "pkg/harness", "pkg/tool", "pkg/model"},
+		forbidden: []string{"pkg/loop", "pkg/runtime/lifecycle", "pkg/harness", "pkg/tool", "pkg/model"},
 		why:       "转录是最底层的数据结构，不得依赖编排或上层抽象",
 	},
 	{
 		from:      "pkg/model",
-		forbidden: []string{"pkg/loop", "pkg/middleware", "pkg/harness", "pkg/tool"},
+		forbidden: []string{"pkg/loop", "pkg/runtime/lifecycle", "pkg/harness", "pkg/tool"},
 		why:       "模型层收敛为单一接口，供应商适配到它，不反向依赖运行时",
 	},
 	{
 		from:      "pkg/tool",
-		forbidden: []string{"pkg/loop", "pkg/middleware", "pkg/harness"},
-		why:       "工具层通过 tool.Interceptor 被中间件介入，不得反向 import middleware（会成环）",
+		forbidden: []string{"pkg/loop", "pkg/runtime/lifecycle", "pkg/harness"},
+		why:       "工具层只暴露 tool.Interceptor，不得反向依赖内核运行周期（会成环）",
 	},
 	{
-		from:      "pkg/middleware",
+		from:      "pkg/runtime/lifecycle",
 		forbidden: []string{"pkg/loop", "pkg/harness"},
-		why:       "中间件只承载横切关注点，编排归 pkg/loop；中间件不得依赖内核",
+		why:       "生命周期处理器不拥有编排，编排只归 pkg/loop",
 	},
 	{
-		from:       "pkg/middleware",
-		forbidden:  []string{"pkg/middleware/builtin"},
+		from:       "pkg/runtime/lifecycle",
+		forbidden:  []string{"pkg/runtime/lifecycle/handlers"},
 		why:        "契约不得依赖实现",
-		exceptFrom: []string{"pkg/middleware/builtin"},
+		exceptFrom: []string{"pkg/runtime/lifecycle/handlers"},
 	},
 	{
-		from:      "pkg/loop",
-		forbidden: []string{"pkg/harness", "pkg/config", "internal/langgraphapi"},
-		why:       "内核只吃 typed Options，不认识 YAML；也不认识 wire 格式",
+		from: "pkg/loop",
+		forbidden: []string{
+			"pkg/harness", "pkg/config", "internal/transport/httpapi",
+			"pkg/runtime/postgres", "pkg/runtime/redis",
+			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
+			"pkg/sandbox/local", "pkg/sandbox/remote",
+			"external/net/http", "external/database/sql",
+			"external/github.com/jackc/pgx", "external/github.com/redis/go-redis",
+		},
+		why: "内核只吃 typed contracts，不认识配置、wire、数据库驱动或 capability 具体实现",
 	},
 	{
 		from:      "pkg/prompt",
-		forbidden: []string{"pkg/loop", "pkg/middleware", "pkg/harness"},
+		forbidden: []string{"pkg/loop", "pkg/runtime/lifecycle", "pkg/harness"},
 		why:       "提示装配是纯函数层",
 	},
 	{
 		from:      "pkg/sandbox",
-		forbidden: []string{"pkg/permission", "pkg/loop", "pkg/middleware"},
+		forbidden: []string{"pkg/permission", "pkg/loop", "pkg/runtime/lifecycle"},
 		why:       "沙箱只做隔离，不得生长出审批或权限判定职责",
 	},
 	{
 		from:      "pkg",
 		forbidden: []string{"internal/"},
 		why:       "库不得依赖 internal；wire 格式适配是单向的",
+	},
+	{
+		from: "internal/transport",
+		forbidden: []string{
+			"pkg/loop", "pkg/harness", "pkg/config",
+			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
+			"pkg/sandbox/local", "pkg/sandbox/remote",
+		},
+		why: "Transport 只适配 Runtime contract 和 wire projection，不得装配 Kernel 或具体 capability",
+	},
+	{
+		from: "pkg/runtime/runmanager",
+		forbidden: []string{
+			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"pkg/runtime/postgres", "pkg/runtime/redis",
+			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
+			"pkg/sandbox/local", "pkg/sandbox/remote",
+		},
+		why: "RunManager 是 transport-neutral Runtime 编排边界，只能依赖 Kernel contract 和 persistence port",
+	},
+	{
+		from: "pkg/runtime/capability",
+		forbidden: []string{
+			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"pkg/runtime/postgres", "pkg/runtime/redis",
+		},
+		why: "Capability contract 不得反向依赖产品、Kernel 或 persistence implementation",
+	},
+	{
+		from: "pkg/runtime/metadata",
+		forbidden: []string{
+			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"pkg/runtime/runmanager", "pkg/runtime/postgres", "pkg/runtime/redis",
+		},
+		why: "Metadata persistence port 是底层 Runtime contract，不得反向依赖编排、Transport 或具体实现",
+	},
+	{
+		from:      "pkg/subagent",
+		forbidden: []string{"pkg/runtime/redis", "external/github.com/redis/go-redis"},
+		why:       "Subagent capability 只依赖 TaskStore port，不得内置 Redis persistence implementation",
+	},
+	{
+		from:      "pkg/memory",
+		forbidden: []string{"pkg/runtime/postgres", "external/github.com/jackc/pgx"},
+		why:       "Memory capability 只依赖 Store port，不得内置 PostgreSQL persistence implementation",
 	},
 }
 
@@ -140,7 +192,7 @@ func forbids(r rule, pkg, dep string) bool {
 		}
 
 		// 显式点名自身子包的规则优先于"可依赖自身子包"的豁免。
-		// 「契约不得依赖实现」（pkg/middleware ↛ pkg/middleware/builtin）
+		// 「契约不得依赖实现」（lifecycle ↛ lifecycle/builtin）
 		// 正是这种情况，若被豁免吞掉这条纪律就形同不存在。
 		if f != pkg && underPath(f, pkg) {
 			return true

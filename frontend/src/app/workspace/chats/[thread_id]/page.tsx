@@ -21,6 +21,7 @@ import {
 import { InputBox } from "@/components/workspace/input-box";
 import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
+import { PlanReview } from "@/components/workspace/plan-review";
 import { SubagentDraggablePanel } from "@/components/workspace/subagent";
 import { SwarmDraggablePanel } from "@/components/workspace/swarm/swarm-panel";
 import { ThreadTitle } from "@/components/workspace/thread-title";
@@ -32,7 +33,6 @@ import { useNotification } from "@/core/notification/hooks";
 import { useLocalSettings } from "@/core/settings";
 import { getTeamsByThread } from "@/core/swarm/api";
 import { useSubtaskContext } from "@/core/tasks/context";
-import { type AgentThreadState } from "@/core/threads";
 import { useSubmitThread, useThreadStream } from "@/core/threads/hooks";
 import {
   cleanThreadTitle,
@@ -101,14 +101,12 @@ export default function ChatPage() {
   }, [threadIdFromPath]);
 
   const { showNotification } = useNotification();
-  const [finalState, setFinalState] = useState<AgentThreadState | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const thread = useThreadStream({
     isNewThread,
     threadId,
     onFinish: (state) => {
       setIsStreaming(false);
-      setFinalState(state);
       if (document.hidden || !document.hasFocus()) {
         let body = "Conversation finished";
         const lastMessage = state.messages[state.messages.length - 1];
@@ -133,10 +131,6 @@ export default function ChatPage() {
       router.replace("/workspace/chats/new");
     }
   }, [router, thread.threadNotFound, threadIdFromPath]);
-  useEffect(() => {
-    if (thread.isLoading) setFinalState(null);
-  }, [thread.isLoading]);
-
   const title = useMemo(() => {
     let result = isNewThread
       ? ""
@@ -249,19 +243,6 @@ export default function ChatPage() {
     thread,
     threadContext: {
       ...settings.context,
-      thinking_enabled: settings.context.mode !== "flash",
-      is_plan_mode:
-        settings.context.mode === "pro" || settings.context.mode === "ultra",
-      subagent_enabled: settings.context.mode === "ultra" || swarmEnabled,
-      swarm_enabled: swarmEnabled,
-      reasoning_effort:
-        settings.context.mode === "ultra"
-          ? "high"
-          : settings.context.mode === "pro"
-            ? "medium"
-            : settings.context.mode === "thinking"
-              ? "low"
-              : undefined,
     },
     afterSubmit() {
       if (isNewThreadFromPath && threadId) {
@@ -333,11 +314,6 @@ export default function ChatPage() {
                     className={cn("size-full", !isNewThread && "pt-10")}
                     threadId={threadId}
                     thread={thread}
-                    messagesOverride={
-                      !thread.isLoading && finalState?.messages
-                        ? finalState.messages
-                        : undefined
-                    }
                     paddingBottom={
                       isNewThread ? (todoListCollapsed ? 160 : 280) : 24
                     }
@@ -384,23 +360,30 @@ export default function ChatPage() {
                         />
                       </div>
                     </div>
-                    <InputBox
-                      className={cn("w-full")}
-                      isNewThread={isNewThread}
-                      autoFocus={isNewThread}
-                      status={isStreaming ? "streaming" : "ready"}
-                      context={settings.context}
-                      extraHeader={
-                        isNewThread && <Welcome mode={settings.context.mode} />
-                      }
-                      disabled={env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"}
-                      onContextChange={(context) =>
-                        setSettings("context", context)
-                      }
-                      tokenUsage={thread.tokenUsage}
-                      onSubmit={handleSubmit}
-                      onStop={handleStop}
-                    />
+                    {thread.pendingQuestion?.intent === "plan-review" ? (
+                      <PlanReview
+                        question={thread.pendingQuestion}
+                        onAnswer={thread.answerQuestion}
+                      />
+                    ) : (
+                      <InputBox
+                        className={cn("w-full")}
+                        isNewThread={isNewThread}
+                        autoFocus={isNewThread}
+                        status={isStreaming ? "streaming" : "ready"}
+                        context={settings.context}
+                        extraHeader={
+                          isNewThread && <Welcome mode={settings.context.mode} />
+                        }
+                        disabled={env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"}
+                        onContextChange={(context) =>
+                          setSettings("context", context)
+                        }
+                        tokenUsage={thread.tokenUsage}
+                        onSubmit={handleSubmit}
+                        onStop={handleStop}
+                      />
+                    )}
                     {env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" && (
                       <div className="text-muted-foreground/67 w-full translate-y-12 text-center text-xs">
                         {t.common.notAvailableInDemoMode}

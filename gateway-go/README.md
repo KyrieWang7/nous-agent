@@ -5,9 +5,6 @@ the native Go Harness tables (`agent_thread`, `agent_message`, `memory_fact`,
 and `agent_swarm_*`) and is HTTP-contract compatible with the current frontend.
 It does not import either Harness implementation.
 
-The sibling Python `gateway/` remains available only through the repository's
-`legacy` Compose profile.
-
 Implemented APIs include:
 
 - model catalog and model details
@@ -54,7 +51,7 @@ Configuration is supplied through environment variables:
 | `DATABASE_URL` | empty; persistence-backed APIs return empty data |
 | `NOUS_HARNESS_CONFIG_PATH` | `/etc/nous-agent/config.yaml` |
 | `NOUS_EXTENSIONS_CONFIG_PATH` | `/etc/nous-agent/extensions.json` |
-| `NOUS_SKILLS_ROOT` | `/agent/skills` |
+| `NOUS_SKILLS_ROOT` | `/opt/nous/skills` |
 | `NOUS_WORKSPACE_ROOT` | `/data/workspaces` |
 | `CORS_ORIGINS` | `*` |
 
@@ -69,15 +66,6 @@ Go libraries. Legacy binary Office documents (`doc`, `ppt`, and `xls`) are
 normalized by the image's headless LibreOffice runtime and then passed through
 the same Go Markdown converters. Conversion failures preserve the original
 upload and do not fail unrelated files.
-
-## Legacy comparison
-
-The Python Gateway is isolated on host port `17777` and never starts by
-default:
-
-```bash
-docker compose --profile legacy up -d --build gateway
-```
 
 ## Verification
 

@@ -15,28 +15,42 @@ import (
 type EventType string
 
 const (
-	EventRunStart       EventType = "run_start"
-	EventStateValues    EventType = "state_values"
-	EventMessage        EventType = "message"
-	EventCustom         EventType = "custom"
-	EventMessageStart   EventType = "message_start"
-	EventContentDelta   EventType = "content_delta"
-	EventMessageReplace EventType = "message_replace"
-	EventReasoningDelta EventType = "reasoning_delta"
-	EventToolStart      EventType = "tool_start"
-	EventToolResult     EventType = "tool_result"
-	EventSkillActivated EventType = "skill_activated"
-	EventSubagentStart  EventType = "subagent_start"
-	EventSubagentResult EventType = "subagent_result"
+	EventRunStart           EventType = "run_start"
+	EventRunStateChanged    EventType = "run_state_changed"
+	EventBudgetChanged      EventType = "budget_changed"
+	EventPlanModeChanged    EventType = "plan_mode_changed"
+	EventStateValues        EventType = "state_values"
+	EventMessage            EventType = "message"
+	EventCustom             EventType = "custom"
+	EventMessageStart       EventType = "message_start"
+	EventContentDelta       EventType = "content_delta"
+	EventMessageReplace     EventType = "message_replace"
+	EventReasoningDelta     EventType = "reasoning_delta"
+	EventToolStart          EventType = "tool_start"
+	EventToolResult         EventType = "tool_result"
+	EventApprovalRequested  EventType = "approval_requested"
+	EventApprovalResolved   EventType = "approval_resolved"
+	EventQuestionRequested  EventType = "question_requested"
+	EventQuestionResolved   EventType = "question_resolved"
+	EventCompactionStart    EventType = "compaction_started"
+	EventCompactionComplete EventType = "compaction_completed"
+	EventSkillActivated     EventType = "skill_activated"
+	EventSubagentStart      EventType = "subagent_start"
+	EventSubagentResult     EventType = "subagent_result"
 	// EventSubagentProgress carries a child model's in-flight AI message. It is
 	// projected to the frontend's task_running custom event, never to the
 	// parent's messages stream.
 	EventSubagentProgress EventType = "subagent_progress"
 	EventGuardrailBlock   EventType = "guardrail_blocked"
-	EventUsage            EventType = "usage"
-	EventMessageStop      EventType = "message_stop"
-	EventRunEnd           EventType = "run_end"
-	EventError            EventType = "error"
+	// Transcript events are canonical persistence events. Wire/UI events remain
+	// separate projections and may be dropped or reshaped without changing the
+	// transcript that a resumed agent sees.
+	EventTranscriptAppend  EventType = "transcript_append"
+	EventTranscriptReplace EventType = "transcript_replace"
+	EventUsage             EventType = "usage"
+	EventMessageStop       EventType = "message_stop"
+	EventRunEnd            EventType = "run_end"
+	EventError             EventType = "error"
 )
 
 // Category 决定事件在存储压力下的取舍。
@@ -60,8 +74,9 @@ const (
 // categoryOf 返回事件类型的默认分类。
 func categoryOf(t EventType) Category {
 	switch t {
-	case EventMessageReplace, EventGuardrailBlock, EventSubagentStart, EventSubagentResult,
-		EventRunEnd, EventError, EventRunStart, EventStateValues, EventMessage:
+	case EventMessageReplace, EventGuardrailBlock, EventTranscriptAppend, EventTranscriptReplace, EventToolStart, EventToolResult, EventSubagentStart, EventSubagentResult,
+		EventApprovalRequested, EventApprovalResolved, EventQuestionRequested, EventQuestionResolved, EventCompactionStart, EventCompactionComplete,
+		EventRunEnd, EventError, EventRunStart, EventRunStateChanged, EventBudgetChanged, EventPlanModeChanged, EventStateValues, EventMessage:
 		return CategoryAudit
 	case EventUsage:
 		return CategoryUsage
@@ -84,6 +99,9 @@ type Event struct {
 	ThreadID string    `json:"thread_id,omitempty"`
 	Type     EventType `json:"type"`
 	Category Category  `json:"category"`
+	// IdempotencyKey links retries and projections to one logical fact.
+	// Persistence implementations may use it to collapse duplicate writes.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
 	// Data 是事件负载。
 	Data json.RawMessage `json:"data,omitempty"`
@@ -151,6 +169,11 @@ type ReasoningDelta struct {
 	MessageID string `json:"message_id,omitempty"`
 }
 
+type PlanModeChanged struct {
+	Active bool `json:"active"`
+	Mode   Mode `json:"mode"`
+}
+
 // MessageReplace 是 message_replace 的负载：让客户端整段替换已渲染的文本。
 type MessageReplace struct {
 	Content   string `json:"content"`
@@ -173,9 +196,21 @@ type ToolResult struct {
 	IsError    bool   `json:"is_error,omitempty"`
 }
 
+// TranscriptAppend is the canonical transcript delta for a completed run.
+// Messages are kept in one event so persistence can atomically append the
+// complete tool transaction produced by the run.
+type TranscriptAppend struct {
+	Messages []message.Message `json:"messages"`
+}
+
+// TranscriptReplace is emitted when compaction rewrites the full transcript.
+type TranscriptReplace struct {
+	Messages []message.Message `json:"messages"`
+}
+
 // SubagentProgress is the trusted child-stream envelope. Message deliberately
 // uses the canonical transcript type; the HTTP adapter converts it to the
-// LangGraph AIMessage wire shape and adds the task_id.
+// client message projection and adds the task_id.
 type SubagentProgress struct {
 	TaskID       string          `json:"task_id"`
 	MessageID    string          `json:"message_id"`
@@ -192,12 +227,18 @@ type RunEnd struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// RunStateChanged is the canonical lifecycle projection used to recover a
+// state machine after a process restart.
+type RunStateChanged struct {
+	Snapshot RunSnapshot `json:"snapshot"`
+}
+
 // UsageReport 是 usage 事件的负载。
 type UsageReport struct {
-	InputTokens      int   `json:"input_tokens"`
-	OutputTokens     int   `json:"output_tokens"`
-	LeadTokens       int   `json:"lead_tokens"`
-	SubagentTokens   int   `json:"subagent_tokens"`
-	MiddlewareTokens int   `json:"middleware_tokens"`
-	CostMicros       int64 `json:"cost_micros"`
+	InputTokens     int   `json:"input_tokens"`
+	OutputTokens    int   `json:"output_tokens"`
+	LeadTokens      int   `json:"lead_tokens"`
+	SubagentTokens  int   `json:"subagent_tokens"`
+	AuxiliaryTokens int   `json:"auxiliary_tokens"`
+	CostMicros      int64 `json:"cost_micros"`
 }

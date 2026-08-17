@@ -8,7 +8,7 @@ import "errors"
 //   - ErrContextOverflow    → 强制压缩后重发（上限 2 次，不计入熔断失败）
 //   - ErrRateLimited        → 指数退避重试，不立即降级
 //   - ErrProviderUnavailable→ 走降级链
-//   - ErrSafetyTerminated   → 交由 SafetyFinishReason 中间件处理，不重试
+//   - ErrSafetyTerminated   → 交由 SafetyFinishReason handler 处理，不重试
 //
 // 一律用 %w 包装后返回，调用方用 errors.Is 判定，不做字符串匹配。
 var (

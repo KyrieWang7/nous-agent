@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 )
 
 // DirectSampler 直接调用单个模型，不做分层、降级或重试。
@@ -22,7 +22,7 @@ func NewDirectSampler(m model.Model) *DirectSampler {
 }
 
 // Sample 实现 Sampler。第二个返回值恒为 false：非流式路径没有内容流出去过。
-func (s *DirectSampler) Sample(ctx context.Context, st *middleware.State) (*model.Response, bool, error) {
+func (s *DirectSampler) Sample(ctx context.Context, st *lifecycle.State) (*model.Response, bool, error) {
 	if s.m == nil {
 		return nil, false, errors.New("loop: direct sampler has no model")
 	}

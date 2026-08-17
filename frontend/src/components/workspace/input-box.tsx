@@ -51,7 +51,7 @@ import { useI18n } from "@/core/i18n/hooks";
 import { useModels } from "@/core/models/hooks";
 import { useSkills } from "@/core/skills/hooks";
 import type { Skill } from "@/core/skills/type";
-import type { AgentThreadContext } from "@/core/threads";
+import type { AgentRunIntent } from "@/core/threads";
 import type { TokenUsage } from "@/core/types/thread";
 import { cn } from "@/lib/utils";
 
@@ -110,23 +110,11 @@ export function InputBox({
   assistantId?: string | null;
   status?: ChatStatus;
   disabled?: boolean;
-  context: Omit<
-    AgentThreadContext,
-    "thread_id" | "is_plan_mode" | "thinking_enabled" | "subagent_enabled"
-  > & {
-    mode: "flash" | "thinking" | "pro" | "ultra" | undefined;
-  };
+  context: AgentRunIntent;
   extraHeader?: React.ReactNode;
   isNewThread?: boolean;
   initialValue?: string;
-  onContextChange?: (
-    context: Omit<
-      AgentThreadContext,
-      "thread_id" | "is_plan_mode" | "thinking_enabled" | "subagent_enabled"
-    > & {
-      mode: "flash" | "thinking" | "pro" | "ultra" | undefined;
-    },
-  ) => void;
+  onContextChange?: (context: AgentRunIntent) => void;
   tokenUsage?: TokenUsage | null;
   onSubmit?: (message: PromptInputMessage) => void;
   onStop?: () => void;
@@ -214,9 +202,11 @@ export function InputBox({
 
   const handleModeSelect = useCallback(
     (mode: InputMode) => {
+      const resolvedMode = getResolvedMode(mode, supportThinking);
       onContextChange?.({
         ...context,
-        mode: getResolvedMode(mode, supportThinking),
+        mode: resolvedMode,
+        swarm_enabled: resolvedMode === "ultra" && context.swarm_enabled,
       });
     },
     [onContextChange, context, supportThinking],
@@ -641,6 +631,7 @@ export function InputBox({
                 onContextChange?.({
                   ...context,
                   swarm_enabled: !swarmEnabled,
+                  mode: !swarmEnabled ? "ultra" : context.mode,
                 })
               }
             >

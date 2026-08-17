@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 )
 
 // Tier 是模型分层。
@@ -53,6 +55,10 @@ type Config struct {
 	// in State.Values; the router resolves it here so model selection remains a
 	// runtime concern instead of leaking into the loop kernel.
 	NamedModels map[string]model.Model
+	// Capability mappings make the immutable run View authoritative in an
+	// assembled Runtime while preserving standalone Router use.
+	TierCapabilities  map[Tier]string
+	NamedCapabilities map[string]string
 
 	// Fallbacks 是每一层的降级顺序。未声明时用 [该层, standard, fast]。
 	Fallbacks map[Tier][]Tier
@@ -62,7 +68,7 @@ type Config struct {
 
 	// OnStreamEvent observes provider deltas before the response is assembled.
 	// It must be non-blocking; delivery failures must not fail model sampling.
-	OnStreamEvent func(context.Context, *middleware.State, model.StreamEvent)
+	OnStreamEvent func(context.Context, *lifecycle.State, model.StreamEvent)
 
 	// Compactor 用于上下文超限后的强制压缩重发。为 nil 时超限不重试。
 	Compactor Compactor
@@ -154,7 +160,7 @@ func New(cfg Config) (*Router, error) {
 //   - 参数错误 / 认证失败 → 直接返回，重试没有意义
 //
 // **已流出内容的请求不重试**：客户端已经看到了半截回答，重发会让它看到两段。
-func (r *Router) Sample(ctx context.Context, st *middleware.State) (*model.Response, bool, error) {
+func (r *Router) Sample(ctx context.Context, st *lifecycle.State) (*model.Response, bool, error) {
 	if st.ModelInput == nil {
 		return nil, false, errors.New("modelrouter: model input was not built")
 	}
@@ -167,9 +173,13 @@ func (r *Router) Sample(ctx context.Context, st *middleware.State) (*model.Respo
 
 	var lastErr error
 	for _, candidate := range chain {
-		m, ok := r.cfg.Models[candidate]
+		configured, ok := r.cfg.Models[candidate]
 		if !ok {
 			continue
+		}
+		m, err := r.resolveModel(ctx, st, r.cfg.TierCapabilities[candidate], configured)
+		if err != nil {
+			return nil, false, err
 		}
 
 		b := r.breakerFor(string(candidate))
@@ -213,8 +223,12 @@ func (r *Router) Sample(ctx context.Context, st *middleware.State) (*model.Respo
 	return nil, false, fmt.Errorf("%w: %w", ErrUnavailable, lastErr)
 }
 
-func (r *Router) sampleNamed(ctx context.Context, name string, st *middleware.State) (*model.Response, bool, error) {
-	m, err := r.namedModel(name)
+func (r *Router) sampleNamed(ctx context.Context, name string, st *lifecycle.State) (*model.Response, bool, error) {
+	configured, err := r.namedModel(name)
+	if err != nil {
+		return nil, false, err
+	}
+	m, err := r.resolveModel(ctx, st, r.cfg.NamedCapabilities[name], configured)
 	if err != nil {
 		return nil, false, err
 	}
@@ -234,7 +248,23 @@ func (r *Router) sampleNamed(ctx context.Context, name string, st *middleware.St
 	return nil, streamed, err
 }
 
-func selectedModelName(st *middleware.State) string {
+func (r *Router) resolveModel(ctx context.Context, st *lifecycle.State, capabilityName string, configured model.Model) (model.Model, error) {
+	if capabilityName == "" {
+		return configured, nil
+	}
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || !run.Capabilities.Initialized() {
+		return configured, nil
+	}
+	return capability.ResolveViewAs[model.Model](ctx, run.Capabilities, capabilityName, capability.KindModel, capability.ResolveRequest{
+		GenerationID: run.GenerationID,
+		ThreadID:     run.ThreadID,
+		RunID:        run.RunID,
+		Values:       run.Values,
+	})
+}
+
+func selectedModelName(st *lifecycle.State) string {
 	if st == nil || st.Values == nil {
 		return ""
 	}
@@ -257,7 +287,7 @@ func (r *Router) namedModel(name string) (model.Model, error) {
 
 // sampleWithRecovery 在单个模型上完成限流退避与上下文超限重发。
 func (r *Router) sampleWithRecovery(
-	ctx context.Context, m model.Model, st *middleware.State,
+	ctx context.Context, m model.Model, st *lifecycle.State,
 ) (*model.Response, bool, error) {
 	if err := applyRuntimeOptions(st, m); err != nil {
 		return nil, false, err
@@ -318,7 +348,7 @@ func (r *Router) sampleWithRecovery(
 // rebuildInput 在压缩后刷新投递给模型的消息。
 //
 // 不刷新的话重发的还是那份超限的消息，压缩等于白做。
-func (r *Router) rebuildInput(st *middleware.State) {
+func (r *Router) rebuildInput(st *lifecycle.State) {
 	if st.ModelInput == nil || st.History == nil {
 		return
 	}
@@ -329,7 +359,7 @@ func (r *Router) rebuildInput(st *middleware.State) {
 
 // sampleOnce 做一次真实调用。第二个返回值表示是否已有内容流出。
 func (r *Router) sampleOnce(
-	ctx context.Context, m model.Model, st *middleware.State,
+	ctx context.Context, m model.Model, st *lifecycle.State,
 ) (*model.Response, bool, error) {
 	if !r.cfg.Stream {
 		resp, err := m.Complete(ctx, *st.ModelInput)
@@ -377,7 +407,7 @@ func (r *Router) sampleOnce(
 }
 
 // tierFor 决定本次采样用哪一层。
-func (r *Router) tierFor(st *middleware.State) Tier {
+func (r *Router) tierFor(st *lifecycle.State) Tier {
 	// 有图片输入且配置了 vision 层时走 vision：让一个不支持视觉的模型
 	// 去看图，得到的是一句"我看不到图片"，白花一次调用。
 	if _, ok := r.cfg.Models[TierVision]; ok && hasImage(st) {
@@ -386,7 +416,7 @@ func (r *Router) tierFor(st *middleware.State) Tier {
 	return TierStandard
 }
 
-func hasImage(st *middleware.State) bool {
+func hasImage(st *lifecycle.State) bool {
 	if st == nil {
 		return false
 	}
@@ -395,7 +425,7 @@ func hasImage(st *middleware.State) bool {
 		messages = st.ModelInput.Messages
 	} else if st.History != nil {
 		// BeforeAgent runs before ModelInput is built. Looking at History keeps
-		// capability middleware and the sampler on the same vision-tier choice.
+		// capability projection and the sampler on the same vision-tier choice.
 		messages = st.History.All()
 	}
 	for _, m := range messages {

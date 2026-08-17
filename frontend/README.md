@@ -6,7 +6,7 @@ Like the original DeerFlow 1.0, we would love to give the community a minimalist
 
 - **Framework**: [Next.js 16](https://nextjs.org/) with [App Router](https://nextjs.org/docs/app)
 - **UI**: [React 19](https://react.dev/), [Tailwind CSS 4](https://tailwindcss.com/), [Shadcn UI](https://ui.shadcn.com/), [MagicUI](https://magicui.design/) and [React Bits](https://reactbits.dev/)
-- **AI Integration**: [LangGraph SDK](https://www.npmjs.com/package/@langchain/langgraph-sdk) and [Vercel AI Elements](https://vercel.com/ai-sdk/ai-elements)
+- **AI Integration**: Native Nous Agent API client and [Vercel AI Elements](https://vercel.com/ai-sdk/ai-elements)
 
 ## Quick Start
 
@@ -67,10 +67,10 @@ pnpm start
 Key environment variables (see `.env.example` for full list):
 
 ```bash
-# Backend API URLs (optional, uses nginx proxy by default)
+# Backend API URLs (optional, uses same-origin proxies by default)
 NEXT_PUBLIC_BACKEND_BASE_URL="http://localhost:8001"
-# LangGraph API URLs (optional, uses nginx proxy by default)
-NEXT_PUBLIC_LANGGRAPH_BASE_URL="http://localhost:2024"
+# Versioned Agent API root
+NEXT_PUBLIC_AGENT_API_BASE_URL="http://localhost:7776/api/v1"
 ```
 
 ## Project Structure
@@ -108,15 +108,15 @@ src/
 
 ## Scripts
 
-| Command | Description |
-|---------|-------------|
-| `pnpm dev` | Start development server with Turbopack |
-| `pnpm build` | Build for production |
-| `pnpm start` | Start production server |
-| `pnpm lint` | Run ESLint |
-| `pnpm lint:fix` | Fix ESLint issues |
-| `pnpm typecheck` | Run TypeScript type checking |
-| `pnpm check` | Run both lint and typecheck |
+| Command          | Description                             |
+| ---------------- | --------------------------------------- |
+| `pnpm dev`       | Start development server with Turbopack |
+| `pnpm build`     | Build for production                    |
+| `pnpm start`     | Start production server                 |
+| `pnpm lint`      | Run ESLint                              |
+| `pnpm lint:fix`  | Fix ESLint issues                       |
+| `pnpm typecheck` | Run TypeScript type checking            |
+| `pnpm check`     | Run both lint and typecheck             |
 
 ## Development Notes
 

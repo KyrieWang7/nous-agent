@@ -18,8 +18,8 @@ const (
 	// BucketSubagent 是派发出去的 worker 的消耗。
 	BucketSubagent Bucket = "subagent"
 
-	// BucketMiddleware 是系统开销：压缩摘要、标题生成这类旁路调用。
-	BucketMiddleware Bucket = "middleware"
+	// BucketAuxiliary 是系统开销：压缩摘要、标题生成这类旁路调用。
+	BucketAuxiliary Bucket = "auxiliary"
 )
 
 // Price 是某个模型的单价，单位是"每百万 token 的微单位成本"。
@@ -85,7 +85,7 @@ func (p *Pricer) CostMicros(modelName string, u model.Usage) int64 {
 type Entry struct {
 	Bucket Bucket
 
-	// Source 是桶内的细分来源，例如 subagent 名或中间件名。
+	// Source 是桶内的细分来源，例如 subagent 名或 lifecycle handler 名。
 	Source string
 
 	// CallID 是模型调用的唯一标识，用于去重。
@@ -104,9 +104,9 @@ type Totals struct {
 	OutputTokens      int
 	CachedInputTokens int
 
-	LeadTokens       int
-	SubagentTokens   int
-	MiddlewareTokens int
+	LeadTokens      int
+	SubagentTokens  int
+	AuxiliaryTokens int
 
 	CostMicros int64
 
@@ -130,7 +130,7 @@ type Journal struct {
 }
 
 // sharedSpend is inherited by child journals. It lets every runner observe
-// the aggregate lead, middleware, and subagent spend without double-counting
+// the aggregate lead, auxiliary, and subagent spend without double-counting
 // child totals when they are merged back into the parent journal.
 type sharedSpend struct {
 	tokens atomic.Int64
@@ -195,8 +195,8 @@ func (j *Journal) Observe(e Entry) bool {
 	switch e.Bucket {
 	case BucketSubagent:
 		j.totals.SubagentTokens += tokens
-	case BucketMiddleware:
-		j.totals.MiddlewareTokens += tokens
+	case BucketAuxiliary:
+		j.totals.AuxiliaryTokens += tokens
 	default:
 		j.totals.LeadTokens += tokens
 	}
@@ -221,6 +221,19 @@ func (j *Journal) Spend() (tokens int64, costMicros int64) {
 		return 0, 0
 	}
 	return j.spend.tokens.Load(), j.spend.cost.Load()
+}
+
+// EstimateCost returns the configured price for one model call without
+// mutating the journal. Kernel budget enforcement uses it to charge the same
+// amount that usage accounting will record.
+func (j *Journal) EstimateCost(modelName string, usage model.Usage) int64 {
+	if j == nil {
+		return 0
+	}
+	j.mu.Lock()
+	pricer := j.pricer
+	j.mu.Unlock()
+	return pricer.CostMicros(modelName, usage)
 }
 
 // dedupeKey 构造去重键。
@@ -263,21 +276,13 @@ func (j *Journal) BySource() map[string]int {
 	return out
 }
 
-// Merge 把 subagent 的账本回灌到父账本的 subagent 桶。
-//
-// 不回灌的话 subagent_tokens 永远是 0，而且一个 run 可以靠不断派发
-// 绕过成本上限（设计文档 §10.1）。
-func (j *Journal) Merge(name string, child *Journal) {
-	j.mergeSubagent("", name, child)
-}
-
 // MergeSubagent merges one completed child exactly once for a trusted task ID.
 // Replayed tool calls can execute the same task identity more than once; the
-// parent bill must still contain that task's usage only once.
+// parent bill must still contain that task's usage only once. Child journals
+// must come from Journal.Child so aggregate spend is shared by construction.
 func (j *Journal) MergeSubagent(taskID, name string, child *Journal) bool {
-	if taskID == "" {
-		j.Merge(name, child)
-		return j != nil && child != nil
+	if j == nil || child == nil || taskID == "" || j.spend != child.spend {
+		return false
 	}
 	key := dedupeKey(Entry{Bucket: BucketSubagent, Source: name, CallID: taskID})
 	return j.mergeSubagent(key, name, child)
@@ -305,15 +310,8 @@ func (j *Journal) mergeSubagent(dedupeKey, name string, child *Journal) bool {
 	j.totals.CostMicros += t.CostMicros
 
 	// 子账本里的一切都归父账本的 subagent 桶，包括子 agent 自己的
-	// middleware 开销 —— 从父 run 的视角看，那都是"派发的代价"。
+	// auxiliary 开销 —— 从父 run 的视角看，那都是"派发的代价"。
 	j.totals.SubagentTokens += t.InputTokens + t.OutputTokens
-	if j.spend != child.spend {
-		// Legacy/custom callers may merge an independently constructed journal.
-		// Production children use Child(), which already shares this counter.
-		j.spend.tokens.Add(int64(t.InputTokens + t.OutputTokens))
-		j.spend.cost.Add(t.CostMicros)
-	}
-
 	if name != "" {
 		j.bySource[string(BucketSubagent)+":"+name] += t.InputTokens + t.OutputTokens
 	}

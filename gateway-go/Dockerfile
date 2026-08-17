@@ -15,8 +15,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && addgroup --system nous \
     && adduser --system --ingroup nous --home /app nous \
-    && mkdir -p /data/workspaces /agent/skills/custom /etc/nous-agent /config \
-    && chown -R nous:nous /app /data /agent/skills/custom /etc/nous-agent /config
+    && mkdir -p /data/workspaces /opt/nous/skills/custom /etc/nous-agent /config \
+    && chown -R nous:nous /app /data /opt/nous/skills/custom /etc/nous-agent /config
 
 COPY --from=build /out/nous-gateway /usr/local/bin/nous-gateway
 

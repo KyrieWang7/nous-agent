@@ -12,379 +12,186 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
-func def(name string, readOnly, sandboxed bool) tool.Definition {
+func definition(name string, readOnly, sandboxed bool) tool.Definition {
 	return tool.Definition{
-		Name:       name,
-		Group:      "test",
-		Parameters: json.RawMessage(`{"type":"object"}`),
-		Metadata: tool.Metadata{
-			IsReadOnly:      readOnly,
-			RequiresSandbox: sandboxed,
-		},
-		Handler: func(context.Context, tool.Call) (*tool.Result, error) {
-			return &tool.Result{}, nil
-		},
+		Name: name, Group: "test", Parameters: json.RawMessage(`{"type":"object"}`),
+		Metadata: tool.Metadata{IsReadOnly: readOnly, RequiresSandbox: sandboxed},
+		Handler:  func(context.Context, tool.Call) (*tool.Result, error) { return &tool.Result{}, nil },
 	}
 }
 
 var (
-	readTool    = def("read_file", true, true)
-	writeTool   = def("write_file", false, true)
-	unsandboxed = def("http_post", false, false)
-	agentState  = func() tool.Definition {
-		d := def("send_message", false, false)
-		d.Metadata.IsAgentState = true
-		return d
-	}()
+	readTool     = definition("read_file", true, true)
+	writeTool    = definition("write_file", false, true)
+	externalTool = definition("http_post", false, false)
 )
 
-func TestAuthorize_ModeMatrix(t *testing.T) {
-	t.Parallel()
-
+func TestPresetBundlesIndependentPolicies(t *testing.T) {
 	tests := []struct {
-		mode Mode
-		tool tool.Definition
-		want bool
+		preset   permission.Preset
+		sandbox  permission.SandboxMode
+		approval permission.ApprovalPolicy
 	}{
-		{permission.ModeReadOnly, readTool, true},
-		{permission.ModeReadOnly, writeTool, false},
-		{permission.ModeReadOnly, unsandboxed, false},
-		{permission.ModeReadOnly, agentState, false},
-
-		{permission.ModeWorkspaceWrite, readTool, true},
-		{permission.ModeWorkspaceWrite, writeTool, true},
-		{permission.ModeWorkspaceWrite, unsandboxed, false},
-		{permission.ModeWorkspaceWrite, agentState, true},
-
-		{permission.ModeAllow, readTool, true},
-		{permission.ModeAllow, writeTool, true},
-		{permission.ModeAllow, unsandboxed, true},
-
-		{permission.ModeDangerFullAccess, unsandboxed, true},
+		{permission.PresetReadOnly, permission.SandboxReadOnly, permission.ApprovalNever},
+		{permission.PresetWorkspaceWrite, permission.SandboxWorkspaceWrite, permission.ApprovalAsk},
+		{permission.PresetDangerFullAccess, permission.SandboxDangerFullAccess, permission.ApprovalNever},
 	}
+	for _, tt := range tests {
+		policy := mustPolicy(t, permission.Config{Preset: tt.preset})
+		if policy.Preset() != tt.preset || policy.SandboxMode() != tt.sandbox || policy.ApprovalPolicy() != tt.approval {
+			t.Fatalf("preset %s resolved to %s/%s", tt.preset, policy.SandboxMode(), policy.ApprovalPolicy())
+		}
+	}
+}
 
-	for _, tc := range tests {
-		name := string(tc.mode) + "/" + tc.tool.Name
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+func TestWorkspaceWriteOnlyAsksForEscalation(t *testing.T) {
+	prompter := &fakePrompter{approve: true}
+	policy := mustPolicy(t, permission.Config{Preset: permission.PresetWorkspaceWrite, Prompter: prompter})
+	for _, direct := range []tool.Definition{readTool, writeTool} {
+		decision := authorize(policy, direct, nil)
+		if !decision.Allowed || decision.ApprovalUsed {
+			t.Fatalf("%s decision = %#v", direct.Name, decision)
+		}
+	}
+	decision := authorize(policy, externalTool, json.RawMessage(`{"target":"remote"}`))
+	if !decision.Allowed || !decision.ApprovalUsed || prompter.calls != 1 {
+		t.Fatalf("external decision = %#v, calls=%d", decision, prompter.calls)
+	}
+	if prompter.last.ToolCallID != "call-1" || !strings.Contains(prompter.last.Reason, "workspace-write to danger-full-access") {
+		t.Fatalf("approval request = %#v", prompter.last)
+	}
+}
 
-			p := mustPolicy(t, permission.Config{Mode: tc.mode})
-			got := p.Authorize(context.Background(), tc.tool, nil)
+func TestApprovalNeverDeniesEscalation(t *testing.T) {
+	policy := mustPolicy(t, permission.Config{Preset: permission.PresetReadOnly})
+	decision := authorize(policy, writeTool, nil)
+	if decision.Allowed || decision.ApprovalUsed || !strings.Contains(decision.Reason, "approval policy is never") {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
 
-			if got.Allowed != tc.want {
-				t.Fatalf("Authorize() allowed = %v, want %v (reason: %s)", got.Allowed, tc.want, got.Reason)
-			}
-			if !got.Allowed && got.Reason == "" {
-				t.Error("a denial must carry a reason the model can act on")
+func TestApprovalAskFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		prompter permission.Prompter
+	}{
+		{name: "missing"},
+		{name: "declined", prompter: &fakePrompter{}},
+		{name: "error", prompter: &fakePrompter{err: errors.New("ui disconnected")}},
+		{name: "timeout", prompter: blockingPrompter{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := mustPolicy(t, permission.Config{
+				Preset: permission.PresetWorkspaceWrite, Prompter: tt.prompter, PromptTimeout: 10 * time.Millisecond,
+			})
+			if decision := authorize(policy, externalTool, nil); decision.Allowed || decision.Reason == "" {
+				t.Fatalf("decision = %#v", decision)
 			}
 		})
 	}
 }
 
-func TestNewPolicy_DefaultsToAllow(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{})
-	if got := p.Mode("anything"); got != permission.ModeAllow {
-		t.Fatalf("default mode = %q, want %q", got, permission.ModeAllow)
-	}
-}
-
-// 拼错的 mode 若被当成默认值处理就是静默降级为放行，必须在构造期失败。
-func TestNewPolicy_RejectsUnknownMode(t *testing.T) {
-	t.Parallel()
-
-	if _, err := permission.NewPolicy(permission.Config{Mode: "read-only"}); err == nil {
-		t.Fatal("NewPolicy() accepted an unknown mode")
-	}
-
-	_, err := permission.NewPolicy(permission.Config{
-		Mode:          permission.ModeAllow,
-		ToolOverrides: map[string]permission.Mode{"bash": "yolo"},
-	})
-	if err == nil {
-		t.Fatal("NewPolicy() accepted an unknown override mode")
-	}
-	if !strings.Contains(err.Error(), "bash") {
-		t.Errorf("error = %q, want it to name the offending tool", err)
-	}
-}
-
-func TestAuthorize_ToolOverrideWins(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{
-		Mode:          permission.ModeReadOnly,
-		ToolOverrides: map[string]permission.Mode{"write_file": permission.ModeAllow},
-	})
-
-	if got := p.Authorize(context.Background(), writeTool, nil); !got.Allowed {
-		t.Fatalf("override did not take effect: %s", got.Reason)
-	}
-	// 未覆盖的工具仍按默认级别
-	if got := p.Authorize(context.Background(), unsandboxed, nil); got.Allowed {
-		t.Fatal("an unrelated tool was allowed by the override")
-	}
-}
-
-// --- ModePrompt ---
-
-func TestAuthorize_PromptAsksAndHonoursApproval(t *testing.T) {
-	t.Parallel()
-
-	pr := &fakePrompter{approve: true}
-	p := mustPolicy(t, permission.Config{Mode: permission.ModePrompt, Prompter: pr})
-
-	got := p.Authorize(context.Background(), writeTool, json.RawMessage(`{"path":"a"}`))
-	if !got.Allowed {
-		t.Fatalf("Authorize() denied an approved call: %s", got.Reason)
-	}
-	if pr.calls != 1 {
-		t.Fatalf("prompter called %d times, want 1", pr.calls)
-	}
-	if pr.lastReq.ToolName != "write_file" {
-		t.Errorf("prompter saw tool %q", pr.lastReq.ToolName)
-	}
-	if string(pr.lastReq.Args) != `{"path":"a"}` {
-		t.Errorf("prompter saw args %q; the user must see what they are approving", pr.lastReq.Args)
-	}
-}
-
-func TestAuthorize_PromptHonoursDecline(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{
-		Mode:     permission.ModePrompt,
-		Prompter: &fakePrompter{approve: false},
-	})
-
-	if got := p.Authorize(context.Background(), writeTool, nil); got.Allowed {
-		t.Fatal("Authorize() allowed a declined call")
-	}
-}
-
-// 只读工具不该打扰用户：prompt 模式的意图是拦住有副作用的操作。
-func TestAuthorize_PromptDoesNotAskForReadOnlyTools(t *testing.T) {
-	t.Parallel()
-
-	pr := &fakePrompter{approve: false}
-	p := mustPolicy(t, permission.Config{Mode: permission.ModePrompt, Prompter: pr})
-
-	if got := p.Authorize(context.Background(), readTool, nil); !got.Allowed {
-		t.Fatalf("a read-only tool was denied in prompt mode: %s", got.Reason)
-	}
-	if pr.calls != 0 {
-		t.Fatalf("prompter called %d times for a read-only tool, want 0", pr.calls)
-	}
-}
-
-// 征求确认失败不能替用户点同意。
-func TestAuthorize_PrompterErrorIsDenial(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{
-		Mode:     permission.ModePrompt,
-		Prompter: &fakePrompter{err: errors.New("ui disconnected")},
-	})
-
-	got := p.Authorize(context.Background(), writeTool, nil)
-	if got.Allowed {
-		t.Fatal("a prompter failure must not be treated as approval")
-	}
-	if !strings.Contains(got.Reason, "ui disconnected") {
-		t.Errorf("reason = %q, want it to carry the cause", got.Reason)
-	}
-}
-
-// 没人能回答的确认请求只能是拒绝。
-func TestAuthorize_PromptWithoutPrompterIsDenial(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{Mode: permission.ModePrompt})
-
-	if got := p.Authorize(context.Background(), writeTool, nil); got.Allowed {
-		t.Fatal("prompt mode without a prompter must deny")
-	}
-}
-
-func TestAuthorize_PromptTimesOutAsDenial(t *testing.T) {
-	t.Parallel()
-
-	p := mustPolicy(t, permission.Config{
-		Mode:          permission.ModePrompt,
-		Prompter:      &blockingPrompter{},
-		PromptTimeout: 20 * time.Millisecond,
-	})
-
-	start := time.Now()
-	got := p.Authorize(context.Background(), writeTool, nil)
-
-	if got.Allowed {
-		t.Fatal("a confirmation timeout must be treated as a denial")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Authorize() took %v; the prompt timeout did not fire", elapsed)
-	}
-}
-
-// --- AllowedTools ---
-
-func TestAllowedTools_FiltersByMode(t *testing.T) {
-	t.Parallel()
-
-	r := tool.NewRegistry()
-	for _, d := range []tool.Definition{readTool, writeTool, unsandboxed} {
-		if err := r.Register(d); err != nil {
+func TestAllowedToolsKeepsAskEscalationsVisible(t *testing.T) {
+	registry := tool.NewRegistry()
+	for _, item := range []tool.Definition{readTool, writeTool, externalTool} {
+		if err := registry.Register(item); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	p := mustPolicy(t, permission.Config{Mode: permission.ModeReadOnly})
-	got := p.AllowedTools(r, []string{"read_file", "write_file", "http_post"})
-
-	if len(got) != 1 || got[0] != "read_file" {
-		t.Fatalf("AllowedTools() = %v, want [read_file]", got)
+	ask := mustPolicy(t, permission.Config{Preset: permission.PresetWorkspaceWrite})
+	if got := ask.AllowedTools(registry, registry.Names()); len(got) != 3 {
+		t.Fatalf("ask tools = %v", got)
+	}
+	never := mustPolicy(t, permission.Config{Preset: permission.PresetReadOnly})
+	if got := never.AllowedTools(registry, registry.Names()); len(got) != 1 || got[0] != "read_file" {
+		t.Fatalf("never tools = %v", got)
 	}
 }
 
-// prompt 模式下工具应当可见：披露与调用是两件事，
-// 否则模型永远不知道有这个能力，也就永远不会去请求确认。
-func TestAllowedTools_PromptModeKeepsToolsVisible(t *testing.T) {
-	t.Parallel()
-
-	r := tool.NewRegistry()
-	if err := r.Register(writeTool); err != nil {
-		t.Fatal(err)
+func TestExplicitRequiredSandboxModeAndInvalidMetadata(t *testing.T) {
+	item := definition("plugin", true, false)
+	item.Metadata.RequiredSandboxMode = string(permission.SandboxDangerFullAccess)
+	policy := mustPolicy(t, permission.Config{Preset: permission.PresetWorkspaceWrite, Prompter: &fakePrompter{approve: true}})
+	if decision := authorize(policy, item, nil); !decision.Allowed || !decision.ApprovalUsed {
+		t.Fatalf("decision = %#v", decision)
 	}
-
-	p := mustPolicy(t, permission.Config{Mode: permission.ModePrompt})
-	got := p.AllowedTools(r, []string{"write_file"})
-
-	if len(got) != 1 {
-		t.Fatalf("AllowedTools() = %v, want the tool to stay visible in prompt mode", got)
+	item.Metadata.RequiredSandboxMode = "root-everything"
+	if decision := authorize(policy, item, nil); decision.Allowed || !strings.Contains(decision.Reason, "invalid required sandbox mode") {
+		t.Fatalf("decision = %#v", decision)
 	}
 }
 
-func TestAllowedTools_SkipsUnregisteredNames(t *testing.T) {
-	t.Parallel()
-
-	r := tool.NewRegistry()
-	if err := r.Register(readTool); err != nil {
-		t.Fatal(err)
+func TestPolicyRejectsInvalidPresetTables(t *testing.T) {
+	tests := []permission.Config{
+		{Preset: "missing"},
+		{Preset: permission.PresetCustom, Presets: map[permission.Preset]permission.PresetSpec{permission.PresetCustom: {Sandbox: permission.SandboxReadOnly, Approval: permission.ApprovalNever}}},
+		{Preset: "bad", Presets: map[permission.Preset]permission.PresetSpec{"bad": {Sandbox: "yolo", Approval: permission.ApprovalAsk}}},
+		{Preset: "bad", Presets: map[permission.Preset]permission.PresetSpec{"bad": {Sandbox: permission.SandboxReadOnly, Approval: "sometimes"}}},
 	}
-
-	p := mustPolicy(t, permission.Config{Mode: permission.ModeAllow})
-	got := p.AllowedTools(r, []string{"read_file", "ghost"})
-
-	if len(got) != 1 || got[0] != "read_file" {
-		t.Fatalf("AllowedTools() = %v, want [read_file]", got)
-	}
-}
-
-func TestRequiredPermissionMinimum(t *testing.T) {
-	t.Parallel()
-
-	dangerTool := def("external_command", false, false)
-	dangerTool.Metadata.RequiredPermission = string(permission.ModeDangerFullAccess)
-	r := tool.NewRegistry()
-	if err := r.Register(dangerTool); err != nil {
-		t.Fatal(err)
-	}
-	for _, mode := range []permission.Mode{permission.ModeWorkspaceWrite, permission.ModePrompt, permission.ModeAllow} {
-		t.Run(string(mode), func(t *testing.T) {
-			p := mustPolicy(t, permission.Config{Mode: mode, Prompter: &fakePrompter{approve: true}})
-			if got := p.Authorize(context.Background(), dangerTool, nil); got.Allowed {
-				t.Fatalf("Authorize() allowed danger_full_access tool under %s", mode)
-			}
-			if got := p.AllowedTools(r, []string{dangerTool.Name}); len(got) != 0 {
-				t.Fatalf("AllowedTools() = %v under %s, want hidden", got, mode)
-			}
-		})
-	}
-	p := mustPolicy(t, permission.Config{Mode: permission.ModeDangerFullAccess})
-	if got := p.Authorize(context.Background(), dangerTool, nil); !got.Allowed {
-		t.Fatalf("Authorize() denied matching minimum: %s", got.Reason)
-	}
-	if got := p.AllowedTools(r, []string{dangerTool.Name}); len(got) != 1 {
-		t.Fatalf("AllowedTools() = %v, want visible", got)
-	}
-}
-
-func TestRequiredPermissionInvalidFailsClosed(t *testing.T) {
-	t.Parallel()
-
-	d := def("bad_manifest_tool", false, false)
-	d.Metadata.RequiredPermission = "root_everything"
-	p := mustPolicy(t, permission.Config{Mode: permission.ModeDangerFullAccess})
-	if got := p.Authorize(context.Background(), d, nil); got.Allowed || !strings.Contains(got.Reason, "unknown mode") {
-		t.Fatalf("Authorize() = %#v, want invalid requirement denial", got)
-	}
-	r := tool.NewRegistry()
-	if err := r.Register(d); err != nil {
-		t.Fatal(err)
-	}
-	if got := p.AllowedTools(r, []string{d.Name}); len(got) != 0 {
-		t.Fatalf("AllowedTools() = %v, want hidden", got)
-	}
-}
-
-func TestPromptMinimumVisibilityAndEmptyRequirementCompatibility(t *testing.T) {
-	t.Parallel()
-
-	promptTool := def("prompt_plugin", false, false)
-	promptTool.Metadata.RequiredPermission = string(permission.ModePrompt)
-	r := tool.NewRegistry()
-	for _, d := range []tool.Definition{promptTool, writeTool} {
-		if err := r.Register(d); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, mode := range []permission.Mode{permission.ModePrompt, permission.ModeAllow, permission.ModeDangerFullAccess} {
-		p := mustPolicy(t, permission.Config{Mode: mode})
-		got := p.AllowedTools(r, []string{promptTool.Name, writeTool.Name})
-		if len(got) != 2 {
-			t.Fatalf("AllowedTools() under %s = %v, want both tools", mode, got)
+	for _, cfg := range tests {
+		if _, err := permission.NewPolicy(cfg); err == nil {
+			t.Fatalf("invalid config accepted: %#v", cfg)
 		}
 	}
 }
 
-// --- ParseMode ---
-
-func TestParseMode(t *testing.T) {
-	t.Parallel()
-
-	if got, err := permission.ParseMode(" READ_ONLY "); err != nil || got != permission.ModeReadOnly {
-		t.Fatalf("ParseMode() = %q, %v", got, err)
-	}
-	if _, err := permission.ParseMode("nope"); err == nil {
-		t.Fatal("ParseMode() accepted an unknown mode")
+func TestPolicyAcceptsConfiguredPresetBundle(t *testing.T) {
+	policy := mustPolicy(t, permission.Config{
+		Preset: "reviewed-read-only",
+		Presets: map[permission.Preset]permission.PresetSpec{
+			"reviewed-read-only": {Sandbox: permission.SandboxReadOnly, Approval: permission.ApprovalAsk},
+		},
+	})
+	if policy.SandboxMode() != permission.SandboxReadOnly || policy.ApprovalPolicy() != permission.ApprovalAsk {
+		t.Fatalf("policy = %s/%s", policy.SandboxMode(), policy.ApprovalPolicy())
 	}
 }
 
-// --- helpers ---
+func TestDelegationPinsApprovalNeverWithoutExpandingSandbox(t *testing.T) {
+	parent := mustPolicy(t, permission.Config{Preset: permission.PresetWorkspaceWrite, Prompter: &fakePrompter{approve: true}})
+	child := parent.ForDelegation()
+	if child.SandboxMode() != permission.SandboxWorkspaceWrite || child.ApprovalPolicy() != permission.ApprovalNever {
+		t.Fatalf("child policy = %s/%s", child.SandboxMode(), child.ApprovalPolicy())
+	}
+	if decision := authorize(child, externalTool, nil); decision.Allowed || decision.ApprovalUsed {
+		t.Fatalf("delegated escalation = %#v", decision)
+	}
+}
 
-type Mode = permission.Mode
+func TestParseSandboxMode(t *testing.T) {
+	if got, err := permission.ParseSandboxMode(" WORKSPACE-WRITE "); err != nil || got != permission.SandboxWorkspaceWrite {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	if _, err := permission.ParseSandboxMode("workspace_write"); err == nil {
+		t.Fatal("legacy underscore mode was accepted")
+	}
+}
 
-func mustPolicy(t *testing.T, cfg permission.Config) *permission.Policy {
+func mustPolicy(t *testing.T, config permission.Config) *permission.Policy {
 	t.Helper()
-	p, err := permission.NewPolicy(cfg)
+	policy, err := permission.NewPolicy(config)
 	if err != nil {
-		t.Fatalf("NewPolicy() error = %v", err)
+		t.Fatal(err)
 	}
-	return p
+	return policy
+}
+
+func authorize(policy *permission.Policy, definition tool.Definition, args json.RawMessage) permission.Decision {
+	return policy.AuthorizeCall(context.Background(), definition, tool.Call{ID: "call-1", Name: definition.Name, Args: args})
 }
 
 type fakePrompter struct {
 	approve bool
 	err     error
 	calls   int
-	lastReq permission.ConfirmRequest
+	last    permission.ConfirmRequest
 }
 
-func (f *fakePrompter) Confirm(_ context.Context, req permission.ConfirmRequest) (bool, error) {
-	f.calls++
-	f.lastReq = req
-	return f.approve, f.err
+func (p *fakePrompter) Confirm(_ context.Context, request permission.ConfirmRequest) (bool, error) {
+	p.calls++
+	p.last = request
+	return p.approve, p.err
 }
 
 type blockingPrompter struct{}

@@ -17,13 +17,20 @@ import (
 
 type Fact struct {
 	ID         int64     `json:"id"`
+	UserID     string    `json:"user_id"`
+	ProjectID  string    `json:"project_id"`
 	ThreadID   string    `json:"thread_id"`
 	Text       string    `json:"fact"`
 	Confidence float64   `json:"confidence"`
 	CreatedAt  time.Time `json:"created_at"`
 }
+type Scope struct {
+	UserID    string `json:"user_id"`
+	ProjectID string `json:"project_id"`
+	ThreadID  string `json:"thread_id"`
+}
 type Store interface {
-	List(context.Context, string, int) ([]Fact, error)
+	List(context.Context, Scope, int) ([]Fact, error)
 	Add(context.Context, Fact) error
 }
 type Options struct {
@@ -55,7 +62,7 @@ func New(model model.Model, store Store, opts Options) (*Manager, error) {
 	}
 	return &Manager{model: model, store: store, opts: opts}, nil
 }
-func (m *Manager) Extract(ctx context.Context, threadID string, msgs []message.Message) error {
+func (m *Manager) Extract(ctx context.Context, scope Scope, msgs []message.Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -75,14 +82,14 @@ func (m *Manager) Extract(ctx context.Context, threadID string, msgs []message.M
 		if strings.TrimSpace(f.Fact) == "" || f.Confidence < m.opts.ConfidenceThreshold {
 			continue
 		}
-		if err := m.store.Add(ctx, Fact{ThreadID: threadID, Text: f.Fact, Confidence: f.Confidence, CreatedAt: time.Now().UTC()}); err != nil {
+		if err := m.store.Add(ctx, Fact{UserID: scope.UserID, ProjectID: scope.ProjectID, ThreadID: scope.ThreadID, Text: f.Fact, Confidence: f.Confidence, CreatedAt: time.Now().UTC()}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
-func (m *Manager) Prompt(ctx context.Context, threadID string) (string, error) {
-	facts, err := m.store.List(ctx, threadID, m.opts.MaxFacts)
+func (m *Manager) Prompt(ctx context.Context, scope Scope) (string, error) {
+	facts, err := m.store.List(ctx, scope, m.opts.MaxFacts)
 	if err != nil {
 		return "", err
 	}
@@ -91,7 +98,7 @@ func (m *Manager) Prompt(ctx context.Context, threadID string) (string, error) {
 	}
 	budget := m.opts.InjectionTokens * 4
 	var b strings.Builder
-	b.WriteString("Known durable facts for this thread:\n")
+	b.WriteString("Known durable facts for this user/project/thread scope:\n")
 	used := 0
 	for _, f := range facts {
 		line := fmt.Sprintf("- %s\n", f.Text)
@@ -105,29 +112,30 @@ func (m *Manager) Prompt(ctx context.Context, threadID string) (string, error) {
 }
 
 type MemoryStore struct {
-	mu       sync.RWMutex
-	next     int64
-	byThread map[string][]Fact
+	mu      sync.RWMutex
+	next    int64
+	byScope map[Scope][]Fact
 }
 
-func NewMemoryStore() *MemoryStore { return &MemoryStore{byThread: map[string][]Fact{}} }
+func NewMemoryStore() *MemoryStore { return &MemoryStore{byScope: map[Scope][]Fact{}} }
 func (s *MemoryStore) Add(_ context.Context, f Fact) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, old := range s.byThread[f.ThreadID] {
+	scope := Scope{UserID: f.UserID, ProjectID: f.ProjectID, ThreadID: f.ThreadID}
+	for _, old := range s.byScope[scope] {
 		if old.Text == f.Text {
 			return nil
 		}
 	}
 	s.next++
 	f.ID = s.next
-	s.byThread[f.ThreadID] = append(s.byThread[f.ThreadID], f)
+	s.byScope[scope] = append(s.byScope[scope], f)
 	return nil
 }
-func (s *MemoryStore) List(_ context.Context, threadID string, limit int) ([]Fact, error) {
+func (s *MemoryStore) List(_ context.Context, scope Scope, limit int) ([]Fact, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := append([]Fact(nil), s.byThread[threadID]...)
+	out := append([]Fact(nil), s.byScope[scope]...)
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]

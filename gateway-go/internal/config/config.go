@@ -20,10 +20,10 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		Address:          env("GATEWAY_ADDR", ":7777"),
-		DatabaseURL:      firstEnv("DATABASE_URL", "LANGGRAPH_PG_URI"),
+		DatabaseURL:      strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		HarnessConfig:    env("NOUS_HARNESS_CONFIG_PATH", "/etc/nous-agent/config.yaml"),
 		ExtensionsConfig: env("NOUS_EXTENSIONS_CONFIG_PATH", "/etc/nous-agent/extensions.json"),
-		SkillsRoot:       env("NOUS_SKILLS_ROOT", "/agent/skills"),
+		SkillsRoot:       env("NOUS_SKILLS_ROOT", "/opt/nous/skills"),
 		WorkspaceRoot:    env("NOUS_WORKSPACE_ROOT", "/data/workspaces"),
 		CORSOrigins:      split(env("CORS_ORIGINS", "*")),
 	}
@@ -47,15 +47,6 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func firstEnv(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func split(value string) []string {

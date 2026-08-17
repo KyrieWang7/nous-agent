@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS agent_run_event (
 );
 CREATE INDEX IF NOT EXISTS agent_run_event_cursor_idx ON agent_run_event(run_id, seq);
 
+CREATE TABLE IF NOT EXISTS agent_projection_snapshot (
+    run_id TEXT NOT NULL REFERENCES agent_run(id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL REFERENCES agent_thread(id) ON DELETE CASCADE,
+    last_seq BIGINT NOT NULL,
+    messages JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_id, thread_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_run_completion (
     run_id TEXT PRIMARY KEY REFERENCES agent_run(id) ON DELETE CASCADE,
     thread_id TEXT NOT NULL,
@@ -59,7 +68,7 @@ CREATE TABLE IF NOT EXISTS agent_run_completion (
     output_tokens BIGINT NOT NULL DEFAULT 0,
     lead_tokens BIGINT NOT NULL DEFAULT 0,
     subagent_tokens BIGINT NOT NULL DEFAULT 0,
-    middleware_tokens BIGINT NOT NULL DEFAULT 0,
+    auxiliary_tokens BIGINT NOT NULL DEFAULT 0,
     cost_micros BIGINT NOT NULL DEFAULT 0,
     duration_ms BIGINT NOT NULL DEFAULT 0,
     completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -67,6 +76,8 @@ CREATE TABLE IF NOT EXISTS agent_run_completion (
 
 CREATE TABLE IF NOT EXISTS memory_fact (
     id BIGSERIAL PRIMARY KEY,
+	user_id TEXT NOT NULL DEFAULT '',
+	project_id TEXT NOT NULL DEFAULT '',
     thread_id TEXT NOT NULL REFERENCES agent_thread(id) ON DELETE CASCADE,
     fact TEXT NOT NULL,
     confidence DOUBLE PRECISION NOT NULL DEFAULT 1,

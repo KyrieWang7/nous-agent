@@ -8,15 +8,14 @@ export function getBackendBaseURL() {
   }
 }
 
-export function getLangGraphBaseURL() {
-  if (env.NEXT_PUBLIC_LANGGRAPH_BASE_URL) {
-    return env.NEXT_PUBLIC_LANGGRAPH_BASE_URL;
+export function getAgentAPIBaseURL() {
+  if (env.NEXT_PUBLIC_AGENT_API_BASE_URL) {
+    return env.NEXT_PUBLIC_AGENT_API_BASE_URL;
   } else {
-    // LangGraph SDK requires a full URL, construct it from current origin
     if (typeof window !== "undefined") {
-      return `${window.location.origin}/api/langgraph`;
+      return `${window.location.origin}/api/agent`;
     }
     // Fallback for SSR; local development uses the same-origin Next.js proxy.
-    return "http://localhost:7775/api/langgraph";
+    return "http://localhost:7775/api/agent";
   }
 }

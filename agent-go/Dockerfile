@@ -17,8 +17,8 @@ FROM alpine:3.22
 RUN apk add --no-cache bash ca-certificates curl git tzdata \
     && addgroup -S nous \
     && adduser -S -G nous -h /app nous \
-    && mkdir -p /app/.nous-agent/workspaces /agent/skills/public /etc/nous-agent \
-    && chown -R nous:nous /app /agent/skills
+    && mkdir -p /app/.nous-agent/workspaces /opt/nous/skills/public /etc/nous-agent \
+    && chown -R nous:nous /app /opt/nous/skills
 
 WORKDIR /app
 COPY --from=build /out/agentd /usr/local/bin/agentd

@@ -15,9 +15,9 @@ var (
 
 // Limits 是内核的安全上限。
 //
-// 这些上限刻意放在内核而不是中间件：中间件的本质是"可以从链里删掉"，
-// 而这几样一旦可删就等于可以被误配成无上限 —— 那是能烧穿账单的失效模式。
-// LoopDetection 那类启发式检测可以是中间件（删了只是少一层保护），
+// 这些上限刻意固定在内核：生命周期处理器可以按业务装配，
+// 而这些约束一旦可删就等于可以被误配成无上限 —— 那是能烧穿账单的失效模式。
+// LoopDetection 那类启发式检测可以是生命周期处理器（删了只是少一层保护），
 // 但 iteration >= MaxIterations 这个判断必须钉死在 for 里（设计文档 §3.3）。
 type Limits struct {
 	// MaxIterations 是单次 run 的最大迭代轮数。<= 0 表示不限轮次。
@@ -34,8 +34,13 @@ type Limits struct {
 	MaxCostMicros int64
 
 	// MaxTokens is the aggregate per-run token ceiling across the lead agent,
-	// middleware model calls, and all child agents. <= 0 means unbounded.
+	// auxiliary model calls, and all child agents. <= 0 means unbounded.
 	MaxTokens int
+
+	// MaxToolCalls and MaxSubagents are optional runtime budget dimensions.
+	// <= 0 means unlimited. They are enforced by the kernel before dispatch.
+	MaxToolCalls int
+	MaxSubagents int
 
 	// StopReinjectionLimit 是停止门拦截后的最大续跑次数。<= 0 时用默认值。
 	//

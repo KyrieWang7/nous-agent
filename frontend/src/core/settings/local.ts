@@ -1,4 +1,4 @@
-import type { AgentThreadContext } from "../threads";
+import type { AgentRunIntent } from "../threads";
 
 export const DEFAULT_LOCAL_SETTINGS: LocalSettings = {
   notification: {
@@ -20,12 +20,7 @@ export interface LocalSettings {
   notification: {
     enabled: boolean;
   };
-  context: Omit<
-    AgentThreadContext,
-    "thread_id" | "is_plan_mode" | "thinking_enabled" | "subagent_enabled"
-  > & {
-    mode: "flash" | "thinking" | "pro" | "ultra" | undefined;
-  };
+  context: AgentRunIntent;
   layout: {
     sidebar_collapsed: boolean;
   };

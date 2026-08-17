@@ -126,7 +126,7 @@ func New(turns ...Turn) *Model {
 	}
 }
 
-// WithInfo 覆盖 Info()，用于测试依赖模型能力的中间件（如 ViewImage）。
+// WithInfo 覆盖 Info()，用于测试依赖模型能力的 lifecycle handler（如 ViewImage）。
 func (m *Model) WithInfo(info model.Info) *Model {
 	m.info = info
 	return m

@@ -12,13 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/harness"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
-	mw "github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware/builtin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
+	lifecyclehandlers "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle/handlers"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/subagent"
 )
 
@@ -48,11 +49,11 @@ func TestAgentHTTPStreamEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer built.Close()
-	wantAfterModel := []string{mw.NameSafetyFinishReason, mw.NameLoopDetection, mw.NameSubagentLimit, mw.NameTokenUsage, "telemetry"}
-	if got := built.chain.StageOrder(middleware.StageAfterModel); !slices.Equal(got, wantAfterModel) {
+	wantAfterModel := []string{lifecyclehandlers.NameSafetyFinishReason, lifecyclehandlers.NameLoopDetection, lifecyclehandlers.NameSubagentLimit, "telemetry"}
+	if got := built.chain.StageOrder(lifecycle.StageAfterModel); !slices.Equal(got, wantAfterModel) {
 		t.Fatalf("after-model order = %v, want %v", got, wantAfterModel)
 	}
-	api, err := langgraphapi.New(langgraphapi.Options{Agent: built.agent, AllowedTools: built.tools})
+	api, err := httpapi.New(httpapi.Options{Agent: built.agent, AllowedTools: built.tools})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,12 +113,12 @@ func TestChildModelStreamUsesOnlyTaskProgressChannel(t *testing.T) {
 		EventRunID:     "parent-run",
 		ThreadID:       "parent-thread",
 		SubagentTaskID: "task-1",
-		Publish: func(_ context.Context, event runtime.Event) int64 {
+		Publish: func(_ context.Context, event runtime.Event) (int64, error) {
 			published = append(published, event)
-			return int64(len(published))
+			return int64(len(published)), nil
 		},
 	})
-	st := middleware.NewState(middleware.StateInit{
+	st := lifecycle.NewState(lifecycle.StateInit{
 		RunID:    "parent-run:task-1",
 		ThreadID: "child-state-thread",
 	})
@@ -173,9 +174,20 @@ func TestBuildAgentRegistersRuntimeCapabilitiesAndBuildsPromptPerRun(t *testing.
 	if !slices.Contains(built.tools, "task") {
 		t.Fatalf("registered tools = %v; task must remain a server capability", built.tools)
 	}
-	agent, ok := built.agent.(langgraphapi.HarnessAgent)
+	agent, ok := built.agent.(harness.Agent)
 	if !ok || agent.SystemPromptBuilder == nil {
 		t.Fatalf("agent = %T, want HarnessAgent with a prompt builder", built.agent)
+	}
+	for _, name := range []string{"model.default", "model.stub", "policy.tools", "agent.subagents", "tool.task"} {
+		if _, err := agent.Capabilities.Get(name); err != nil {
+			t.Fatalf("production generation is missing capability %q: %v", name, err)
+		}
+	}
+	if agent.GenerationID == "" {
+		t.Fatal("production agent has no immutable generation id")
+	}
+	if got := agent.RunBudgetLimits(); got.Tokens != int64(cfg.Loop.TokenBudget) || got.CostMicros != cfg.Loop.CostBudgetMicros {
+		t.Fatalf("production budget limits = %+v", got)
 	}
 	plain := agent.SystemPromptBuilder(map[string]any{valueSubagentEnabled: false, valueSwarmEnabled: false})
 	if strings.Contains(plain, "<available_subagents>") || strings.Contains(plain, "Swarm Mode") {

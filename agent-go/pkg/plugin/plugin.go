@@ -1,5 +1,4 @@
-// Package plugin loads command-backed tools from DeerFlow-compatible
-// plugin.json manifests.
+// Package plugin loads command-backed tools from Nous plugin.json manifests.
 package plugin
 
 import (
@@ -25,8 +24,9 @@ const (
 )
 
 type Contribution struct {
-	Definition         tool.Definition
-	RequiredPermission string
+	PluginName          string
+	Definition          tool.Definition
+	RequiredSandboxMode string
 }
 
 type manifest struct {
@@ -34,13 +34,11 @@ type manifest struct {
 	Enabled     *bool  `json:"enabled,omitempty"`
 	Description string `json:"description,omitempty"`
 	Tools       []struct {
-		Name               string          `json:"name"`
-		Description        string          `json:"description,omitempty"`
-		Command            string          `json:"command"`
-		InputSchema        json.RawMessage `json:"inputSchema,omitempty"`
-		InputSchemaLegacy  json.RawMessage `json:"input_schema,omitempty"`
-		RequiredPermission string          `json:"requiredPermission,omitempty"`
-		PermissionLegacy   string          `json:"required_permission,omitempty"`
+		Name                string          `json:"name"`
+		Description         string          `json:"description,omitempty"`
+		Command             string          `json:"command"`
+		InputSchema         json.RawMessage `json:"inputSchema,omitempty"`
+		RequiredSandboxMode string          `json:"requiredSandboxMode,omitempty"`
 	} `json:"tools"`
 }
 
@@ -77,7 +75,7 @@ func Load(directories []string, reserved []string) ([]Contribution, error) {
 				return nil, err
 			}
 			var item manifest
-			if err := json.Unmarshal(raw, &item); err != nil {
+			if err := decodeManifest(raw, &item); err != nil {
 				return nil, fmt.Errorf("plugin: decoding %s: %w", path, err)
 			}
 			if strings.TrimSpace(item.Name) == "" {
@@ -99,21 +97,16 @@ func Load(directories []string, reserved []string) ([]Contribution, error) {
 				seen[declared.Name] = item.Name
 				schema := declared.InputSchema
 				if len(schema) == 0 {
-					schema = declared.InputSchemaLegacy
-				}
-				if len(schema) == 0 {
 					schema = json.RawMessage(`{"type":"object","additionalProperties":true}`)
 				}
-				permission := declared.RequiredPermission
-				if permission == "" {
-					permission = declared.PermissionLegacy
-				}
-				if permission == "" {
-					permission = "danger_full_access"
+				requiredMode := declared.RequiredSandboxMode
+				if requiredMode == "" {
+					requiredMode = "danger-full-access"
 				}
 				contributions = append(contributions, Contribution{
-					Definition:         commandTool(item.Name, filepath.Dir(path), declared.Name, declared.Description, declared.Command, schema, permission),
-					RequiredPermission: permission,
+					PluginName:          item.Name,
+					Definition:          commandTool(item.Name, filepath.Dir(path), declared.Name, declared.Description, declared.Command, schema, requiredMode),
+					RequiredSandboxMode: requiredMode,
 				})
 			}
 		}
@@ -121,22 +114,22 @@ func Load(directories []string, reserved []string) ([]Contribution, error) {
 	return contributions, nil
 }
 
-func commandTool(pluginName, root, name, description, command string, schema json.RawMessage, requiredPermission string) tool.Definition {
+func commandTool(pluginName, root, name, description, command string, schema json.RawMessage, requiredSandboxMode string) tool.Definition {
 	if description == "" {
 		description = "Plugin tool: " + name
 	}
 	return tool.Definition{
 		Name: name, Group: "plugin", Description: description, Parameters: schema,
-		Metadata: tool.Metadata{RequiredPermission: requiredPermission},
+		Metadata: tool.Metadata{RequiredSandboxMode: requiredSandboxMode},
 		Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
 			runCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 			defer cancel()
 			cmd := exec.CommandContext(runCtx, "/bin/sh", "-c", command)
 			cmd.Dir = root
 			cmd.Env = append(os.Environ(),
-				"DEERFLOW_PLUGIN_NAME="+pluginName,
-				"DEERFLOW_PLUGIN_ROOT="+root,
-				"DEERFLOW_TOOL_NAME="+name,
+				"NOUS_PLUGIN_NAME="+pluginName,
+				"NOUS_PLUGIN_ROOT="+root,
+				"NOUS_TOOL_NAME="+name,
 			)
 			cmd.Stdin = bytes.NewReader(call.Args)
 			stdout := &limitedBuffer{limit: maxOutputBytes}
@@ -156,6 +149,21 @@ func commandTool(pluginName, root, name, description, command string, schema jso
 			return &tool.Result{Content: strings.TrimSpace(stdout.String())}, nil
 		},
 	}
+}
+
+func decodeManifest(raw []byte, item *manifest) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(item); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 type limitedBuffer struct {

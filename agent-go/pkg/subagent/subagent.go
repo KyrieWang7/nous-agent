@@ -2,10 +2,12 @@
 package subagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -16,8 +18,8 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
-	"github.com/redis/go-redis/v9"
 )
 
 type Definition struct {
@@ -34,14 +36,10 @@ type RunnerFactory func(Definition, []string) (*loop.Runner, error)
 // settings). RunnerFactory remains supported for fixed-runner embedders.
 type ContextRunnerFactory func(context.Context, Definition, []string, DispatchRequest) (*loop.Runner, error)
 type DispatchRequest struct {
-	// SubagentType, Description and MaxTurns mirror the Python/frontend task
-	// tool contract. Agent is retained as a source-compatible legacy alias for
-	// callers that predate the cross-language contract.
 	SubagentType  string
 	Description   string
 	Name          string
 	MaxTurns      int
-	Agent         string
 	Prompt        string
 	RestrictTools []string
 	ToolCallID    string
@@ -60,11 +58,11 @@ type DispatchLifecycle interface {
 // limits for ordinary subagents and Swarm teammates.
 type TimeoutResolver func(runtime.RunContext, DispatchRequest) time.Duration
 type Result struct {
-	TaskID string `json:"task_id"`
-	Agent  string `json:"agent"`
-	Status string `json:"status"`
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	TaskID       string `json:"task_id"`
+	SubagentType string `json:"subagent_type"`
+	Status       string `json:"status"`
+	Output       string `json:"output,omitempty"`
+	Error        string `json:"error,omitempty"`
 	// CoordinationError describes a failure after the child execution reached
 	// its terminal state (for example a Swarm announcement transaction). It is
 	// deliberately separate from Error so consumers never mistake a completed
@@ -89,6 +87,13 @@ type Manager struct {
 	lifecycle      DispatchLifecycle
 	timeout        TimeoutResolver
 	hooks          *hooks.Runner
+	stateMu        sync.Mutex
+	stateWaits     map[*runtime.RunStateMachine]subagentStateWait
+}
+
+type subagentStateWait struct {
+	count   int
+	restore runtime.RunPhase
 }
 
 // SetLifecycle installs process-level dispatch coordination. It must be called
@@ -124,7 +129,7 @@ func newManager(factory RunnerFactory, contextFactory ContextRunnerFactory, stor
 	if len(maxConcurrent) > 0 && maxConcurrent[0] > 0 {
 		limit = maxConcurrent[0]
 	}
-	return &Manager{defs: map[string]Definition{}, factory: factory, contextFactory: contextFactory, store: store, ttl: ttl, sem: make(chan struct{}, limit)}
+	return &Manager{defs: map[string]Definition{}, factory: factory, contextFactory: contextFactory, store: store, ttl: ttl, sem: make(chan struct{}, limit), stateWaits: make(map[*runtime.RunStateMachine]subagentStateWait)}
 }
 func (m *Manager) Register(d Definition) error {
 	if d.Name == "" || d.Description == "" {
@@ -170,7 +175,10 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	case <-ctx.Done():
 		return Result{}, ctx.Err()
 	}
-	agentName := req.subagentType()
+	agentName := strings.TrimSpace(req.SubagentType)
+	if agentName == "" {
+		return Result{}, errors.New("subagent: subagent_type is required")
+	}
 	m.mu.RLock()
 	def, ok := m.defs[agentName]
 	m.mu.RUnlock()
@@ -186,7 +194,31 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 		// Model input may narrow a profile limit, never widen it.
 		def.MaxTurns = req.MaxTurns
 	}
-	parent, _ := runtime.RunContextFrom(ctx)
+	parent, ok := runtime.RunContextFrom(ctx)
+	if !ok || parent.Budget == nil || parent.StateMachine == nil {
+		return Result{}, errors.New("subagent: dispatch requires a run context with budget and state machine")
+	}
+	if !parent.Capabilities.Initialized() {
+		return Result{}, errors.New("subagent: dispatch requires an initialized capability view")
+	}
+	resolved, err := capability.ResolveViewAs[Definition](ctx, parent.Capabilities, "agent."+agentName, capability.KindAgent, capability.ResolveRequest{
+		GenerationID: parent.GenerationID, ThreadID: parent.ThreadID, RunID: parent.RunID, Values: parent.Values,
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("subagent: resolving agent capability %q: %w", agentName, err)
+	}
+	if resolved.Name != def.Name {
+		return Result{}, fmt.Errorf("subagent: agent capability %q resolved profile %q", agentName, resolved.Name)
+	}
+	if parent.MaxRecursionDepth > 0 && parent.AgentDepth >= parent.MaxRecursionDepth {
+		return Result{}, fmt.Errorf("subagent: maximum recursion depth %d reached", parent.MaxRecursionDepth)
+	}
+	if err := parent.Budget.Charge(runtime.BudgetAmount{Subagents: 1}); err != nil {
+		if errors.Is(err, runtime.ErrBudgetExceeded) {
+			return Result{}, fmt.Errorf("subagent: %w", loop.ErrBudgetExhausted)
+		}
+		return Result{}, fmt.Errorf("subagent: charging budget: %w", err)
+	}
 	if m.timeout != nil {
 		if timeout := m.timeout(parent, req); timeout > 0 {
 			var cancel context.CancelFunc
@@ -210,15 +242,28 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	if err != nil {
 		return Result{}, err
 	}
+	restoreState, err := m.beginSubagentWait(parent.StateMachine)
+	if err != nil {
+		return Result{}, err
+	}
+	defer restoreState()
 	if err := m.runStartHook(ctx, parent, taskID, def.Name); err != nil {
 		return Result{}, err
 	}
-	childContext := cloneRunContext(parent)
+	childContext, err := cloneRunContext(parent)
+	if err != nil {
+		return Result{}, fmt.Errorf("subagent: creating child budget: %w", err)
+	}
+	trustedBudget := childContext.Budget
 	if m.lifecycle != nil {
 		childContext, err = m.lifecycle.Start(ctx, parent, taskID, req)
 		if err != nil {
-			return Result{}, err
+			return Result{}, fmt.Errorf("subagent: starting lifecycle for %q: %w", def.Name, err)
 		}
+	}
+	childContext, err = restrictChildRunContext(parent, childContext, trustedBudget, allowed)
+	if err != nil {
+		return Result{}, err
 	}
 	// The task identity is trusted dispatcher state, not a model argument.
 	// Keep it on the child context even when lifecycle code returned a cloned
@@ -227,12 +272,18 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	childContext.ParentRunID = parent.RunID
 	childContext.RunID = nestedRunID(parent.RunID, taskID)
 	childContext.EventRunID = parent.EventStreamRunID()
+	childContext.StateMachine, err = runtime.NewRunStateMachine(childContext.RunID, parent.ThreadID)
+	if err != nil {
+		return Result{}, fmt.Errorf("subagent: creating child run state: %w", err)
+	}
+	if err := childContext.StateMachine.Start(); err != nil {
+		return Result{}, fmt.Errorf("subagent: starting child run state: %w", err)
+	}
 	persistCtx := context.WithoutCancel(ctx)
-	result := Result{TaskID: taskID, Agent: def.Name, Status: "running", StartedAt: time.Now().UTC()}
+	result := Result{TaskID: taskID, SubagentType: def.Name, Status: "running", StartedAt: time.Now().UTC()}
 	description := taskDescription(req, def.Description)
 	publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
 		"task_id":       result.TaskID,
-		"agent":         def.Name, // legacy field retained for existing consumers
 		"subagent_type": def.Name,
 		"description":   description,
 	})
@@ -297,6 +348,59 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	return result, runErr
 }
 
+func (m *Manager) beginSubagentWait(state *runtime.RunStateMachine) (func(), error) {
+	if state == nil {
+		return nil, errors.New("subagent: parent run state machine is required")
+	}
+	m.stateMu.Lock()
+	wait := m.stateWaits[state]
+	if wait.count == 0 {
+		wait.restore = state.Snapshot().Phase
+		if wait.restore != runtime.RunRunning && wait.restore != runtime.RunWaitingTool {
+			m.stateMu.Unlock()
+			return nil, fmt.Errorf("subagent: cannot dispatch while run is %s", wait.restore)
+		}
+		if err := state.WaitSubagent(); err != nil {
+			m.stateMu.Unlock()
+			return nil, err
+		}
+	}
+	wait.count++
+	m.stateWaits[state] = wait
+	m.stateMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { m.endSubagentWait(state) })
+	}, nil
+}
+
+func (m *Manager) endSubagentWait(state *runtime.RunStateMachine) {
+	m.stateMu.Lock()
+	wait, ok := m.stateWaits[state]
+	if !ok {
+		m.stateMu.Unlock()
+		return
+	}
+	wait.count--
+	if wait.count > 0 {
+		m.stateWaits[state] = wait
+		m.stateMu.Unlock()
+		return
+	}
+	delete(m.stateWaits, state)
+	m.stateMu.Unlock()
+
+	if state.Snapshot().Phase.Terminal() {
+		return
+	}
+	if wait.restore == runtime.RunWaitingTool {
+		_ = state.WaitTool()
+		return
+	}
+	_ = state.Resume()
+}
+
 func (m *Manager) finishLifecycle(ctx context.Context, parent, child runtime.RunContext, req DispatchRequest, result *Result, cause error) error {
 	if m.lifecycle == nil {
 		return cause
@@ -349,7 +453,7 @@ func (m *Manager) runEndHook(ctx context.Context, parent runtime.RunContext, res
 	}
 	m.hooks.Run(ctx, hooks.Payload{
 		Event: hooks.EventSubagentEnd, ThreadID: parent.ThreadID, RunID: parent.RunID,
-		TaskID: result.TaskID, Subagent: result.Agent, Status: result.Status,
+		TaskID: result.TaskID, Subagent: result.SubagentType, Status: result.Status,
 		Output: result.Output, Error: resultErrorText(result),
 		IsError: result.Status != message.SubagentCompleted || result.CoordinationError != "",
 	})
@@ -373,11 +477,18 @@ func joinErrorText(existing string, next error) string {
 	return errors.Join(errors.New(strings.TrimSpace(existing)), errors.New(nextText)).Error()
 }
 func (m *Manager) DispatchAsync(ctx context.Context, req DispatchRequest) (string, error) {
+	if strings.TrimSpace(req.SubagentType) == "" {
+		return "", errors.New("subagent: subagent_type is required")
+	}
+	parent, ok := runtime.RunContextFrom(ctx)
+	if !ok || parent.Budget == nil {
+		return "", errors.New("subagent: dispatch requires a run context with budget")
+	}
 	id := strings.TrimSpace(req.ToolCallID)
 	if id == "" {
 		id = newTaskID()
 	}
-	initial := Result{TaskID: id, Agent: req.subagentType(), Status: "pending", StartedAt: time.Now().UTC()}
+	initial := Result{TaskID: id, SubagentType: strings.TrimSpace(req.SubagentType), Status: "pending", StartedAt: time.Now().UTC()}
 	if err := m.store.Put(context.WithoutCancel(ctx), initial, m.ttl); err != nil {
 		return "", err
 	}
@@ -394,16 +505,15 @@ func (m *Manager) DispatchAsync(ctx context.Context, req DispatchRequest) (strin
 func (m *Manager) recordEarlyFailure(ctx context.Context, req DispatchRequest, taskID string, cause error) (Result, error) {
 	now := time.Now().UTC()
 	result := Result{
-		TaskID: taskID, Agent: req.subagentType(), Status: failureStatus(cause),
+		TaskID: taskID, SubagentType: strings.TrimSpace(req.SubagentType), Status: failureStatus(cause),
 		Error: cause.Error(), StartedAt: now, CompletedAt: &now,
 	}
 	parent, _ := runtime.RunContextFrom(ctx)
 	persistCtx := context.WithoutCancel(ctx)
 	publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
 		"task_id":       taskID,
-		"agent":         result.Agent,
-		"subagent_type": result.Agent,
-		"description":   taskDescription(req, result.Agent),
+		"subagent_type": result.SubagentType,
+		"description":   taskDescription(req, result.SubagentType),
 	})
 	cause = m.persistTerminal(persistCtx, &result, cause)
 	m.runEndHook(persistCtx, parent, result)
@@ -459,7 +569,7 @@ func set(in []string) map[string]bool {
 func publish(ctx context.Context, p runtime.RunContext, t runtime.EventType, data any) {
 	e := runtime.MustEvent(p.EventStreamRunID(), p.ThreadID, t, data)
 	if p.Publish != nil {
-		p.Publish(ctx, e)
+		_, _ = p.Publish(ctx, e)
 	} else if p.Bus != nil {
 		p.Bus.Publish(ctx, e)
 	}
@@ -483,11 +593,66 @@ func runChild(ctx context.Context, runner *loop.Runner, request loop.Request) (r
 	return runner.Run(ctx, request)
 }
 
-func cloneRunContext(parent runtime.RunContext) runtime.RunContext {
+func cloneRunContext(parent runtime.RunContext) (runtime.RunContext, error) {
 	child := parent
 	child.AllowedTools = append([]string(nil), parent.AllowedTools...)
+	child.AllowedCapabilities = append([]string(nil), parent.AllowedCapabilities...)
 	child.Values = cloneValues(parent.Values)
-	return child
+	if child.Values == nil {
+		child.Values = make(map[string]any)
+	}
+	// New child agents begin outside the parent's collaboration-only plan mode.
+	child.Values["is_plan_mode"] = false
+	// Child runs share the root budget but keep an independent local limit.
+	budget, err := parent.Budget.Child(runtime.BudgetAmount{})
+	if err != nil {
+		return runtime.RunContext{}, err
+	}
+	child.Budget = budget
+	// A child gets its own lifecycle authority once the trusted dispatcher has
+	// assigned its nested RunID; never let it mutate the parent's state machine.
+	child.StateMachine = nil
+	return child, nil
+}
+
+func restrictChildRunContext(parent, child runtime.RunContext, trustedBudget *runtime.BudgetLedger, allowedTools []string) (runtime.RunContext, error) {
+	child.GenerationID = parent.GenerationID
+	child.AgentDepth = parent.AgentDepth + 1
+	child.MaxRecursionDepth = parent.MaxRecursionDepth
+	child.AllowedTools = append([]string(nil), allowedTools...)
+	child.Budget = trustedBudget
+	child.StateMachine = nil
+	child.Approvals = parent.Approvals
+	child.Bus = parent.Bus
+	child.Publish = parent.Publish
+
+	if parent.AllowedCapabilities == nil {
+		child.AllowedCapabilities = nil
+		child.Capabilities = parent.Capabilities
+		return child, nil
+	}
+	allowedToolCapabilities := make(map[string]struct{}, len(allowedTools))
+	for _, name := range allowedTools {
+		allowedToolCapabilities["tool."+name] = struct{}{}
+	}
+	names := make([]string, 0, len(parent.AllowedCapabilities))
+	for _, name := range parent.AllowedCapabilities {
+		if strings.HasPrefix(name, "tool.") {
+			if _, ok := allowedToolCapabilities[name]; !ok {
+				continue
+			}
+		}
+		names = append(names, name)
+	}
+	child.AllowedCapabilities = names
+	if !parent.Capabilities.Empty() {
+		view, err := parent.Capabilities.Restrict(names)
+		if err != nil {
+			return runtime.RunContext{}, fmt.Errorf("subagent: restricting capability view: %w", err)
+		}
+		child.Capabilities = view
+	}
+	return child, nil
 }
 
 func cloneValues(in map[string]any) map[string]any {
@@ -502,7 +667,7 @@ func cloneValues(in map[string]any) map[string]any {
 }
 
 func (m *Manager) TaskTool() tool.Definition {
-	return tool.Definition{Name: "task", Group: "subagent", Description: "Delegate a bounded task to a specialized subagent and wait for its terminal result.", Parameters: json.RawMessage(`{"type":"object","properties":{"description":{"type":"string","description":"Short description shown in the task card."},"prompt":{"type":"string"},"subagent_type":{"type":"string","description":"Registered subagent type."},"name":{"type":"string","description":"Optional teammate name in swarm mode."},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}},"agent":{"type":"string","description":"Legacy alias for subagent_type."}},"required":["description","prompt","subagent_type"]}`), Metadata: tool.Metadata{IsAgentState: true, IsConcurrencySafe: true}, Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
+	return tool.Definition{Name: "task", Group: "subagent", Description: "Delegate a bounded task to a specialized subagent and wait for its terminal result.", Parameters: json.RawMessage(`{"type":"object","properties":{"description":{"type":"string","description":"Short description shown in the task card."},"prompt":{"type":"string"},"subagent_type":{"type":"string","description":"Registered subagent type."},"name":{"type":"string","description":"Optional teammate name in swarm mode."},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}}},"required":["description","prompt","subagent_type"]}`), Metadata: tool.Metadata{IsAgentState: true, IsConcurrencySafe: true}, Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
 		var args struct {
 			Description  string   `json:"description"`
 			Prompt       string   `json:"prompt"`
@@ -510,15 +675,19 @@ func (m *Manager) TaskTool() tool.Definition {
 			Name         string   `json:"name"`
 			MaxTurns     int      `json:"max_turns"`
 			Restrict     []string `json:"restrict_tools"`
-			Agent        string   `json:"agent"`
 		}
-		if err := json.Unmarshal(call.Args, &args); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(call.Args))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&args); err != nil {
 			return taskFailure(err.Error()), nil //nolint:nilerr // malformed model input is returned to the model
 		}
-		agentName := args.SubagentType
-		if agentName == "" {
-			agentName = args.Agent
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			if err == nil {
+				err = errors.New("task arguments must contain one JSON value")
+			}
+			return taskFailure(err.Error()), nil //nolint:nilerr // malformed model input is returned to the model
 		}
+		agentName := strings.TrimSpace(args.SubagentType)
 		if agentName == "" {
 			return taskFailure("missing required field subagent_type"), nil
 		}
@@ -526,28 +695,16 @@ func (m *Manager) TaskTool() tool.Definition {
 			return taskFailure("missing required field prompt"), nil
 		}
 		description := strings.TrimSpace(args.Description)
-		// Legacy callers did not send a description. A short prompt fallback
-		// keeps their task cards useful without changing dispatch semantics.
 		if description == "" {
-			description = strings.TrimSpace(args.Prompt)
-			if len(description) > 80 {
-				description = description[:80]
-			}
+			return taskFailure("missing required field description"), nil
 		}
-		req := DispatchRequest{SubagentType: agentName, Description: description, Name: strings.TrimSpace(args.Name), MaxTurns: args.MaxTurns, Agent: args.Agent, Prompt: args.Prompt, RestrictTools: args.Restrict, ToolCallID: call.ID}
+		req := DispatchRequest{SubagentType: agentName, Description: description, Name: strings.TrimSpace(args.Name), MaxTurns: args.MaxTurns, Prompt: args.Prompt, RestrictTools: args.Restrict, ToolCallID: call.ID}
 		res, err := m.Dispatch(ctx, req)
 		if err != nil {
 			return taskFailureFromResult(res, err), nil
 		}
 		return taskSuccess(res.Output), nil
 	}}
-}
-
-func (r DispatchRequest) subagentType() string {
-	if strings.TrimSpace(r.SubagentType) != "" {
-		return strings.TrimSpace(r.SubagentType)
-	}
-	return strings.TrimSpace(r.Agent)
 }
 
 func dispatchError(res Result, err error) string {
@@ -639,29 +796,4 @@ func (s *MemoryTaskStore) Get(_ context.Context, id string) (Result, error) {
 		return Result{}, fmt.Errorf("subagent: task %q not found", id)
 	}
 	return r, nil
-}
-
-type RedisTaskStore struct {
-	client redis.UniversalClient
-	prefix string
-}
-
-func NewRedisTaskStore(client redis.UniversalClient) *RedisTaskStore {
-	return &RedisTaskStore{client: client, prefix: "nous-agent:task:"}
-}
-func (s *RedisTaskStore) Put(ctx context.Context, r Result, ttl time.Duration) error {
-	raw, err := json.Marshal(r)
-	if err != nil {
-		return err
-	}
-	return s.client.Set(ctx, s.prefix+r.TaskID, raw, ttl).Err()
-}
-func (s *RedisTaskStore) Get(ctx context.Context, id string) (Result, error) {
-	raw, err := s.client.Get(ctx, s.prefix+id).Bytes()
-	if err != nil {
-		return Result{}, err
-	}
-	var r Result
-	err = json.Unmarshal(raw, &r)
-	return r, err
 }

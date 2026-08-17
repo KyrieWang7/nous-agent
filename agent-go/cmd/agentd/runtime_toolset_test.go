@@ -6,8 +6,10 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -24,15 +26,16 @@ func TestRuntimeToolSetAppliesRunCapabilities(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: permission.ModeAllow})
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := runtimeToolSet{registry: registry, policy: policy}
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
+	ctx := policyContext(t, policy)
 
-	assertTools(t, resolver, nil, []string{"ask_clarification", "read_file", "write_file"})
-	assertTools(t, resolver, map[string]any{valueSubagentEnabled: true}, []string{"ask_clarification", "read_file", "task", "write_file"})
-	assertTools(t, resolver, map[string]any{valueSwarmEnabled: true}, []string{"ask_clarification", "team_create"})
+	assertTools(t, ctx, resolver, nil, []string{"ask_clarification", "read_file", "write_file"})
+	assertTools(t, ctx, resolver, map[string]any{valueSubagentEnabled: true}, []string{"ask_clarification", "read_file", "task", "write_file"})
+	assertTools(t, ctx, resolver, map[string]any{valueSwarmEnabled: true}, []string{"ask_clarification", "team_create"})
 }
 
 func TestRuntimeToolSetHonoursDefaultsAndPermission(t *testing.T) {
@@ -46,14 +49,37 @@ func TestRuntimeToolSetHonoursDefaultsAndPermission(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: permission.ModeReadOnly})
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetReadOnly})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := runtimeToolSet{registry: registry, policy: policy, defaultSubagent: true}
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools", defaultSubagent: true}
+	ctx := policyContext(t, policy)
 
-	assertTools(t, resolver, nil, []string{"read_file"})
-	assertTools(t, resolver, map[string]any{valueSubagentEnabled: false}, []string{"read_file"})
+	assertTools(t, ctx, resolver, nil, []string{"read_file"})
+	assertTools(t, ctx, resolver, map[string]any{valueSubagentEnabled: false}, []string{"read_file"})
+}
+
+func TestRuntimeToolSetPinsDelegatedApprovalToNever(t *testing.T) {
+	registry := tool.NewRegistry()
+	for _, definition := range []tool.Definition{
+		testTool("read_file", "file:read", true),
+		testTool("external_write", "external", false),
+	} {
+		if err := registry.Register(definition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetWorkspaceWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := policyContext(t, policy)
+	run, _ := runtime.RunContextFrom(ctx)
+	run.AgentDepth = 1
+	ctx = runtime.WithRunContext(context.Background(), run)
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
+	assertTools(t, ctx, resolver, nil, []string{"read_file"})
 }
 
 func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
@@ -67,11 +93,12 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: permission.ModeAllow})
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := runtimeToolSet{registry: registry, policy: policy}
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
+	ctx := policyContext(t, policy)
 
 	tests := []struct {
 		name   string
@@ -84,7 +111,7 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assertTools(t, resolver, map[string]any{
+			assertTools(t, ctx, resolver, map[string]any{
 				valueSwarmEnabled: true,
 				valueSwarmTeamID:  tt.teamID,
 			}, tt.want)
@@ -108,17 +135,20 @@ func TestRestrictedToolSetGivesSwarmTeammatesWorkToolsWithoutNestedOrchestration
 			t.Fatal(err)
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: permission.ModeAllow})
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := runtimeToolSet{registry: registry, policy: policy}
+	base := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
 	resolver := newRestrictedToolSet(base, []string{"read_file"})
-	state := middleware.NewState(middleware.StateInit{})
+	state := lifecycle.NewState(lifecycle.StateInit{})
 	state.SetValue(valueSwarmEnabled, true)
 	state.SetValue("swarm_agent_name", "explore-1")
 
-	got, _ := resolver.Resolve(state)
+	got, _, err := resolver.Resolve(policyContext(t, policy), state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"list_teammates", "read_file", "send_message"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tools = %v, want %v", got, want)
@@ -138,33 +168,52 @@ func TestRestrictedToolSetInheritedProfileExcludesChildControlTools(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: permission.ModeAllow})
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := runtimeToolSet{registry: registry, policy: policy, defaultSubagent: true}
+	base := runtimeToolSet{registry: registry, policyCapability: "policy.tools", defaultSubagent: true}
 	resolver := newRestrictedToolSet(base, registry.Names())
 
-	got, _ := resolver.Resolve(middleware.NewState(middleware.StateInit{}))
+	got, _, err := resolver.Resolve(policyContext(t, policy), lifecycle.NewState(lifecycle.StateInit{}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"read_file", "write_file"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
 }
 
-func assertTools(t *testing.T, resolver runtimeToolSet, values map[string]any, want []string) {
+func assertTools(t *testing.T, ctx context.Context, resolver runtimeToolSet, values map[string]any, want []string) {
 	t.Helper()
-	state := middleware.NewState(middleware.StateInit{})
+	state := lifecycle.NewState(lifecycle.StateInit{})
 	for key, value := range values {
 		state.SetValue(key, value)
 	}
-	got, disclosed := resolver.Resolve(state)
+	got, disclosed, err := resolver.Resolve(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(disclosed) != 0 {
 		t.Fatalf("disclosed = %v, want none", disclosed)
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
+}
+
+func policyContext(t *testing.T, policy *permission.Policy) context.Context {
+	t.Helper()
+	registry := capability.NewRegistry()
+	if err := capability.RegisterValue(registry, capability.Value{Definition: capability.Definition{Name: "policy.tools", Kind: capability.KindPolicy, Scope: capability.ScopeRun}, Value: policy}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := capability.NewView(registry.Snapshot(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "run-1", ThreadID: "thread-1", Capabilities: view})
 }
 
 func testTool(name, group string, readOnly bool) tool.Definition {

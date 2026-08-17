@@ -26,9 +26,9 @@ type ExecutorOptions struct {
 
 // Executor 按段执行一批工具调用。
 //
-// 它不是中间件：并发分段、信号量、级联取消是执行机制而非横切关注点，
+// 它是 Kernel 执行机制：并发分段、信号量、级联取消不属于可装配关注点，
 // 换实现就换掉整个 Executor（设计文档 §5 注入接口）。
-// 中间件通过 Interceptor 介入每次调用。
+// lifecycle dispatcher 通过 Interceptor 介入每次调用。
 type Executor struct {
 	registry *Registry
 	opts     ExecutorOptions
@@ -202,25 +202,48 @@ func (e *Executor) runConcurrent(ctx context.Context, seg Segment, ic Intercepto
 //
 // 第二个返回值 stop 表示拦截器要求结束回合。
 func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome Outcome, stop bool, err error) {
+	var tx Transaction
+	if observer := transactionObserverFrom(ctx); observer != nil {
+		var txErr error
+		tx, txErr = observer.Start(ctx, c)
+		if txErr != nil {
+			return Outcome{}, false, txErr
+		}
+		if tx == nil {
+			return Outcome{}, false, errors.New("tool: transaction observer returned nil transaction")
+		}
+	}
+	deny := func(reason string) (Outcome, bool, error) {
+		if tx != nil {
+			if txErr := tx.Deny(reason); txErr != nil {
+				return Outcome{}, false, txErr
+			}
+		}
+		return Outcome{Call: c, Result: &Result{Content: reasonOr(reason, "tool call denied"), IsError: true}}, false, nil
+	}
+	cancel := func(execErr error) (Outcome, bool, error) {
+		if tx != nil {
+			if txErr := tx.Cancel(execErr); txErr != nil {
+				return Outcome{}, false, txErr
+			}
+		}
+		return Outcome{}, false, execErr
+	}
+
 	if ic != nil {
 		decision, decErr := ic.BeforeTool(ctx, c)
 		if decErr != nil {
+			if tx != nil {
+				_ = tx.Cancel(decErr)
+			}
 			return Outcome{}, false, decErr
 		}
 		if decision.EndTurn {
-			return Outcome{
-				Call:   c,
-				Result: &Result{Content: reasonOr(decision.Reason, "turn ended by interceptor")},
-			}, true, nil
+			outcome, _, err := deny(reasonOr(decision.Reason, "turn ended by interceptor"))
+			return outcome, true, err
 		}
 		if decision.Deny {
-			return Outcome{
-				Call: c,
-				Result: &Result{
-					Content: reasonOr(decision.Reason, "tool call denied"),
-					IsError: true,
-				},
-			}, false, nil
+			return deny(decision.Reason)
 		}
 		if decision.Args != nil {
 			c.Args = decision.Args
@@ -232,6 +255,9 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 	if ic != nil {
 		rewritten, afterErr := ic.AfterTool(ctx, c, res, execErr)
 		if afterErr != nil {
+			if tx != nil {
+				_ = tx.Finish(res, afterErr)
+			}
 			return Outcome{}, false, afterErr
 		}
 		if rewritten != nil {
@@ -245,7 +271,12 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 
 	// 取消不是工具的失败，是外部意志：往上抛，不转成 error 结果。
 	if execErr != nil && (errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded)) {
-		return Outcome{}, false, execErr
+		return cancel(execErr)
+	}
+	if tx != nil {
+		if txErr := tx.Finish(res, execErr); txErr != nil {
+			return Outcome{}, false, txErr
+		}
 	}
 
 	return Outcome{Call: c, Result: res, ExecErr: execErr}, false, nil

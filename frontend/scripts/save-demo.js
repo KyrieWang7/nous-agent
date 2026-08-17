@@ -8,17 +8,11 @@ export async function main() {
   const threadId = url.pathname.split("/").pop();
   const host = url.host;
   const apiURL = new URL(
-    `/api/langgraph/threads/${threadId}/history`,
+    `/api/agent/threads/${threadId}/history`,
     `${url.protocol}//${host}`,
   );
   const response = await fetch(apiURL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      limit: 10,
-    }),
+    method: "GET",
   });
 
   const data = (await response.json())[0];

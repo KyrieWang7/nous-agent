@@ -2,10 +2,11 @@
 
 import type { ThreadState } from "@/core/types";
 
-import { authFetch } from "./auth-fetch";
-import { getLangGraphBaseURL } from "../config";
+import { getAgentAPIBaseURL } from "../config";
 
-class LangGraphAPI {
+import { authFetch } from "./auth-fetch";
+
+class AgentAPI {
   private baseUrl: string;
 
   constructor(baseUrl: string) {
@@ -54,9 +55,9 @@ class LangGraphAPI {
   };
 }
 
-let _singleton: LangGraphAPI | null = null;
+let _singleton: AgentAPI | null = null;
 
-export function getAPIClient(): LangGraphAPI {
-  _singleton ??= new LangGraphAPI(getLangGraphBaseURL());
+export function getAPIClient(): AgentAPI {
+  _singleton ??= new AgentAPI(getAgentAPIBaseURL());
   return _singleton;
 }

@@ -1,6 +1,6 @@
 // Package sandbox 提供工具执行的隔离边界。
 //
-// 本包只做隔离，不做审批也不做权限判定 —— 那是 pkg/permission 与中间件的职责
+// 本包只做隔离，不做审批也不做权限判定 —— 那是 Policy 与 lifecycle handler 的职责
 // （设计文档 §2 依赖纪律）。layercheck 断言 pkg/sandbox 不得 import pkg/permission。
 package sandbox
 
@@ -106,32 +106,17 @@ type FS interface {
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 	WriteFile(ctx context.Context, path string, data []byte) error
 	List(ctx context.Context, path string) ([]Entry, error)
+	ListLimit(ctx context.Context, path string, limit int) ([]Entry, bool, error)
 	Stat(ctx context.Context, path string) (Entry, error)
 }
 
-type limitedLister interface {
-	ListLimit(ctx context.Context, path string, limit int) ([]Entry, bool, error)
-}
-
-// ListWithLimit bounds directory materialization when the FS supports it.
-// Local and Docker providers implement the optional contract; the fallback
-// preserves compatibility for external FS implementations and still trims the
-// returned slice before handing it to callers.
+// ListWithLimit bounds directory materialization through the required FS
+// contract. Implementations must not materialize more than limit+1 entries.
 func ListWithLimit(ctx context.Context, fsys FS, path string, limit int) ([]Entry, bool, error) {
 	if limit <= 0 {
 		return nil, false, errors.New("sandbox: list limit must be positive")
 	}
-	if bounded, ok := fsys.(limitedLister); ok {
-		return bounded.ListLimit(ctx, path, limit)
-	}
-	entries, err := fsys.List(ctx, path)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(entries) <= limit {
-		return entries, false, nil
-	}
-	return entries[:limit], true, nil
+	return fsys.ListLimit(ctx, path, limit)
 }
 
 // Handle 是一个已就绪的沙箱实例。
@@ -155,7 +140,7 @@ type Provider interface {
 
 // Lease 是对沙箱实例的惰性持有。
 //
-// lazy_init 的落点：SandboxMiddleware 在 BeforeAgent 建立 Lease，但真正的
+// lazy_init 的落点：sandbox capability 在 run 开始时建立 Lease，但真正的
 // Acquire 延后到第一次工具调用。绝大多数回合根本不碰文件系统，
 // 提前创建容器是纯浪费。
 type Lease struct {

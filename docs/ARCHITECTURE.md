@@ -1,6 +1,8 @@
-# Nous Agent 架构演进文档
+# Nous Agent 历史架构演进记录
 
-> Nous Agent 基于 DeerFlow 深度改造，融合 Claude Code 核心架构理念，并新增 PostgreSQL 持久化和 Swarm/Team 协作能力。
+> 本文记录 Nous Agent 从 DeerFlow/Python/LangGraph 迁移到 Go 的历史背景。新的开发和架构决策以 [`docs/architecture-v2.md`](architecture-v2.md) 为准：Go Runtime 采用 DeepSeek Agent Harness 风格的插件、Registry、Capability 和事件重放思想，不再把 middleware chain 作为顶层架构。
+
+> 历史版本：Nous Agent 基于 DeerFlow 深度改造，融合 Claude Code 核心架构理念，并新增 PostgreSQL 持久化和 Swarm/Team 协作能力。
 
 ---
 
@@ -106,21 +108,17 @@ DeerFlow 仅有 `general-purpose` 和 `bash` 两种 Subagent。Nous Agent 新增
 22. ClarificationMiddleware     — 用户澄清拦截（始终最后）
 ```
 
-### 3.2 权限系统：从无到有
+### 3.2 安全策略：Sandbox 与 Approval 正交
 
 ```
-DeerFlow:   SandboxMiddleware 做基本的沙箱隔离，无工具级权限
+SandboxPolicy:   read-only | workspace-write | danger-full-access
+ApprovalPolicy:  ask | never
+PermissionPreset:
+  workspace-write   = workspace-write + ask
+  danger-full-access = danger-full-access + never
 
-Nous Agent: 5级权限模型
-            ┌─────────────────────────────────────────┐
-            │  READ_ONLY          仅读操作              │
-            │  WORKSPACE_WRITE    读 + 工作区写          │
-            │  PROMPT             高风险工具需用户审批    │
-            │  ALLOW              所有工具放行（默认）    │
-            │  DANGER_FULL_ACCESS 完全不受限              │
-            └─────────────────────────────────────────┘
-            + 工具级覆盖: tool_overrides: { bash: "danger_full_access" }
-            + PolicyEngine: authorize(tool_name, tool_input, prompter)
+工具先声明 requiredSandboxMode。当前 sandbox 足够时直接执行；不足时仅由
+ApprovalPolicy 决定是否发起持久审批。Preset 不参与工具判定，只负责组合两个机制策略。
 ```
 
 ### 3.3 上下文压缩：双层实验 → 对齐 DeerFlow 单一路径

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"slices"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -18,21 +22,28 @@ const (
 // Registration describes server capabilities; run values decide which of
 // those capabilities are exposed to the current model invocation.
 type runtimeToolSet struct {
-	registry        *tool.Registry
-	policy          *permission.Policy
-	defaultSubagent bool
-	defaultSwarm    bool
+	registry         *tool.Registry
+	policyCapability string
+	defaultSubagent  bool
+	defaultSwarm     bool
 }
 
-func (r runtimeToolSet) Resolve(st *middleware.State) ([]string, []string) {
-	if r.registry == nil || r.policy == nil {
-		return nil, nil
+func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]string, []string, error) {
+	if r.registry == nil {
+		return nil, nil, errors.New("agentd: tool registry is nil")
+	}
+	policy, err := resolveToolPolicy(ctx, r.policyCapability)
+	if err != nil {
+		return nil, nil, err
+	}
+	if run, ok := runtime.RunContextFrom(ctx); ok && run.AgentDepth > 0 {
+		policy = policy.ForDelegation()
 	}
 
 	swarmEnabled := runBool(st, valueSwarmEnabled, r.defaultSwarm)
 	subagentEnabled := runBool(st, valueSubagentEnabled, r.defaultSubagent) || swarmEnabled
 	hasSwarmTeam := runString(st, valueSwarmTeamID) != ""
-	allowed := r.policy.AllowedTools(r.registry, r.registry.Names())
+	allowed := policy.AllowedTools(r.registry, r.registry.Names())
 
 	out := allowed[:0]
 	for _, name := range allowed {
@@ -69,7 +80,7 @@ func (r runtimeToolSet) Resolve(st *middleware.State) ([]string, []string) {
 		}
 		out = append(out, name)
 	}
-	return slices.Clone(out), nil
+	return slices.Clone(out), nil, nil
 }
 
 // restrictedToolSet applies one subagent profile after runtime feature and
@@ -88,8 +99,11 @@ func newRestrictedToolSet(base runtimeToolSet, allowed []string) restrictedToolS
 	return restrictedToolSet{base: base, allowed: set}
 }
 
-func (r restrictedToolSet) Resolve(st *middleware.State) ([]string, []string) {
-	allowed, disclosed := r.base.Resolve(st)
+func (r restrictedToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]string, []string, error) {
+	allowed, disclosed, err := r.base.Resolve(ctx, st)
+	if err != nil {
+		return nil, nil, err
+	}
 	out := allowed[:0]
 	for _, name := range allowed {
 		_, profileAllowed := r.allowed[name]
@@ -106,14 +120,27 @@ func (r restrictedToolSet) Resolve(st *middleware.State) ([]string, []string) {
 		}
 		out = append(out, name)
 	}
-	return slices.Clone(out), disclosed
+	return slices.Clone(out), disclosed, nil
+}
+
+func resolveToolPolicy(ctx context.Context, name string) (*permission.Policy, error) {
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || !run.Capabilities.Initialized() {
+		return nil, errors.New("agentd: tool policy requires an initialized capability view")
+	}
+	if name == "" {
+		return nil, errors.New("agentd: tool policy capability name is empty")
+	}
+	return capability.ResolveViewAs[*permission.Policy](ctx, run.Capabilities, name, capability.KindPolicy, capability.ResolveRequest{
+		GenerationID: run.GenerationID, ThreadID: run.ThreadID, RunID: run.RunID, Values: run.Values,
+	})
 }
 
 func isSwarmCommunicationTool(name string) bool {
 	return name == "send_message" || name == "list_teammates"
 }
 
-func runBool(st *middleware.State, key string, fallback bool) bool {
+func runBool(st *lifecycle.State, key string, fallback bool) bool {
 	if st == nil {
 		return fallback
 	}
@@ -125,7 +152,7 @@ func runBool(st *middleware.State, key string, fallback bool) bool {
 	return ok && enabled
 }
 
-func runString(st *middleware.State, key string) string {
+func runString(st *lifecycle.State, key string) string {
 	if st == nil {
 		return ""
 	}
@@ -146,7 +173,7 @@ func isCoordinatorTool(definition tool.Definition) bool {
 	}
 }
 
-func isLeadRun(st *middleware.State) bool {
+func isLeadRun(st *lifecycle.State) bool {
 	if st == nil {
 		return true
 	}

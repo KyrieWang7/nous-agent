@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/migrations"
@@ -25,12 +32,67 @@ func run() error {
 		return runConfig()
 	case "migrate":
 		return runMigrate()
+	case "run":
+		return runAgent(os.Args[2:], os.Stdout)
 	default:
 		return fmt.Errorf("unknown command %q", os.Args[1])
 	}
 }
 func usage() error {
-	return fmt.Errorf("usage: agentctl <config validate|migrate up|migrate down|migrate version>")
+	return fmt.Errorf("usage: agentctl <run --prompt TEXT|config validate|migrate up|migrate down|migrate version>")
+}
+
+func runAgent(args []string, output io.Writer) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	server := fs.String("server", "http://127.0.0.1:2024", "agentd base URL")
+	threadID := fs.String("thread", "", "thread ID (generated when empty)")
+	assistantID := fs.String("assistant", "lead_agent", "assistant ID")
+	prompt := fs.String("prompt", "", "user prompt")
+	onDisconnect := fs.String("on-disconnect", "continue", "cancel or continue")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*prompt) == "" && fs.NArg() > 0 {
+		*prompt = strings.Join(fs.Args(), " ")
+	}
+	if strings.TrimSpace(*prompt) == "" {
+		return errors.New("run requires --prompt or a positional prompt")
+	}
+	if *onDisconnect != "cancel" && *onDisconnect != "continue" {
+		return errors.New("run --on-disconnect must be cancel or continue")
+	}
+	if *threadID == "" {
+		*threadID = fmt.Sprintf("cli-%d", time.Now().UTC().UnixNano())
+	}
+	payload := map[string]any{
+		"assistant_id":  *assistantID,
+		"input":         map[string]any{"messages": []map[string]any{{"role": "user", "content": *prompt}}},
+		"on_disconnect": *onDisconnect,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding run request: %w", err)
+	}
+	endpoint := strings.TrimRight(*server, "/") + "/api/v1/threads/" + *threadID + "/runs"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("building run request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("starting run: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		return fmt.Errorf("starting run: HTTP %s: %s", response.Status, strings.TrimSpace(string(data)))
+	}
+	if _, err := io.Copy(output, response.Body); err != nil {
+		return fmt.Errorf("streaming run: %w", err)
+	}
+	return nil
 }
 func runConfig() error {
 	if len(os.Args) < 3 || os.Args[2] != "validate" {

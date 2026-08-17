@@ -78,9 +78,17 @@ sandbox:
   #   Authorization: Bearer $SANDBOX_TOKEN
 
 permissions:
-  mode: workspace_write
+  preset: workspace-write
 
-# Python-compatible community tool declarations. Search and image search use
+plan:
+  guidance: >-
+    You are in plan mode. Explore the problem, identify constraints, and
+    maintain a concrete plan without implementing it. When the plan is complete,
+    call exit_plan_mode with the complete Markdown plan starting with a # heading.
+    Do not begin implementation until the user approves the plan; if they keep
+    planning, revise it using their feedback and present it again.
+
+# Community tool declarations. Search and image search use
 # Tavily; web_fetch uses Jina Reader. Empty keys fall back to the matching
 # TAVILY_API_KEY / JINA_API_KEY environment variables.
 tool_groups:
@@ -110,8 +118,9 @@ plugins:
   directories:
     - ~/.deerflow/plugins
     - .deerflow/plugins
-  # plugin.json requiredPermission is a minimum run permission. It never
-  # elevates a run; omitted values default to danger_full_access.
+  # plugin.json requiredSandboxMode declares the minimum sandbox mode.
+  # Omitted values default to danger-full-access and therefore require an
+  # approval-backed escalation under the workspace-write preset.
 
 # Optional ACP v1 subprocess agents. The Go Harness performs the native
 # initialize/session/new/session/prompt JSON-RPC flow.
@@ -124,7 +133,7 @@ plugins:
 
 skills:
   enabled: true
-  path: ../agent/skills/public
+  path: ../skills/public
 
 subagents:
   enabled: true
@@ -195,7 +204,10 @@ loop:
   token_budget: 100000
   # Optional hard cost ceiling in integer micro-units for the whole run.
   cost_budget_micros: 0
-  middleware_timeout: 30s
+  tool_call_budget: 200
+  subagent_budget: 20
+  max_recursion_depth: 1
+  lifecycle_timeout: 30s
 
 runtime:
   event_buffer_size: 500

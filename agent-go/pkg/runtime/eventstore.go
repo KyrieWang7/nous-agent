@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 )
@@ -23,15 +25,61 @@ type EventStore interface {
 	Get(ctx context.Context, runID string, afterSeq int64, limit int) ([]Event, error)
 }
 
+// EventSequenceReader exposes the durable high-water mark used to seed a new
+// process's in-memory publisher. Implementations must include events already
+// accepted by PutBatch, regardless of their type.
+type EventSequenceReader interface {
+	LastSeq(context.Context, string) (int64, error)
+}
+
+// MultiEventStore writes to every store and reads from Primary. It composes
+// persistence interfaces without coupling the runtime contract package to a
+// database or cache driver.
+type MultiEventStore struct {
+	Primary EventStore
+	Mirrors []EventStore
+}
+
+func (m MultiEventStore) PutBatch(ctx context.Context, events []Event) error {
+	if m.Primary == nil {
+		return errors.New("runtime: primary event store is nil")
+	}
+	if err := m.Primary.PutBatch(ctx, events); err != nil {
+		return err
+	}
+	for _, store := range m.Mirrors {
+		if err := store.PutBatch(ctx, events); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m MultiEventStore) Get(ctx context.Context, runID string, afterSeq int64, limit int) ([]Event, error) {
+	if m.Primary == nil {
+		return nil, errors.New("runtime: primary event store is nil")
+	}
+	return m.Primary.Get(ctx, runID, afterSeq, limit)
+}
+
+func (m MultiEventStore) LastSeq(ctx context.Context, runID string) (int64, error) {
+	reader, ok := m.Primary.(EventSequenceReader)
+	if !ok {
+		return 0, errors.New("runtime: primary event store does not expose a sequence high-water mark")
+	}
+	return reader.LastSeq(ctx, runID)
+}
+
 // MemoryEventStore 是内存实现，供测试与无持久化部署使用。
 type MemoryEventStore struct {
 	mu    sync.RWMutex
 	byRun map[string][]Event
+	byKey map[string]struct{}
 }
 
 // NewMemoryEventStore 返回内存事件存储。
 func NewMemoryEventStore() *MemoryEventStore {
-	return &MemoryEventStore{byRun: make(map[string][]Event)}
+	return &MemoryEventStore{byRun: make(map[string][]Event), byKey: make(map[string]struct{})}
 }
 
 // PutBatch 实现 EventStore。
@@ -40,6 +88,25 @@ func (s *MemoryEventStore) PutBatch(_ context.Context, events []Event) error {
 	defer s.mu.Unlock()
 
 	for _, e := range events {
+		if e.IdempotencyKey != "" {
+			key := e.RunID + "\x00" + e.IdempotencyKey
+			if _, exists := s.byKey[key]; exists {
+				continue
+			}
+			s.byKey[key] = struct{}{}
+		}
+		if e.Seq > 0 {
+			duplicateSeq := false
+			for _, existing := range s.byRun[e.RunID] {
+				if existing.Seq == e.Seq {
+					duplicateSeq = true
+					break
+				}
+			}
+			if duplicateSeq {
+				continue
+			}
+		}
 		s.byRun[e.RunID] = append(s.byRun[e.RunID], e)
 	}
 	return nil
@@ -56,11 +123,32 @@ func (s *MemoryEventStore) Get(_ context.Context, runID string, afterSeq int64, 
 			continue
 		}
 		out = append(out, e)
-		if limit > 0 && len(out) >= limit {
-			break
+	}
+	slices.SortFunc(out, func(a, b Event) int {
+		if a.Seq < b.Seq {
+			return -1
 		}
+		if a.Seq > b.Seq {
+			return 1
+		}
+		return 0
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryEventStore) LastSeq(_ context.Context, runID string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var last int64
+	for _, event := range s.byRun[runID] {
+		if event.Seq > last {
+			last = event.Seq
+		}
+	}
+	return last, nil
 }
 
 // AsyncPersister 把事件异步批量写入 EventStore。
@@ -71,7 +159,7 @@ type AsyncPersister struct {
 	store EventStore
 	opts  PersisterOptions
 
-	queue   chan Event
+	queue   chan persistRequest
 	done    chan struct{}
 	once    sync.Once
 	queueMu sync.RWMutex
@@ -79,6 +167,11 @@ type AsyncPersister struct {
 
 	mu      sync.Mutex
 	dropped int64
+}
+
+type persistRequest struct {
+	event Event
+	ack   chan error
 }
 
 // PersisterOptions 配置异步持久化。
@@ -133,7 +226,7 @@ func NewAsyncPersister(store EventStore, opts PersisterOptions) *AsyncPersister 
 	p := &AsyncPersister{
 		store: store,
 		opts:  opts,
-		queue: make(chan Event, opts.QueueSize),
+		queue: make(chan persistRequest, opts.QueueSize),
 		done:  make(chan struct{}),
 	}
 	go p.run()
@@ -145,20 +238,45 @@ func NewAsyncPersister(store EventStore, opts PersisterOptions) *AsyncPersister 
 // trace 类事件在队列满时直接丢弃并计数；audit 类事件最多等
 // AuditBlockTimeout，超时记 error。
 func (p *AsyncPersister) Persist(ctx context.Context, e Event) {
+	p.enqueue(ctx, persistRequest{event: e})
+}
+
+// PersistDurable submits an event through the same ordered queue as trace
+// events and waits until every preceding event and this event are durable.
+func (p *AsyncPersister) PersistDurable(ctx context.Context, e Event) error {
+	ack := make(chan error, 1)
+	if !p.enqueue(ctx, persistRequest{event: e, ack: ack}) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("runtime: durable event persistence queue is unavailable")
+	}
+	select {
+	case err := <-ack:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *AsyncPersister) enqueue(ctx context.Context, req persistRequest) bool {
 	p.queueMu.RLock()
 	defer p.queueMu.RUnlock()
 	if p.closed {
-		return
+		if req.ack != nil {
+			req.ack <- errors.New("runtime: event persister is closed")
+		}
+		return false
 	}
 	select {
-	case p.queue <- e:
-		return
+	case p.queue <- req:
+		return true
 	default:
 	}
 
-	if e.Droppable() {
+	if req.event.Droppable() && req.ack == nil {
 		p.countDrop()
-		return
+		return false
 	}
 
 	// 不可丢弃事件：有限等待。这里是唯一允许短暂阻塞的地方，
@@ -167,14 +285,16 @@ func (p *AsyncPersister) Persist(ctx context.Context, e Event) {
 	defer timer.Stop()
 
 	select {
-	case p.queue <- e:
+	case p.queue <- req:
+		return true
 	case <-timer.C:
 		p.countDrop()
 		p.opts.Logger.ErrorContext(ctx, "dropped a non-droppable event; the audit trail has a gap",
-			"run_id", e.RunID, "seq", e.Seq, "type", e.Type, "category", e.Category)
+			"run_id", req.event.RunID, "seq", req.event.Seq, "type", req.event.Type, "category", req.event.Category)
 	case <-ctx.Done():
 		p.countDrop()
 	}
+	return false
 }
 
 func (p *AsyncPersister) countDrop() {
@@ -196,27 +316,39 @@ func (p *AsyncPersister) run() {
 	ticker := time.NewTicker(p.opts.FlushInterval)
 	defer ticker.Stop()
 
-	batch := make([]Event, 0, p.opts.BatchSize)
+	batch := make([]persistRequest, 0, p.opts.BatchSize)
 
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := p.store.PutBatch(context.Background(), batch); err != nil {
+		events := make([]Event, len(batch))
+		for i := range batch {
+			events[i] = batch[i].event
+		}
+		err := p.store.PutBatch(context.Background(), events)
+		if err != nil {
 			p.opts.Logger.Error("persisting events failed", "count", len(batch), "error", err)
+		}
+		for _, req := range batch {
+			if req.ack != nil {
+				req.ack <- err
+			}
 		}
 		batch = batch[:0]
 	}
 
 	for {
 		select {
-		case e, ok := <-p.queue:
+		case req, ok := <-p.queue:
 			if !ok {
 				flush()
 				return
 			}
-			batch = append(batch, e)
-			if len(batch) >= p.opts.BatchSize {
+			batch = append(batch, req)
+			// A durable waiter is a commit barrier: flushing here preserves FIFO
+			// ordering and bounds audit/usage publication latency.
+			if req.ack != nil || len(batch) >= p.opts.BatchSize {
 				flush()
 			}
 		case <-ticker.C:

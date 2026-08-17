@@ -12,8 +12,8 @@ services:
       - "${AGENT_PORT:-7776}:7776"
     volumes:
       - ./agent-go:/app
-      - ./agent/skills/public:/agent/skills/public:ro
-      - gateway_custom_skills:/agent/skills/custom:ro
+      - ./skills/public:/opt/nous/skills/public:ro
+      - gateway_custom_skills:/opt/nous/skills/custom:ro
       - gateway_config:/app/extensions
       - agent_go_data:/app/.nous-agent
     environment:
@@ -21,7 +21,7 @@ services:
       DATABASE_URL: "${DATABASE_URL:-}"
       REDIS_URL: "${REDIS_URL:-}"
       NOUS_EXTENSIONS_CONFIG_PATH: /app/extensions/extensions.json
-      NOUS_SKILLS_PATH: /agent/skills
+      NOUS_SKILLS_PATH: /opt/nous/skills
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
@@ -47,88 +47,19 @@ services:
       DATABASE_URL: "${DATABASE_URL:-}"
       NOUS_HARNESS_CONFIG_PATH: /etc/nous-agent/config.yaml
       NOUS_EXTENSIONS_CONFIG_PATH: /config/extensions.json
-      NOUS_SKILLS_ROOT: /agent/skills
+      NOUS_SKILLS_ROOT: /opt/nous/skills
       NOUS_WORKSPACE_ROOT: /data/workspaces
       CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:7775,http://127.0.0.1:7775}"
     volumes:
       - ./agent-go/config.example.yaml:/etc/nous-agent/config.yaml:ro
-      - ./agent/skills/public:/agent/skills/public:ro
-      - gateway_custom_skills:/agent/skills/custom
+      - ./skills/public:/opt/nous/skills/public:ro
+      - gateway_custom_skills:/opt/nous/skills/custom
       - gateway_config:/config
       - agent_go_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # Legacy Python Harness. It is excluded from the default Compose project.
-  agent:
-    profiles: ["legacy"]
-    build:
-      context: ./agent
-      dockerfile: Dockerfile
-    container_name: nous-agent-python-legacy
-    restart: unless-stopped
-    ports:
-      - "${LEGACY_AGENT_PORT:-17776}:7776"
-    volumes:
-      - ./agent/src:/app/src
-      - ./agent/config.yaml:/app/config.yaml
-      - ./agent/extensions_config.json:/app/extensions_config.json
-      - ./agent/skills:/app/skills
-      - agent_data:/app/.deer-flow
-    environment:
-      LANGGRAPH_PG_URI: "${LANGGRAPH_PG_URI:-}"
-      REDIS_URL: "${REDIS_URL:-}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
-      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
-      TUYOO_BASE_URL: "${TUYOO_BASE_URL:-}"
-      TUYOO_API_KEY: "${TUYOO_API_KEY:-}"
-      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
-      JINA_API_KEY: "${JINA_API_KEY:-}"
-    command: ["uv", "run", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "7776", "--reload", "--reload-dir", "src"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  # Legacy Python Gateway. Use only for compatibility checks during migration.
-  gateway:
-    profiles: ["legacy"]
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    container_name: nous-agent-python-gateway-legacy
-    restart: unless-stopped
-    ports:
-      - "${LEGACY_GATEWAY_PORT:-17777}:7777"
-    environment:
-      LANGGRAPH_PG_URI: "${LANGGRAPH_PG_URI:-}"
-      REDIS_URL: "${REDIS_URL:-}"
-      DEER_FLOW_CONFIG_PATH: /app/agent/config.yaml
-      DEER_FLOW_EXTENSIONS_CONFIG_PATH: /app/agent/extensions_config.json
-      DEER_FLOW_HOME: /app/.deer-flow
-      NOUS_HARNESS_CONFIG_PATH: /app/agent-go/config.yaml
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
-      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
-      TUYOO_BASE_URL: "${TUYOO_BASE_URL:-}"
-      TUYOO_API_KEY: "${TUYOO_API_KEY:-}"
-      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
-      JINA_API_KEY: "${JINA_API_KEY:-}"
-    volumes:
-      - ./gateway/src:/app/gateway/src
-      - ./agent/src:/app/agent/src
-      - ./agent-go/config.example.yaml:/app/agent-go/config.yaml:ro
-      - ./agent/config.yaml:/app/agent/config.yaml
-      - ./agent/extensions_config.json:/app/agent/extensions_config.json
-      - ./agent/skills:/app/agent/skills
-      - agent_data:/app/.deer-flow
-    command: ["uv", "run", "uvicorn", "nous_gateway.app:app", "--host", "0.0.0.0", "--port", "7777", "--reload", "--reload-dir", "/app/gateway/src", "--reload-dir", "/app/agent/src"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
 volumes:
-  agent_data:
   agent_go_data:
   gateway_config:
   gateway_custom_skills:

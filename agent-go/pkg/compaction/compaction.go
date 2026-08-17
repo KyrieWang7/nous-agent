@@ -1,7 +1,7 @@
 // Package compaction 实现单路径 LLM 摘要压缩。
 //
-// 只有一条压缩路径。nous-agent 曾并行跑 SummarizationMiddleware 与
-// CompactionMiddleware 两层，实践中互相干扰后移除了后者；本实现不重犯
+// 只有一条压缩路径。nous-agent 曾并行跑两套压缩处理器，实践中互相干扰；
+// 本实现不再保留重叠路径。
 // （设计文档 §6.2）。
 package compaction
 
@@ -76,6 +76,17 @@ func New(cfg Config, s Summariser) (*Compactor, error) {
 		return nil, errors.New("compaction: a summariser is required")
 	}
 	return &Compactor{cfg: cfg.withDefaults(), summariser: s}, nil
+}
+
+// ShouldCompact reports whether this history currently has a safe cut point
+// above the configured threshold. The loop uses it only to expose the durable
+// compacting phase; MaybeCompact remains the execution authority and checks
+// the condition again while holding the compactor lock.
+func (c *Compactor) ShouldCompact(h *message.History) bool {
+	if c == nil || c.cfg.TriggerTokens <= 0 || h == nil || h.TokenCount() < c.cfg.TriggerTokens {
+		return false
+	}
+	return FindCutPoint(h.All(), c.cfg.KeepMessages) > 0
 }
 
 // MaybeCompact 在超过阈值时压缩转录，返回是否发生了压缩。

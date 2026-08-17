@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/local"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
@@ -37,6 +38,18 @@ func run(t *testing.T, ctx context.Context, d tool.Definition, args string) *too
 		t.Fatalf("%s returned a nil result", d.Name)
 	}
 	return res
+}
+
+func TestWriteTodosRequiresPlanMode(t *testing.T) {
+	definition := builtin.WriteTodos()
+	inactive := runtime.WithRunContext(context.Background(), runtime.RunContext{Values: map[string]any{"is_plan_mode": false}})
+	if result := run(t, inactive, definition, `{"todos":[]}`); !result.IsError || !strings.Contains(result.Content, "plan mode") {
+		t.Fatalf("inactive result = %#v", result)
+	}
+	active := runtime.WithRunContext(context.Background(), runtime.RunContext{Values: map[string]any{"is_plan_mode": true}})
+	if result := run(t, active, definition, `{"todos":[]}`); result.IsError {
+		t.Fatalf("active result = %#v", result)
+	}
 }
 
 // --- 元数据（决定并发分段与沙箱要求）---

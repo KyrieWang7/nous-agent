@@ -56,36 +56,12 @@ func TestAddMemberRejectsInvalidNamesBeforeDatabaseAccess(t *testing.T) {
 		".worker",
 		"System",
 		"LEAD",
-		"TEAM-LEAD",
 		strings.Repeat("a", 65),
 		"line\nbreak",
 	} {
 		if err := manager.AddMember(context.Background(), Member{TeamID: "team-1", Name: name}); err == nil {
 			t.Errorf("AddMember(%q) succeeded", name)
 		}
-	}
-	if err := db.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSendCanonicalizesPythonTeamLeadRecipient(t *testing.T) {
-	db, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
-	manager, err := New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db.ExpectExec("INSERT INTO agent_swarm_messages").
-		WithArgs("team-1", "reviewer", LeadAgentName, "done").
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-
-	if err := manager.Send(context.Background(), "team-1", "reviewer", TeamLeadAgentAlias, "done"); err != nil {
-		t.Fatal(err)
 	}
 	if err := db.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -169,7 +145,7 @@ func TestPollDoesNotAcknowledgeMessagesAfterRowError(t *testing.T) {
 	}
 }
 
-func TestPollAcceptsPythonTeamLeadAliasAndEmitsCanonicalIdentity(t *testing.T) {
+func TestPollLeadMailbox(t *testing.T) {
 	db, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatal(err)
@@ -184,12 +160,12 @@ func TestPollAcceptsPythonTeamLeadAliasAndEmitsCanonicalIdentity(t *testing.T) {
 	db.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs("team-1", LeadAgentName).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	db.ExpectQuery("SELECT m.id").WithArgs("team-1", LeadAgentName, 50).WillReturnRows(
 		pgxmock.NewRows([]string{"id", "team_id", "from_agent", "to_agent", "content", "created_at"}).
-			AddRow(int64(1), "team-1", "reviewer", TeamLeadAgentAlias, "done", time.Now().UTC()),
+			AddRow(int64(1), "team-1", "reviewer", LeadAgentName, "done", time.Now().UTC()),
 	)
 	db.ExpectExec("INSERT INTO agent_swarm_message_receipts").WithArgs([]int64{1}, LeadAgentName).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	db.ExpectCommit()
 
-	messages, err := manager.Poll(context.Background(), "team-1", TeamLeadAgentAlias, 50)
+	messages, err := manager.Poll(context.Background(), "team-1", LeadAgentName, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +270,7 @@ func TestSendMessageToolAcceptsPythonTeamLeadRecipient(t *testing.T) {
 		RunID: "parent:task-1", ThreadID: "lead-thread",
 		SwarmTeamID: "team-1", SwarmAgentName: "reviewer",
 	})
-	result, err := findTool(t, manager, "send_message").Handler(ctx, tool.Call{Args: []byte(`{"to":"team-lead","content":"done"}`)})
+	result, err := findTool(t, manager, "send_message").Handler(ctx, tool.Call{Args: []byte(`{"to":"lead","content":"done"}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,40 +548,11 @@ func TestMemberLifecycle(t *testing.T) {
 	if err := manager.AddMember(context.Background(), Member{TeamID: "team-1", Name: LeadAgentName}); err == nil {
 		t.Fatal("AddMember() accepted the reserved lead identity")
 	}
-	if err := manager.AddMember(context.Background(), Member{TeamID: "team-1", Name: TeamLeadAgentAlias}); err == nil {
-		t.Fatal("AddMember() accepted the Python lead alias as a teammate identity")
-	}
 	if err := manager.AddMember(context.Background(), Member{TeamID: "team-1", Name: SystemAgentName}); err == nil {
 		t.Fatal("AddMember() accepted the reserved lifecycle sender identity")
 	}
 	if err := db.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestTrustedIdentityCanonicalizesPythonTeamLeadMetadata(t *testing.T) {
-	db, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
-	manager, err := New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
-		ThreadID: "lead-thread", SwarmTeamID: "team-1", SwarmAgentName: TeamLeadAgentAlias,
-	})
-
-	teamID, agent, err := manager.trustedIdentity(ctx, "team-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if teamID != "team-1" || agent != LeadAgentName {
-		t.Fatalf("identity = %q/%q", teamID, agent)
-	}
-	if threadID, err := trustedThreadID(ctx); err != nil || threadID != "lead-thread" {
-		t.Fatalf("trustedThreadID() = %q, %v", threadID, err)
 	}
 }
 

@@ -1,19 +1,28 @@
 # Nous Agent Go
 
-`agent-go` is the primary Nous Agent Harness. It owns the model loop,
-middleware chain, tools, state, persistence, Subagent and Swarm orchestration,
-and runtime event model. It does not import Python and does not depend on
-LangGraph.
+`agent-go` is the primary Nous Agent Runtime. It owns the explicit model loop,
+capability registry, tools, state, persistence, Subagent and Swarm orchestration,
+and runtime event model. It is independent from the archived Python runtime.
+The target architecture is documented in
+[`../docs/architecture-v2.md`](../docs/architecture-v2.md).
 
-The compatibility routes under `/threads` and `/runs` are wire adapters for the
-current frontend. Both native and compatibility APIs emit the frontend event
-names `metadata`, `values`, `messages`, `custom`, `error`, and `end`; internal
-events retain more precise content, reasoning, tool, task, usage, and audit
-types.
+Models, tools, sandboxes, memory, skills, MCP servers and subagents are runtime
+capabilities. The loop kernel owns Agent semantics; extension points are
+provided by capability providers and runtime plugins. The Kernel owns a fixed
+lifecycle dispatcher; it is not a general-purpose business extension chain.
 
-The sibling `../gateway-go` is the primary control plane. The Python
-implementations in `../agent` and `../gateway` are legacy compatibility targets
-and are not required by this runtime.
+The only public protocol is the versioned `/api/v1` Agent API. It emits the
+frontend event names `metadata`, `values`, `messages`, `custom`, `error`, and
+`end`; internal events retain more precise content, reasoning, tool, task,
+usage, and audit types.
+
+Requests are decoded strictly. Removed LangGraph fields and nested
+`config.configurable` values return HTTP 400. Subagent tasks use only
+`subagent_type` and structured terminal metadata. Auxiliary model work is
+reported as `auxiliary_tokens`.
+
+The sibling `../gateway-go` is the primary control plane. Historical Python
+sources are not built, imported, queried, or used as a fallback by this runtime.
 
 ## Repository development
 
@@ -47,6 +56,7 @@ Go 1.25 is required.
 export DEEPSEEK_API_KEY=...
 go run ./cmd/agentctl config validate --config config.example.yaml
 go run ./cmd/agentd --config config.example.yaml
+go run ./cmd/agentctl run --server http://127.0.0.1:7776 --prompt "Inspect this repository"
 ```
 
 The address defaults to `http://127.0.0.1:7776`; health is available at
@@ -55,7 +65,7 @@ extensions paths documented in `config.example.yaml`.
 
 ## APIs
 
-Native endpoints start at `/api/v1`:
+Endpoints start at `/api/v1`:
 
 ```text
 POST /api/v1/threads
@@ -63,11 +73,12 @@ GET  /api/v1/threads/{thread_id}/state
 POST /api/v1/threads/{thread_id}/runs
 GET  /api/v1/threads/{thread_id}/runs/{run_id}/events
 POST /api/v1/threads/{thread_id}/runs/{run_id}/cancel
+GET  /api/v1/threads/{thread_id}/runs/{run_id}/questions/{question_id}
+POST /api/v1/threads/{thread_id}/runs/{run_id}/questions/{question_id}/answer
 ```
 
-The frontend currently uses the compatible `/threads` and `/runs` routes. That
-adapter preserves event semantics without making the Go runtime a graph engine
-or a LangGraph checkpoint implementation.
+Old unversioned routes are not registered. Historical data must be converted
+offline into canonical threads, messages, runs, and events before deployment.
 
 ## Configuration
 
@@ -76,13 +87,18 @@ See [config.example.yaml](./config.example.yaml). Main sections are:
 - `models`: OpenAI-compatible or Anthropic endpoints and thinking options.
 - `sandbox`: per-thread local, Docker, or remote/Kubernetes-backed isolation.
 - `permissions` and `hooks`: fail-closed tool policy and command governance.
+- `plan`: deployment-owned Plan Mode guidance.
 - `summarization`: long-context compaction and overflow recovery.
 - `skills`, `subagents`, and `swarm`: bounded delegation and team workflows.
 - `extensions.mcp_servers`: HTTP/SSE or stdio MCP tools.
 - `tools`, `plugins`, and `acp_agents`: community web tools, command plugins,
   and ACP v1 subprocess agents.
-- `memory`, `title`, and `guardrails`: optional stateful middleware.
+- `memory`, `title`, and `guardrails`: optional governed runtime capabilities.
 - `runtime`: PostgreSQL, Redis, event retention, and SSE heartbeat.
+
+Repository-provided Skill capabilities live in `../skills/public`; custom
+Skills use the sibling `../skills/custom` catalog or the configured runtime
+volume. They are not owned by the historical Python source tree.
 
 MCP availability is not a startup dependency. An unavailable MCP server is
 logged and skipped. Child identities and Swarm sender identities come from the
@@ -113,11 +129,22 @@ Jina Reader and optionally `JINA_API_KEY`. They are registered only when listed
 under `tools`.
 
 Command plugins are immediate child directories containing `plugin.json`.
-`requiredPermission` (or `required_permission`) is a minimum and never elevates
-the run. Missing values default to `danger_full_access`; malformed values fail
-closed. `acp_agents` registers `invoke_acp_agent` and speaks ACP v1 over
+`requiredSandboxMode` is a minimum and never elevates the run without approval.
+Plugin manifests are decoded strictly; removed permission fields are rejected.
+Missing values default to `danger-full-access`; malformed values fail closed. Plugin commands
+receive `NOUS_PLUGIN_NAME`, `NOUS_PLUGIN_ROOT`, and `NOUS_TOOL_NAME`.
+`acp_agents` registers `invoke_acp_agent` and speaks ACP v1 over
 newline-delimited JSON-RPC. ACP permission requests are denied unless the agent
 explicitly sets `auto_approve_permissions: true`.
+
+Plan-mode guidance is deployment-owned through `plan.guidance`. The model tool
+catalog remains stable across mode changes; `write_todos` and `exit_plan_mode`
+validate active plan state at execution. `exit_plan_mode` presents the complete
+Markdown plan through the durable `interaction.questions` capability. Approval
+persists `plan_mode_changed(active=false)` before the next model step;
+keep-planning, dismissal, cancellation, or persistence failure leaves plan mode
+active. User questions are collaboration state and never grant tool or sandbox
+permissions.
 
 ### Remote sandbox API
 
@@ -134,6 +161,10 @@ POST   /v1/sandboxes/{id}/fs/list
 POST   /v1/sandboxes/{id}/fs/stat
 ```
 
+`fs/list` receives a positive `limit` for bounded reads. Remote sandbox
+implementations must honor it and may return at most `limit` entries to the
+caller; the Go adapter requests one additional entry to detect truncation.
+
 Acquire returns `id` and `root`. File bodies use `path` and base64 data; exec
 uses `line`, `work_dir`, `timeout_ms`, and `env`. Responses are size-bounded,
 virtual paths are checked against the acquired root, and authentication headers
@@ -141,9 +172,10 @@ can be supplied through `sandbox.remote_headers`.
 
 ## Persistence
 
-PostgreSQL stores threads, transcripts, runs, replay events, memory facts, and
-Swarm mailboxes. Redis provides cross-instance run cancellation, event replay,
-and asynchronous Subagent task state.
+PostgreSQL stores threads, transcripts, runs, replay events, durable user
+questions, disposable projection snapshots, memory facts, and Swarm mailboxes. Redis provides
+cross-instance run cancellation, event replay, and asynchronous Subagent task
+state.
 
 Both are optional for basic single-process development. PostgreSQL is required
 for Swarm and production persistence.

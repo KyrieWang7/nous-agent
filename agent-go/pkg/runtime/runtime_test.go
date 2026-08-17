@@ -37,7 +37,7 @@ func TestEvent_CategoryAssignment(t *testing.T) {
 		want runtime.Category
 	}{
 		{runtime.EventContentDelta, runtime.CategoryTrace},
-		{runtime.EventToolStart, runtime.CategoryTrace},
+		{runtime.EventToolStart, runtime.CategoryAudit},
 		{runtime.EventUsage, runtime.CategoryUsage},
 		{runtime.EventRunEnd, runtime.CategoryAudit},
 		{runtime.EventError, runtime.CategoryAudit},
@@ -45,6 +45,15 @@ func TestEvent_CategoryAssignment(t *testing.T) {
 		{runtime.EventSubagentStart, runtime.CategoryAudit},
 		{runtime.EventSubagentResult, runtime.CategoryAudit},
 		{runtime.EventSubagentProgress, runtime.CategoryTrace},
+		{runtime.EventApprovalRequested, runtime.CategoryAudit},
+		{runtime.EventApprovalResolved, runtime.CategoryAudit},
+		{runtime.EventQuestionRequested, runtime.CategoryAudit},
+		{runtime.EventQuestionResolved, runtime.CategoryAudit},
+		{runtime.EventCompactionStart, runtime.CategoryAudit},
+		{runtime.EventCompactionComplete, runtime.CategoryAudit},
+		{runtime.EventRunStateChanged, runtime.CategoryAudit},
+		{runtime.EventBudgetChanged, runtime.CategoryAudit},
+		{runtime.EventPlanModeChanged, runtime.CategoryAudit},
 		// message_replace 丢掉就等于把被拦截的文本留在用户屏幕上
 		{runtime.EventMessageReplace, runtime.CategoryAudit},
 	}
@@ -97,6 +106,18 @@ func TestBus_PublishAssignsMonotonicSeq(t *testing.T) {
 		if got := b.Publish(ctx, ev("r1", runtime.EventContentDelta)); got != i {
 			t.Fatalf("Publish() = %d, want %d", got, i)
 		}
+	}
+}
+
+func TestBus_ContinuesFromDurableSequence(t *testing.T) {
+	b := runtime.NewMemoryBus(runtime.BusOptions{})
+	seeded := ev("r1", runtime.EventRunStateChanged)
+	seeded.Seq = 41
+	if got := b.Publish(context.Background(), seeded); got != 41 {
+		t.Fatalf("seeded Publish() = %d, want 41", got)
+	}
+	if got := b.Publish(context.Background(), ev("r1", runtime.EventRunEnd)); got != 42 {
+		t.Fatalf("next Publish() = %d, want 42", got)
 	}
 }
 
@@ -515,7 +536,7 @@ func TestJournal_BucketsTokens(t *testing.T) {
 		Usage: model.Usage{InputTokens: 50, OutputTokens: 10},
 	})
 	j.Observe(runtime.Entry{
-		Bucket: runtime.BucketMiddleware, Source: "summariser", CallID: "c", ModelName: "fast",
+		Bucket: runtime.BucketAuxiliary, Source: "summariser", CallID: "c", ModelName: "fast",
 		Usage: model.Usage{InputTokens: 30, OutputTokens: 5},
 	})
 
@@ -526,8 +547,8 @@ func TestJournal_BucketsTokens(t *testing.T) {
 	if got.SubagentTokens != 60 {
 		t.Errorf("SubagentTokens = %d, want 60", got.SubagentTokens)
 	}
-	if got.MiddlewareTokens != 35 {
-		t.Errorf("MiddlewareTokens = %d, want 35", got.MiddlewareTokens)
+	if got.AuxiliaryTokens != 35 {
+		t.Errorf("AuxiliaryTokens = %d, want 35", got.AuxiliaryTokens)
 	}
 	if got.LLMCalls != 3 {
 		t.Errorf("LLMCalls = %d, want 3", got.LLMCalls)
@@ -604,7 +625,7 @@ func TestJournal_BySourceBreakdown(t *testing.T) {
 		Usage: model.Usage{InputTokens: 1000, OutputTokens: 100},
 	})
 	j.Observe(runtime.Entry{
-		Bucket: runtime.BucketMiddleware, Source: "summariser", CallID: "b", ModelName: "fast",
+		Bucket: runtime.BucketAuxiliary, Source: "summariser", CallID: "b", ModelName: "fast",
 		Usage: model.Usage{InputTokens: 10, OutputTokens: 2},
 	})
 
@@ -613,8 +634,8 @@ func TestJournal_BySourceBreakdown(t *testing.T) {
 	if got["subagent:vision"] != 1100 {
 		t.Errorf("subagent:vision = %d, want 1100", got["subagent:vision"])
 	}
-	if got["middleware:summariser"] != 12 {
-		t.Errorf("middleware:summariser = %d, want 12", got["middleware:summariser"])
+	if got["auxiliary:summariser"] != 12 {
+		t.Errorf("auxiliary:summariser = %d, want 12", got["auxiliary:summariser"])
 	}
 }
 
@@ -692,21 +713,21 @@ func TestJournal_MergeFeedsSubagentUsageBack(t *testing.T) {
 	t.Parallel()
 
 	parent := runtime.NewJournal(pricer())
-	child := runtime.NewJournal(pricer())
+	child := parent.Child()
 
 	child.Observe(runtime.Entry{
 		Bucket: runtime.BucketLead, CallID: "c1", ModelName: "standard",
 		Usage: model.Usage{InputTokens: 200, OutputTokens: 40, CachedInputTokens: 80},
 	})
 	child.Observe(runtime.Entry{
-		Bucket: runtime.BucketMiddleware, Source: "summariser", CallID: "c2", ModelName: "fast",
+		Bucket: runtime.BucketAuxiliary, Source: "summariser", CallID: "c2", ModelName: "fast",
 		Usage: model.Usage{InputTokens: 20, OutputTokens: 4},
 	})
 
-	parent.Merge("explore", child)
+	parent.MergeSubagent("task-1", "explore", child)
 
 	got := parent.Totals()
-	// 子账本里的一切都归父账本的 subagent 桶，包括子 agent 自己的 middleware 开销
+	// 子账本里的一切都归父账本的 subagent 桶，包括子 agent 自己的 auxiliary 开销
 	if got.SubagentTokens != 264 {
 		t.Fatalf("SubagentTokens = %d, want 264 (everything the child spent)", got.SubagentTokens)
 	}
@@ -728,7 +749,7 @@ func TestJournal_MergeSubagentDeduplicatesTaskReplay(t *testing.T) {
 	t.Parallel()
 
 	parent := runtime.NewJournal(pricer())
-	child := runtime.NewJournal(pricer())
+	child := parent.Child()
 	child.Observe(runtime.Entry{
 		Bucket: runtime.BucketLead, CallID: "child-call", ModelName: "standard",
 		Usage: model.Usage{InputTokens: 20, OutputTokens: 4},
@@ -755,7 +776,7 @@ func TestJournal_MergeSubagentDeduplicatesTaskReplay(t *testing.T) {
 
 func TestJournal_OnChangeObservesLateSubagentMerge(t *testing.T) {
 	parent := runtime.NewJournal(nil)
-	child := runtime.NewJournal(nil)
+	child := parent.Child()
 	child.Observe(runtime.Entry{Bucket: runtime.BucketLead, CallID: "child-1", Usage: model.Usage{InputTokens: 4, OutputTokens: 2}})
 
 	changed := make(chan runtime.Totals, 2)
@@ -764,7 +785,7 @@ func TestJournal_OnChangeObservesLateSubagentMerge(t *testing.T) {
 	if initial.LLMCalls != 0 {
 		t.Fatalf("initial totals = %#v", initial)
 	}
-	parent.Merge("explore", child)
+	parent.MergeSubagent("task-1", "explore", child)
 
 	select {
 	case totals := <-changed:
@@ -829,7 +850,7 @@ func TestJournal_MergeNilChildIsSafe(t *testing.T) {
 	t.Parallel()
 
 	parent := runtime.NewJournal(pricer())
-	parent.Merge("x", nil)
+	parent.MergeSubagent("task-1", "x", nil)
 
 	if got := parent.Totals(); got.SubagentTokens != 0 {
 		t.Fatalf("totals = %+v after merging nil", got)
@@ -849,7 +870,7 @@ func TestJournal_NilReceiverIsSafe(t *testing.T) {
 	if got := j.BySource(); got != nil {
 		t.Errorf("BySource() on a nil journal = %v", got)
 	}
-	j.Merge("x", runtime.NewJournal(nil))
+	j.MergeSubagent("task-1", "x", runtime.NewJournal(nil))
 }
 
 func TestJournal_ConcurrentObserve(t *testing.T) {

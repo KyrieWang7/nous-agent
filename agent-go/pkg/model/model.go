@@ -84,7 +84,7 @@ type Response struct {
 	ModelName string
 }
 
-// Info 描述模型能力。中间件据此决定是否生效（如 ViewImage 只在 SupportsVision 时挂载）。
+// Info 描述模型能力。Lifecycle handler 据此决定是否生效（如 ViewImage 只在 SupportsVision 时挂载）。
 type Info struct {
 	Name                    string
 	ContextLength           int

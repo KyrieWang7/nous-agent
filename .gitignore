@@ -42,8 +42,8 @@ agent/extensions_config.json
 agent/memory.json
 
 # Skills (custom skills are user-specific)
-agent/skills/custom/*
-!agent/skills/custom/.gitkeep
+skills/custom/*
+!skills/custom/.gitkeep
 
 # Data
 agent/.deer-flow/

@@ -9,7 +9,7 @@ import "sync"
 //   - ReplaceLastAssistant：护栏撤回最后一条回复
 //
 // 其余操作只追加。History 是并发安全的：并发工具执行期间，
-// 内核与中间件共享同一个 History 实例。
+// Kernel 与 lifecycle handlers 共享同一个 History 实例。
 type History struct {
 	mu   sync.RWMutex
 	msgs []Message

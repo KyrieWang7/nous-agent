@@ -19,10 +19,7 @@ import (
 )
 
 const (
-	LeadAgentName = "lead"
-	// TeamLeadAgentAlias is accepted at product boundaries for compatibility
-	// with the Python harness. Go persists and emits LeadAgentName only.
-	TeamLeadAgentAlias    = "team-lead"
+	LeadAgentName         = "lead"
 	SystemAgentName       = "system"
 	MemberStatusActive    = "active"
 	MemberStatusRunning   = "running"
@@ -731,11 +728,7 @@ func nullableText(value string) any {
 }
 
 func canonicalAgentName(name string) string {
-	name = strings.TrimSpace(name)
-	if strings.EqualFold(name, TeamLeadAgentAlias) {
-		return LeadAgentName
-	}
-	return name
+	return strings.TrimSpace(name)
 }
 
 // ValidateMemberName enforces the stable identifier used in mailbox addresses,
@@ -762,7 +755,6 @@ func reservedMemberName(name string) bool {
 		return true
 	}
 	return strings.EqualFold(name, LeadAgentName) ||
-		strings.EqualFold(name, TeamLeadAgentAlias) ||
 		strings.EqualFold(name, SystemAgentName)
 }
 

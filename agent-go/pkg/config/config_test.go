@@ -25,7 +25,7 @@ models:
     model: test-model
     api_key: $TEST_MODEL_KEY
 permissions:
-  mode: read_only
+  preset: read-only
 `
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
@@ -41,8 +41,8 @@ permissions:
 	if m.APIKey != "secret" {
 		t.Fatalf("api key not expanded")
 	}
-	if cfg.Permissions.Mode != permission.ModeReadOnly {
-		t.Fatalf("mode=%q", cfg.Permissions.Mode)
+	if cfg.Permissions.Preset != permission.PresetReadOnly {
+		t.Fatalf("preset=%q", cfg.Permissions.Preset)
 	}
 }
 
@@ -60,6 +60,9 @@ func TestDefaultsUseHarnessPort(t *testing.T) {
 	if cfg.Swarm.MaxTeamSize != 5 || cfg.Swarm.MessagePollInterval != 2*time.Second {
 		t.Fatalf("swarm defaults = %#v", cfg.Swarm)
 	}
+	if !strings.Contains(cfg.Plan.Guidance, "exit_plan_mode") || !strings.Contains(cfg.Plan.Guidance, "Do not begin implementation") {
+		t.Fatalf("plan guidance does not enforce review boundary: %q", cfg.Plan.Guidance)
+	}
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
@@ -68,6 +71,24 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	_ = os.WriteFile(path, []byte("mystery: true\n"), 0o600)
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "field mystery not found") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestLoadRejectsRemovedPermissionMode(t *testing.T) {
+	isolateTuyooEnv(t)
+	path := filepath.Join(t.TempDir(), "bad-permission.yaml")
+	data := `models:
+  - name: primary
+    provider: openai-compatible
+    model: test-model
+permissions:
+  mode: workspace_write
+`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field mode not found") {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -174,6 +195,8 @@ func TestValidateRejectsInvalidRuntimeLimits(t *testing.T) {
 		{name: "negative pricing", mutate: func(c *Config) { c.Models[0].Pricing.InputPerMillionMicros = -1 }, want: "pricing cannot be negative"},
 		{name: "negative token budget", mutate: func(c *Config) { c.Loop.TokenBudget = -1 }, want: "token_budget"},
 		{name: "negative cost budget", mutate: func(c *Config) { c.Loop.CostBudgetMicros = -1 }, want: "cost_budget_micros"},
+		{name: "negative approval ttl", mutate: func(c *Config) { c.Permissions.ApprovalTTL = -time.Second }, want: "approval_ttl"},
+		{name: "blank plan guidance", mutate: func(c *Config) { c.Plan.Guidance = " " }, want: "plan.guidance"},
 		{name: "remote sandbox url", mutate: func(c *Config) { c.Sandbox.Enabled = true; c.Sandbox.Provider = "remote"; c.Sandbox.RemoteURL = "" }, want: "sandbox.remote_url"},
 		{name: "plugin directories", mutate: func(c *Config) { c.Plugins.Enabled = true; c.Plugins.Directories = nil }, want: "plugins.directories"},
 		{name: "ACP command", mutate: func(c *Config) { c.ACPAgents = map[string]ACPAgentConfig{"codex": {Description: "coding"}} }, want: "command and description"},
@@ -195,7 +218,7 @@ func TestValidateRejectsInvalidRuntimeLimits(t *testing.T) {
 	}
 }
 
-func TestLoadPythonCompatibleToolsPluginsAndACP(t *testing.T) {
+func TestLoadToolsPluginsAndACP(t *testing.T) {
 	isolateTuyooEnv(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := `models:

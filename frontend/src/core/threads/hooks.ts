@@ -26,7 +26,6 @@ import {
   mergeSSEValuesMessages,
 } from "./merge-messages";
 import { MessageManager } from "./message-manager";
-import { isThreadNotFoundError } from "./thread-lifecycle";
 import {
   FAIL_CLOSED_RESPONSE,
   classifyRiskLevel,
@@ -36,11 +35,18 @@ import {
   shouldFailClosedRunEnd,
   type RunRiskVerdict,
 } from "./sse-events";
-import { fetchActiveRunId, reconnectSSE, streamSSE } from "./transport";
+import { isThreadNotFoundError } from "./thread-lifecycle";
+import {
+  answerUserQuestion,
+  fetchActiveRunId,
+  reconnectSSE,
+  streamSSE,
+} from "./transport";
 import type {
   AgentThread,
-  AgentThreadContext,
+  AgentRunIntent,
   AgentThreadState,
+  PendingUserQuestion,
   TokenUsage,
 } from "./types";
 
@@ -130,7 +136,7 @@ function useThreadHistory(
 // ---------------------------------------------------------------------------
 // useSSEStream — manage SSE connection, parse events, accumulate state
 //
-// Architecture mirrors the LangGraph SDK's StreamManager + MessageTupleManager:
+// The stream state keeps one canonical values snapshot:
 //   - NO independent `messages` state — messages live inside `values.messages`
 //   - `values` events directly replace the entire values snapshot
 //   - `messages` events go through MessageManager for correct chunk merging,
@@ -146,6 +152,7 @@ interface SSEStreamState {
   riskLevel: string | null;
   /** Stable client-side classification used for safety decisions. */
   riskVerdict: RunRiskVerdict | null;
+  pendingQuestion: PendingUserQuestion | null;
 }
 
 const EMPTY_STATE: AgentThreadState = {
@@ -167,6 +174,7 @@ function useSSEStream(
     tokenUsage: initialTokenUsage,
     riskLevel: null,
     riskVerdict: null,
+    pendingQuestion: null,
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -197,6 +205,7 @@ function useSSEStream(
       tokenUsage: null,
       riskLevel: null,
       riskVerdict: null,
+      pendingQuestion: null,
     });
   }, [threadId]);
 
@@ -376,6 +385,18 @@ function useSSEStream(
       if (customData.type === "guardrail_blocked") {
         guardrailBlockedRef.current = true;
       }
+      if (customData.type === "question_requested") {
+        setState((prev) => ({
+          ...prev,
+          pendingQuestion: customData as unknown as PendingUserQuestion,
+        }));
+      } else if (customData.type === "question_resolved") {
+        setState((prev) =>
+          prev.pendingQuestion?.id === customData.id
+            ? { ...prev, pendingQuestion: null }
+            : prev,
+        );
+      }
       const replacement = parseMessageReplacement(customData);
       if (replacement) {
         replacementReceivedRef.current = true;
@@ -497,7 +518,6 @@ function useSSEStream(
         ) => Partial<AgentThreadState>;
         config?: Record<string, unknown>;
         context?: Record<string, unknown>;
-        command?: Record<string, unknown>;
       },
     ) => {
       abortRef.current?.abort();
@@ -527,16 +547,39 @@ function useSSEStream(
       try {
         for await (const { event, data } of streamSSE(threadId, "lead_agent", {
           input,
-          config: {
-            ...options?.config,
-            configurable: { thread_id: threadId },
-          },
+          config: options?.config,
           context: options?.context,
-          command: options?.command,
           signal: ac.signal,
         })) {
           processSSEEvent(event, data);
           if (event === "error") return;
+        }
+
+        // SSE can finish after a browser reconnect or proxy interruption has
+        // dropped one or more message deltas. The persisted projection is the
+        // source of truth, so reconcile it once at the terminal boundary.
+        try {
+          const persisted = await getAPIClient().threads.getState<AgentThreadState>(
+            threadId,
+          );
+          if (persisted.values?.messages?.length) {
+            flushSync(() => {
+              setState((prev) => ({
+                ...prev,
+                values: {
+                  ...prev.values,
+                  ...persisted.values,
+                  messages: mergeSSEValuesMessages(
+                    prev.values.messages ?? [],
+                    persisted.values.messages,
+                  ),
+                },
+              }));
+            });
+          }
+        } catch {
+          // The streamed state remains usable when the final reconciliation
+          // request races with a transient backend restart.
         }
 
         setState((prev) => ({ ...prev, isLoading: false }));
@@ -570,6 +613,7 @@ function useSSEStream(
     tokenUsage: state.tokenUsage,
     riskLevel: state.riskLevel,
     riskVerdict: state.riskVerdict,
+    pendingQuestion: state.pendingQuestion,
     submit,
     stop,
   };
@@ -657,7 +701,6 @@ export function useThreadStream({
           | ((prev: AgentThreadState) => Partial<AgentThreadState>);
         config?: Record<string, unknown>;
         context?: Record<string, unknown>;
-        command?: Record<string, unknown>;
       },
     ) => {
       if (!threadId) throw new Error("threadId is required");
@@ -671,14 +714,30 @@ export function useThreadStream({
         optimisticValues: optFn,
         config: options?.config,
         context: options?.context,
-        command: options?.command,
       });
     },
     [threadId, stream],
   );
 
+  const answerQuestion = useCallback(
+    async (answer: {
+      selected?: string[];
+      custom?: string;
+      dismiss?: boolean;
+    }) => {
+      if (!stream.pendingQuestion) {
+        throw new Error("No user question is pending");
+      }
+      await answerUserQuestion(stream.pendingQuestion, answer);
+    },
+    [stream.pendingQuestion],
+  );
+
   return useMemo(
-    (): ThreadStream<AgentThreadState> => ({
+    (): ThreadStream<AgentThreadState> & {
+      pendingQuestion: PendingUserQuestion | null;
+      answerQuestion: typeof answerQuestion;
+    } => ({
       values: stream.values,
       messages: stream.messages,
       isLoading: stream.isLoading,
@@ -686,20 +745,12 @@ export function useThreadStream({
       threadNotFound: history.notFound,
       error: stream.error,
       tokenUsage: stream.tokenUsage,
+      pendingQuestion: stream.pendingQuestion,
+      answerQuestion,
       submit: submitFn,
       stop: stream.stop,
-      interrupt: undefined,
-      toolCalls: [],
-      getToolCalls: () => [],
-      branch: "",
-      setBranch: () => undefined,
-      history: [],
-      experimental_branchTree: { type: "sequence" as const, items: [] },
-      getMessagesMetadata: () => undefined,
-      assistantId: "lead_agent",
-      joinStream: async () => undefined,
     }),
-    [stream, history.isLoading, submitFn],
+    [stream, history.isLoading, history.notFound, submitFn, answerQuestion],
   );
 }
 
@@ -717,7 +768,7 @@ export function useSubmitThread({
   isNewThread: boolean;
   threadId: string | null | undefined;
   thread: ThreadStream<AgentThreadState>;
-  threadContext: Omit<AgentThreadContext, "thread_id">;
+  threadContext: AgentRunIntent;
   afterSubmit?: () => void;
 }) {
   const queryClient = useQueryClient();

@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -28,31 +30,37 @@ type harness struct {
 }
 
 type harnessOpts struct {
-	turns      []faux.Turn
-	tools      []tool.Definition
-	middleware []middleware.Middleware
-	limits     loop.Limits
-	stopGate   loop.StopGate
-	compactor  loop.Compactor
-	trimmer    loop.Trimmer
-	publisher  loop.Publisher
-	resolver   loop.ToolSetResolver
+	turns     []faux.Turn
+	tools     []tool.Definition
+	auxiliary []lifecycle.Handler
+	limits    loop.Limits
+	stopGate  loop.StopGate
+	compactor loop.Compactor
+	trimmer   loop.Trimmer
+	publisher loop.Publisher
+	resolver  loop.ToolSetResolver
 }
 
 type setRunValue struct{}
 
 func (setRunValue) Name() string { return "setRunValue" }
-func (setRunValue) BeforeAgent(_ context.Context, st *middleware.State) error {
+func (setRunValue) BeforeAgent(_ context.Context, st *lifecycle.State) error {
 	st.SetValue("team_id", "team-1")
 	return nil
 }
 
 type meteredBeforeModel struct{ usage model.Usage }
 
+type samplerFunc func(context.Context, *lifecycle.State) (*model.Response, bool, error)
+
+func (f samplerFunc) Sample(ctx context.Context, st *lifecycle.State) (*model.Response, bool, error) {
+	return f(ctx, st)
+}
+
 func (meteredBeforeModel) Name() string { return "meteredBeforeModel" }
-func (m meteredBeforeModel) BeforeModel(ctx context.Context, _ *middleware.State) error {
+func (m meteredBeforeModel) BeforeModel(ctx context.Context, _ *lifecycle.State) error {
 	run, _ := runtime.RunContextFrom(ctx)
-	run.Journal.Observe(runtime.Entry{Bucket: runtime.BucketMiddleware, Source: "test", CallID: "middleware-call", Usage: m.usage})
+	run.Journal.Observe(runtime.Entry{Bucket: runtime.BucketAuxiliary, Source: "test", CallID: "auxiliary-call", Usage: m.usage})
 	return nil
 }
 
@@ -67,7 +75,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		}
 	}
 
-	chain, err := middleware.NewChain(opts.middleware, middleware.ChainOptions{})
+	chain, err := lifecycle.NewDispatcher(opts.auxiliary, lifecycle.DispatcherOptions{})
 	if err != nil {
 		t.Fatalf("NewChain() error = %v", err)
 	}
@@ -81,7 +89,7 @@ func newHarness(t *testing.T, opts harnessOpts) *harness {
 		Sampler:   loop.NewDirectSampler(fx),
 		Registry:  registry,
 		Executor:  tool.NewExecutor(registry, tool.ExecutorOptions{}),
-		Chain:     chain,
+		Lifecycle: chain,
 		Limits:    limits,
 		StopGate:  opts.stopGate,
 		Compactor: opts.compactor,
@@ -142,10 +150,123 @@ func TestLoop_NoToolCallsEndsTurn(t *testing.T) {
 	}
 }
 
-func TestLoopSharesRunValuesWithMiddlewareAndReturnsSnapshot(t *testing.T) {
+func TestLoop_ToolExecutionPublishesRuntimeTransactions(t *testing.T) {
+	b := runtime.NewMemoryBus(runtime.BusOptions{})
+	ch, unsubscribe := b.Subscribe("r1")
+	defer unsubscribe()
+	h := newHarness(t, harnessOpts{
+		turns: []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("done")},
+		tools: []tool.Definition{echoTool("echo")},
+	})
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "r1", ThreadID: "t1", Bus: b})
+	if _, err := h.run(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	var got []runtime.Event
+	for {
+		select {
+		case event := <-ch:
+			got = append(got, event)
+		default:
+			if len(got) != 2 || got[0].Type != runtime.EventToolStart || got[1].Type != runtime.EventToolResult {
+				t.Fatalf("runtime tool events = %v", got)
+			}
+			for _, event := range got {
+				if event.Category != runtime.CategoryAudit || event.IdempotencyKey == "" {
+					t.Fatalf("tool transaction event is not canonical: %#v", event)
+				}
+			}
+			return
+		}
+	}
+}
+
+func TestLoop_NormalizesToolCallIDBeforeTranscriptAndTransaction(t *testing.T) {
+	registry := tool.NewRegistry()
+	var handlerID string
+	definition := echoTool("echo")
+	definition.Handler = func(_ context.Context, call tool.Call) (*tool.Result, error) {
+		handlerID = call.ID
+		return &tool.Result{Content: "ok"}, nil
+	}
+	if err := registry.Register(definition); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := lifecycle.NewDispatcher(nil, lifecycle.DispatcherOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := 0
+	sampler := samplerFunc(func(context.Context, *lifecycle.State) (*model.Response, bool, error) {
+		turn++
+		if turn == 1 {
+			return &model.Response{Message: message.Message{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{Name: "echo", Arguments: json.RawMessage(`{}`)}}}, StopReason: model.StopReasonToolCalls}, false, nil
+		}
+		return &model.Response{Message: message.Message{Role: message.RoleAssistant, Content: "done"}, StopReason: model.StopReasonStop}, false, nil
+	})
+	runner, err := loop.NewRunner(loop.Config{Sampler: sampler, Registry: registry, Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Lifecycle: dispatcher, Limits: loop.Limits{MaxIterations: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := message.NewHistory()
+	if _, err := runner.Run(context.Background(), loop.Request{RunID: "r1", ThreadID: "t1", History: history, Prompt: "run"}); err != nil {
+		t.Fatal(err)
+	}
+	messages := history.All()
+	if len(messages) < 3 || messages[1].ToolCalls[0].ID == "" || messages[2].ToolCallID != messages[1].ToolCalls[0].ID || handlerID != messages[1].ToolCalls[0].ID {
+		t.Fatalf("normalized transaction mismatch: handler=%q messages=%+v", handlerID, messages)
+	}
+}
+
+func TestLoop_CapabilityViewFiltersToolDisclosure(t *testing.T) {
+	h := newHarness(t, harnessOpts{turns: []faux.Turn{faux.Text("done")}, tools: []tool.Definition{echoTool("echo")}})
+	view, err := capability.NewView(capability.NewRegistry().Snapshot(), []string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "r1", ThreadID: "t1", Capabilities: view})
+	if _, err := h.run(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	request, ok := h.fx.LastRequest()
+	if !ok || len(request.Tools) != 0 {
+		t.Fatalf("model tools = %+v, want none", request.Tools)
+	}
+}
+
+func TestLoop_ToolExecutionUsesExplicitRunState(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, harnessOpts{turns: []faux.Turn{faux.Text("done")}, middleware: []middleware.Middleware{setRunValue{}}})
+	state, err := runtime.NewRunStateMachine("r1", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var phases []runtime.RunPhase
+	state.SetObserver(func(snapshot runtime.RunSnapshot) error {
+		phases = append(phases, snapshot.Phase)
+		return nil
+	})
+	if err := state.Start(); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, harnessOpts{
+		turns: []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("done")},
+		tools: []tool.Definition{echoTool("echo")},
+	})
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{RunID: "r1", ThreadID: "t1", StateMachine: state})
+	if _, err := h.run(ctx, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	want := []runtime.RunPhase{runtime.RunRunning, runtime.RunWaitingTool, runtime.RunRunning}
+	if !slices.Equal(phases, want) {
+		t.Fatalf("run phases = %v, want %v", phases, want)
+	}
+}
+
+func TestLoopSharesRunValuesWithLifecycleAndReturnsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, harnessOpts{turns: []faux.Turn{faux.Text("done")}, auxiliary: []lifecycle.Handler{setRunValue{}}})
 	values := map[string]any{"swarm_enabled": true}
 	result, err := h.runner.Run(context.Background(), loop.Request{
 		ThreadID: "t1", RunID: "r1", History: message.NewHistory(), Prompt: "work", Values: values,
@@ -223,9 +344,9 @@ func TestLoop_TokenBudgetIncludesBeforeModelAndStopsLeadSample(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.Text("must not be reached")},
-		middleware: []middleware.Middleware{meteredBeforeModel{usage: model.Usage{InputTokens: 5}}},
-		limits:     loop.Limits{MaxTokens: 5},
+		turns:     []faux.Turn{faux.Text("must not be reached")},
+		auxiliary: []lifecycle.Handler{meteredBeforeModel{usage: model.Usage{InputTokens: 5}}},
+		limits:    loop.Limits{MaxTokens: 5},
 	})
 	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{Journal: runtime.NewJournal(nil)})
 
@@ -234,7 +355,36 @@ func TestLoop_TokenBudgetIncludesBeforeModelAndStopsLeadSample(t *testing.T) {
 		t.Fatalf("Run() error = %v, want ErrBudgetExhausted", err)
 	}
 	if got := h.fx.CallCount(); got != 0 {
-		t.Fatalf("model calls = %d; middleware spend bypassed the run budget", got)
+		t.Fatalf("model calls = %d; auxiliary spend bypassed the run budget", got)
+	}
+}
+
+func TestLoop_ToolCallBudgetStopsBeforeToolExecution(t *testing.T) {
+	t.Parallel()
+
+	var toolCalls atomic.Int32
+	counted := echoTool("echo")
+	counted.Handler = func(context.Context, tool.Call) (*tool.Result, error) {
+		toolCalls.Add(1)
+		return &tool.Result{Content: "ran"}, nil
+	}
+	h := newHarness(t, harnessOpts{
+		turns: []faux.Turn{
+			faux.ToolCalls(
+				faux.Call{ID: "c1", Name: "echo", Args: `{}`},
+				faux.Call{ID: "c2", Name: "echo", Args: `{}`},
+			),
+		},
+		tools:  []tool.Definition{counted},
+		limits: loop.Limits{MaxToolCalls: 1},
+	})
+
+	_, err := h.run(context.Background(), "work")
+	if !errors.Is(err, loop.ErrBudgetExhausted) {
+		t.Fatalf("Run() error = %v, want ErrBudgetExhausted", err)
+	}
+	if got := toolCalls.Load(); got != 0 {
+		t.Fatalf("tool calls = %d; an over-budget batch must be rejected atomically", got)
 	}
 }
 
@@ -406,6 +556,53 @@ func TestLoop_CompactionRunsBeforeEachSampling(t *testing.T) {
 	}
 }
 
+func TestLoop_CompactionUsesExplicitStateAndCanonicalEvents(t *testing.T) {
+	t.Parallel()
+
+	state, err := runtime.NewRunStateMachine("r1", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var phases []runtime.RunPhase
+	state.SetObserver(func(snapshot runtime.RunSnapshot) error {
+		phases = append(phases, snapshot.Phase)
+		return nil
+	})
+	if err := state.Start(); err != nil {
+		t.Fatal(err)
+	}
+	bus := runtime.NewMemoryBus(runtime.BusOptions{})
+	events, unsubscribe := bus.Subscribe("r1")
+	defer unsubscribe()
+	h := newHarness(t, harnessOpts{
+		turns:     []faux.Turn{faux.Text("done")},
+		compactor: trackedCompactor{},
+	})
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID: "r1", ThreadID: "t1", StateMachine: state, Bus: bus,
+	})
+	if _, err := h.run(ctx, "compact"); err != nil {
+		t.Fatal(err)
+	}
+	wantPhases := []runtime.RunPhase{runtime.RunRunning, runtime.RunCompacting, runtime.RunRunning}
+	if !slices.Equal(phases, wantPhases) {
+		t.Fatalf("run phases = %v, want %v", phases, wantPhases)
+	}
+	var gotEvents []runtime.EventType
+	for {
+		select {
+		case event := <-events:
+			gotEvents = append(gotEvents, event.Type)
+		default:
+			wantEvents := []runtime.EventType{runtime.EventCompactionStart, runtime.EventCompactionComplete}
+			if !slices.Equal(gotEvents, wantEvents) {
+				t.Fatalf("compaction events = %v, want %v", gotEvents, wantEvents)
+			}
+			return
+		}
+	}
+}
+
 // Result.Compacted 是持久化层选择"整体重写"还是"追加"的唯一判据，
 // 不能靠"消息数变少了"这种推断（设计文档 §13.2）。
 func TestLoop_CompactedFlagIsStickyAcrossIterations(t *testing.T) {
@@ -485,7 +682,7 @@ func TestLoop_ToolSetIsRecomputedEachIteration(t *testing.T) {
 	t.Parallel()
 
 	var iterations atomic.Int64
-	resolver := resolverFunc(func(st *middleware.State) ([]string, []string) {
+	resolver := resolverFunc(func(st *lifecycle.State) ([]string, []string) {
 		iterations.Add(1)
 		// 第一轮给 echo，第二轮收走
 		if st.Iteration == 0 {
@@ -543,9 +740,9 @@ func TestLoop_StagesRunAtTheRightTimes(t *testing.T) {
 	rec := &stageRecorder{log: &log}
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("done")},
-		tools:      []tool.Definition{echoTool("echo")},
-		middleware: []middleware.Middleware{rec},
+		turns:     []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("done")},
+		tools:     []tool.Definition{echoTool("echo")},
+		auxiliary: []lifecycle.Handler{rec},
 	})
 
 	if _, err := h.run(context.Background(), "go"); err != nil {
@@ -567,8 +764,8 @@ func TestLoop_AfterAgentRunsEvenWhenTheTurnFails(t *testing.T) {
 	rec := &stageRecorder{log: &log}
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.Fail(model.ErrProviderUnavailable)},
-		middleware: []middleware.Middleware{rec},
+		turns:     []faux.Turn{faux.Fail(model.ErrProviderUnavailable)},
+		auxiliary: []lifecycle.Handler{rec},
 	})
 
 	if _, err := h.run(context.Background(), "go"); err == nil {
@@ -590,9 +787,9 @@ func TestLoop_PublishesAfterAfterModelStage(t *testing.T) {
 	pub := &recordingPublisher{}
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.Text("unsafe content")},
-		middleware: []middleware.Middleware{rewriteReply{to: "safe fallback"}},
-		publisher:  pub,
+		turns:     []faux.Turn{faux.Text("unsafe content")},
+		auxiliary: []lifecycle.Handler{rewriteReply{to: "safe fallback"}},
+		publisher: pub,
 	})
 
 	res, err := h.run(context.Background(), "go")
@@ -617,9 +814,9 @@ func TestLoop_DirectiveStopEndsTurnImmediately(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("never reached")},
-		tools:      []tool.Definition{echoTool("echo")},
-		middleware: []middleware.Middleware{stopAfterModel{}},
+		turns:     []faux.Turn{faux.ToolCall("echo", `{}`), faux.Text("never reached")},
+		tools:     []tool.Definition{echoTool("echo")},
+		auxiliary: []lifecycle.Handler{stopAfterModel{}},
 	})
 
 	res, err := h.run(context.Background(), "go")
@@ -639,7 +836,7 @@ func TestLoop_DirectiveContinueForcesAnotherIteration(t *testing.T) {
 
 	h := newHarness(t, harnessOpts{
 		turns: []faux.Turn{faux.Text("first"), faux.Text("second")},
-		middleware: []middleware.Middleware{
+		auxiliary: []lifecycle.Handler{
 			&continueOnce{},
 		},
 	})
@@ -671,9 +868,9 @@ func TestLoop_ToolInterceptorEndTurnStopsTheTurn(t *testing.T) {
 	}
 
 	h := newHarness(t, harnessOpts{
-		turns:      []faux.Turn{faux.ToolCall("ask_clarification", `{}`), faux.Text("never")},
-		tools:      []tool.Definition{clarify},
-		middleware: []middleware.Middleware{clarificationInterceptor{}},
+		turns:     []faux.Turn{faux.ToolCall("ask_clarification", `{}`), faux.Text("never")},
+		tools:     []tool.Definition{clarify},
+		auxiliary: []lifecycle.Handler{clarificationInterceptor{}},
 	})
 
 	res, err := h.run(context.Background(), "go")
@@ -700,7 +897,7 @@ func TestLoop_StopGateReinjectsAndBoundsRetries(t *testing.T) {
 
 	h := newHarness(t, harnessOpts{
 		turns: turns,
-		stopGate: stopGateFunc(func(context.Context, string, *middleware.State) (string, error) {
+		stopGate: stopGateFunc(func(context.Context, string, *lifecycle.State) (string, error) {
 			return "tests still failing", nil // 永远拦截
 		}),
 		limits: loop.Limits{MaxIterations: 20, StopReinjectionLimit: 2},
@@ -721,7 +918,7 @@ func TestLoop_StopGatePassThrough(t *testing.T) {
 
 	h := newHarness(t, harnessOpts{
 		turns: []faux.Turn{faux.Text("done")},
-		stopGate: stopGateFunc(func(context.Context, string, *middleware.State) (string, error) {
+		stopGate: stopGateFunc(func(context.Context, string, *lifecycle.State) (string, error) {
 			return "", nil // 放行
 		}),
 	})
@@ -741,7 +938,7 @@ func TestLoop_StopGateReinjectionAppearsInHistory(t *testing.T) {
 	var n atomic.Int64
 	h := newHarness(t, harnessOpts{
 		turns: []faux.Turn{faux.Text("first"), faux.Text("second")},
-		stopGate: stopGateFunc(func(context.Context, string, *middleware.State) (string, error) {
+		stopGate: stopGateFunc(func(context.Context, string, *lifecycle.State) (string, error) {
 			if n.Add(1) == 1 {
 				return "you forgot the tests", nil
 			}
@@ -834,7 +1031,7 @@ func TestLoop_AccumulatesUsageAcrossIterations(t *testing.T) {
 func TestNewRunner_RequiresSamplerAndExecutor(t *testing.T) {
 	t.Parallel()
 
-	chain, _ := middleware.NewChain(nil, middleware.ChainOptions{})
+	chain, _ := lifecycle.NewDispatcher(nil, lifecycle.DispatcherOptions{})
 	registry := tool.NewRegistry()
 
 	tests := []struct {
@@ -844,17 +1041,17 @@ func TestNewRunner_RequiresSamplerAndExecutor(t *testing.T) {
 	}{
 		{
 			name: "no sampler",
-			cfg:  loop.Config{Registry: registry, Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Chain: chain},
+			cfg:  loop.Config{Registry: registry, Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Lifecycle: chain},
 			want: "sampler",
 		},
 		{
 			name: "no executor",
-			cfg:  loop.Config{Sampler: loop.NewDirectSampler(faux.New()), Registry: registry, Chain: chain},
+			cfg:  loop.Config{Sampler: loop.NewDirectSampler(faux.New()), Registry: registry, Lifecycle: chain},
 			want: "executor",
 		},
 		{
 			name: "no registry",
-			cfg:  loop.Config{Sampler: loop.NewDirectSampler(faux.New()), Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Chain: chain},
+			cfg:  loop.Config{Sampler: loop.NewDirectSampler(faux.New()), Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Lifecycle: chain},
 			want: "registry",
 		},
 	}
@@ -938,23 +1135,33 @@ func (f compactorFunc) MaybeCompact(ctx context.Context, h *message.History) (bo
 	return f(ctx, h)
 }
 
+type trackedCompactor struct{}
+
+func (trackedCompactor) ShouldCompact(*message.History) bool { return true }
+func (trackedCompactor) MaybeCompact(context.Context, *message.History) (bool, error) {
+	return true, nil
+}
+
 type trimmerFunc func([]message.Message) []message.Message
 
 func (f trimmerFunc) Trim(msgs []message.Message) []message.Message { return f(msgs) }
 
-type resolverFunc func(*middleware.State) ([]string, []string)
+type resolverFunc func(*lifecycle.State) ([]string, []string)
 
-func (f resolverFunc) Resolve(st *middleware.State) ([]string, []string) { return f(st) }
+func (f resolverFunc) Resolve(_ context.Context, st *lifecycle.State) ([]string, []string, error) {
+	allow, disclosed := f(st)
+	return allow, disclosed, nil
+}
 
-type stopGateFunc func(context.Context, string, *middleware.State) (string, error)
+type stopGateFunc func(context.Context, string, *lifecycle.State) (string, error)
 
-func (f stopGateFunc) Evaluate(ctx context.Context, stopReason string, st *middleware.State) (string, error) {
+func (f stopGateFunc) Evaluate(ctx context.Context, stopReason string, st *lifecycle.State) (string, error) {
 	return f(ctx, stopReason, st)
 }
 
 type recordingPublisher struct{ published []string }
 
-func (p *recordingPublisher) PublishReply(_ context.Context, st *middleware.State, _ bool) {
+func (p *recordingPublisher) PublishReply(_ context.Context, st *lifecycle.State, _ bool) {
 	if st.ModelOutput != nil {
 		p.published = append(p.published, st.ModelOutput.Message.Content)
 	}
@@ -963,19 +1170,19 @@ func (p *recordingPublisher) PublishReply(_ context.Context, st *middleware.Stat
 type stageRecorder struct{ log *[]string }
 
 func (s *stageRecorder) Name() string { return "stageRecorder" }
-func (s *stageRecorder) BeforeAgent(context.Context, *middleware.State) error {
+func (s *stageRecorder) BeforeAgent(context.Context, *lifecycle.State) error {
 	*s.log = append(*s.log, "BeforeAgent")
 	return nil
 }
-func (s *stageRecorder) BeforeModel(context.Context, *middleware.State) error {
+func (s *stageRecorder) BeforeModel(context.Context, *lifecycle.State) error {
 	*s.log = append(*s.log, "BeforeModel")
 	return nil
 }
-func (s *stageRecorder) AfterModel(context.Context, *middleware.State) error {
+func (s *stageRecorder) AfterModel(context.Context, *lifecycle.State) error {
 	*s.log = append(*s.log, "AfterModel")
 	return nil
 }
-func (s *stageRecorder) AfterAgent(context.Context, *middleware.State) error {
+func (s *stageRecorder) AfterAgent(context.Context, *lifecycle.State) error {
 	*s.log = append(*s.log, "AfterAgent")
 	return nil
 }
@@ -984,7 +1191,7 @@ func (s *stageRecorder) AfterAgent(context.Context, *middleware.State) error {
 type rewriteReply struct{ to string }
 
 func (rewriteReply) Name() string { return "guardrailOutput" }
-func (r rewriteReply) AfterModel(_ context.Context, st *middleware.State) error {
+func (r rewriteReply) AfterModel(_ context.Context, st *lifecycle.State) error {
 	st.ModelOutput.Message.Content = r.to
 	st.History.ReplaceLastAssistant(st.ModelOutput.Message)
 	return nil
@@ -993,26 +1200,26 @@ func (r rewriteReply) AfterModel(_ context.Context, st *middleware.State) error 
 type stopAfterModel struct{}
 
 func (stopAfterModel) Name() string { return "stopper" }
-func (stopAfterModel) AfterModel(_ context.Context, st *middleware.State) error {
-	st.Directive = middleware.DirectiveStop
+func (stopAfterModel) AfterModel(_ context.Context, st *lifecycle.State) error {
+	st.Directive = lifecycle.DirectiveStop
 	return nil
 }
 
 type continueOnce struct{ fired bool }
 
 func (c *continueOnce) Name() string { return "schemaValidate" }
-func (c *continueOnce) AfterModel(_ context.Context, st *middleware.State) error {
+func (c *continueOnce) AfterModel(_ context.Context, st *lifecycle.State) error {
 	if !c.fired {
 		c.fired = true
-		st.Directive = middleware.DirectiveContinue
+		st.Directive = lifecycle.DirectiveContinue
 	}
 	return nil
 }
 
 type clarificationInterceptor struct{}
 
-func (clarificationInterceptor) Name() string { return middleware.TerminalName }
-func (clarificationInterceptor) BeforeTool(_ context.Context, st *middleware.State) (tool.Decision, error) {
+func (clarificationInterceptor) Name() string { return lifecycle.TerminalName }
+func (clarificationInterceptor) BeforeTool(_ context.Context, st *lifecycle.State) (tool.Decision, error) {
 	if st.ToolCall != nil && st.ToolCall.Name == "ask_clarification" {
 		return tool.Decision{EndTurn: true, Reason: "need input"}, nil
 	}

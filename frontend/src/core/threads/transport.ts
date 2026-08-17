@@ -1,5 +1,5 @@
 /**
- * SSE transport — streams events from the LangGraph backend using native
+ * SSE transport for the versioned Agent API using native
  * `fetch` + `ReadableStream`.  No SDK dependency.
  *
  * Supports:
@@ -8,7 +8,9 @@
  * - fetchActiveRun: Check if a thread has a running task
  */
 
-import { getLangGraphBaseURL } from "../config";
+import { getAgentAPIBaseURL } from "../config";
+
+import type { PendingUserQuestion } from "./types";
 
 export interface SSEEvent {
   event: string;
@@ -21,7 +23,6 @@ export interface StreamPayload {
   input: Record<string, unknown> | null | undefined;
   config?: Record<string, unknown>;
   context?: Record<string, unknown>;
-  command?: Record<string, unknown>;
   signal?: AbortSignal;
 }
 
@@ -45,7 +46,7 @@ async function* parseSSEStream(
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+      buffer = lines.pop() ?? "";
 
       let streamEnded = false;
 
@@ -82,15 +83,15 @@ async function* parseSSEStream(
 }
 
 /**
- * Create a new run and stream SSE events (POST /threads/{id}/runs/stream).
+ * Create a new run and stream SSE events (POST /threads/{id}/runs).
  */
 export async function* streamSSE(
   threadId: string,
   assistantId: string,
   payload: StreamPayload,
 ): AsyncGenerator<SSEEvent> {
-  const baseUrl = getLangGraphBaseURL();
-  const url = `${baseUrl}/threads/${threadId}/runs/stream`;
+  const baseUrl = getAgentAPIBaseURL();
+  const url = `${baseUrl}/threads/${threadId}/runs`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -106,9 +107,6 @@ export async function* streamSSE(
       input: payload.input,
       config: payload.config,
       context: payload.context,
-      command: payload.command,
-      stream_mode: ["values", "messages", "custom"],
-      stream_subgraphs: true,
       on_disconnect: "continue",
     }),
     signal: payload.signal,
@@ -124,7 +122,7 @@ export async function* streamSSE(
 }
 
 /**
- * Reconnect to an existing run's SSE stream (GET /threads/{id}/runs/{runId}/stream).
+ * Reconnect to an existing run's SSE stream (GET /threads/{id}/runs/{runId}/events).
  *
  * Used when:
  * - User switches away from a thread and comes back while the run is still active
@@ -137,8 +135,8 @@ export async function* reconnectSSE(
   signal?: AbortSignal,
   lastEventId?: string,
 ): AsyncGenerator<SSEEvent> {
-  const baseUrl = getLangGraphBaseURL();
-  const url = `${baseUrl}/threads/${threadId}/runs/${runId}/stream`;
+  const baseUrl = getAgentAPIBaseURL();
+  const url = `${baseUrl}/threads/${threadId}/runs/${runId}/events`;
 
   const headers: Record<string, string> = {
     Accept: "text/event-stream",
@@ -171,7 +169,7 @@ export async function* reconnectSSE(
 export async function fetchActiveRunId(
   threadId: string,
 ): Promise<string | null> {
-  const baseUrl = getLangGraphBaseURL();
+  const baseUrl = getAgentAPIBaseURL();
   const url = `${baseUrl}/threads/${threadId}/runs`;
 
   try {
@@ -188,5 +186,25 @@ export async function fetchActiveRunId(
     return active?.run_id ?? null;
   } catch {
     return null;
+  }
+}
+
+export async function answerUserQuestion(
+  question: PendingUserQuestion,
+  answer: { selected?: string[]; custom?: string; dismiss?: boolean },
+): Promise<void> {
+  const baseUrl = getAgentAPIBaseURL();
+  const response = await fetch(
+    `${baseUrl}/threads/${question.thread_id}/runs/${question.run_id}/questions/${question.id}/answer`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(answer),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => response.statusText);
+    throw new Error(`Question response failed (${response.status}): ${text}`);
   }
 }

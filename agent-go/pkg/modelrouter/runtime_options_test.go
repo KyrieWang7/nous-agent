@@ -5,10 +5,10 @@ import (
 	"testing"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/modelrouter"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 )
 
 func TestRuntimeOptionsUseSelectedNamedModelCapabilities(t *testing.T) {
@@ -218,10 +218,10 @@ func TestRuntimeOptionsDefaultThinkingMatchesPythonHarness(t *testing.T) {
 	}
 }
 
-func runtimeOptionsState(values map[string]any) *middleware.State {
+func runtimeOptionsState(values map[string]any) *lifecycle.State {
 	h := message.NewHistory()
 	h.Append(message.Message{Role: message.RoleUser, Content: "hi"})
-	st := middleware.NewState(middleware.StateInit{History: h})
+	st := lifecycle.NewState(lifecycle.StateInit{History: h})
 	for key, value := range values {
 		st.SetValue(key, value)
 	}

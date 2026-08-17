@@ -1,16 +1,28 @@
 package runtime
 
-import "context"
+import (
+	"context"
+
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+)
 
 type RunContext struct {
 	RunID       string
 	ParentRunID string
+	// GenerationID identifies the immutable capability assembly pinned for this
+	// run. Reloadable transports must keep the corresponding generation alive
+	// until the run releases it.
+	GenerationID string
 	// EventRunID identifies the root run whose SSE/event-store partition owns
 	// externally visible events. Child executions keep their own RunID for
 	// isolation and telemetry while publishing into the root run's stream.
-	EventRunID   string
-	ThreadID     string
-	AllowedTools []string
+	EventRunID          string
+	ThreadID            string
+	AllowedTools        []string
+	AllowedCapabilities []string
+	Capabilities        capability.View
+	AgentDepth          int
+	MaxRecursionDepth   int
 	// Values are the flattened run-scoped options used by nested runners. The
 	// map belongs to one run and must be cloned before a child mutates it.
 	Values map[string]any
@@ -23,10 +35,20 @@ type RunContext struct {
 	// parent's normal message channel.
 	SubagentTaskID string
 	Journal        *Journal
-	Bus            Bus
+	// StateMachine is the durable lifecycle authority for this run. Kernel
+	// execution requires it to be present and aligned with RunID and ThreadID.
+	StateMachine *RunStateMachine
+	// Budget is the hierarchical accounting ledger inherited by child runs.
+	Budget *BudgetLedger
+	// Approvals is the durable approval manager used by policy capabilities.
+	Approvals *ApprovalManager
+	// Questions is a human collaboration capability. It carries answers and
+	// feedback only; it must never be consulted as a permission grant.
+	Questions *QuestionManager
+	Bus       Bus
 	// Publish is the authoritative event path for a run. HTTP adapters use it
 	// to fan out to the live bus and durable replay store with one sequence.
-	Publish func(context.Context, Event) int64
+	Publish func(context.Context, Event) (int64, error)
 }
 type runContextKey struct{}
 

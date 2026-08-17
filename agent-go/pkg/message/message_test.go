@@ -72,49 +72,6 @@ func TestClone_DeepCopiesAdditionalKwargs(t *testing.T) {
 	}
 }
 
-func TestExtractSubagentStatusContract(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name, content, want string
-	}{
-		{"succeeded", "Task Succeeded. Result: ok", message.SubagentCompleted},
-		{"failed", "Task failed. Error: boom", message.SubagentFailed},
-		{"cancelled", "Task cancelled by user.", message.SubagentCancelled},
-		{"timed out", "Task timed out. Error: 900 seconds", message.SubagentTimedOut},
-		{"polling timed out", "Task polling timed out after 1 minutes", message.SubagentPollingTimedOut},
-		{"unknown", "Investigating ...", ""},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := message.ExtractSubagentStatus(tc.content)
-			if tc.want == "" {
-				if ok || got != "" {
-					t.Fatalf("status = %q, ok=%v, want no status", got, ok)
-				}
-				return
-			}
-			if !ok || got != tc.want {
-				t.Fatalf("status = %q, ok=%v, want %q", got, ok, tc.want)
-			}
-		})
-	}
-}
-
-func TestStampSubagentStatus(t *testing.T) {
-	t.Parallel()
-	msg := message.StampSubagentStatus(message.Message{
-		Role:    message.RoleTool,
-		Name:    "task",
-		Content: "Task failed. Error: underlying failure",
-	})
-	if got := msg.AdditionalKwargs[message.SubagentStatusKey]; got != message.SubagentFailed {
-		t.Fatalf("status = %v, want %q", got, message.SubagentFailed)
-	}
-	if got := msg.AdditionalKwargs[message.SubagentErrorKey]; got != "underlying failure" {
-		t.Fatalf("error = %v, want underlying failure", got)
-	}
-}
-
 func TestStartsToolTransaction(t *testing.T) {
 	t.Parallel()
 

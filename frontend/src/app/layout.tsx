@@ -9,7 +9,8 @@ import { detectLocaleServer } from "@/core/i18n/server";
 
 export const metadata: Metadata = {
   title: "Nous Agent",
-  description: "An open-source AI agent platform powered by LangGraph.",
+  description:
+    "An open-source AI agent platform powered by Nous Agent Runtime.",
   icons: {
     icon: "/icon.png?v=nous-logo-1",
     apple: "/icon.png?v=nous-logo-1",
@@ -39,9 +40,7 @@ export default async function RootLayout({
           enableSystem={false}
           disableTransitionOnChange
         >
-          <I18nProvider initialLocale={locale}>
-            {children}
-          </I18nProvider>
+          <I18nProvider initialLocale={locale}>{children}</I18nProvider>
         </ThemeProvider>
       </body>
     </html>

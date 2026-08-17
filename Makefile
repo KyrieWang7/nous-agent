@@ -1,15 +1,11 @@
 # Nous Agent development commands. The Go stack is the default product path.
 
-.PHONY: install install-legacy dev dev-go backend stop logs compose-config \
+.PHONY: install dev dev-go backend stop logs compose-config \
 	agent agent-go agent-local gateway gateway-go gateway-local frontend \
-	dev-legacy legacy-backend legacy-agent legacy-gateway stop-legacy logs-legacy \
-	migrate migrate-current migrate-down legacy-migrate legacy-migrate-current \
-	legacy-migrate-down legacy-migrate-new build clean help
+	migrate migrate-current migrate-down build clean help
 
 GATEWAY_BASE_URL ?= http://127.0.0.1:7777
 HARNESS_BASE_URL ?= http://127.0.0.1:7776
-LEGACY_GATEWAY_BASE_URL ?= http://127.0.0.1:17777
-LEGACY_HARNESS_BASE_URL ?= http://127.0.0.1:17776
 
 # -----------------------------------------------------------------------------
 # Primary Go development path
@@ -62,32 +58,6 @@ frontend: ## Start the frontend locally on :7775 against the Go stack
 	cd frontend && GATEWAY_BASE_URL=$(GATEWAY_BASE_URL) HARNESS_BASE_URL=$(HARNESS_BASE_URL) npm run dev
 
 # -----------------------------------------------------------------------------
-# Legacy Python compatibility path
-# -----------------------------------------------------------------------------
-
-install-legacy: ## Install Python Harness and Gateway dependencies
-	cd agent && uv sync
-	cd gateway && uv sync
-
-dev-legacy: legacy-backend ## Start legacy Python backend and frontend on :7775
-	cd frontend && GATEWAY_BASE_URL=$(LEGACY_GATEWAY_BASE_URL) HARNESS_BASE_URL=$(LEGACY_HARNESS_BASE_URL) npm run dev
-
-legacy-backend: ## Start legacy Python Harness (:17776) and Gateway (:17777)
-	docker compose --profile legacy up -d --build agent gateway
-
-legacy-agent: ## Start only the legacy Python Harness
-	docker compose --profile legacy up -d --build agent
-
-legacy-gateway: ## Start only the legacy Python Gateway
-	docker compose --profile legacy up -d --build gateway
-
-stop-legacy: ## Stop legacy Python services
-	docker compose --profile legacy stop agent gateway
-
-logs-legacy: ## Follow legacy Python backend logs
-	docker compose --profile legacy logs -f agent gateway
-
-# -----------------------------------------------------------------------------
 # Database migrations
 # -----------------------------------------------------------------------------
 
@@ -99,18 +69,6 @@ migrate-current: ## Show the Go runtime migration version
 
 migrate-down: ## Roll back one Go runtime migration
 	docker compose run --rm --build agent-go go run ./cmd/agentctl migrate down --steps 1
-
-legacy-migrate: ## Apply legacy Python migrations
-	cd agent && uv run alembic upgrade head
-
-legacy-migrate-current: ## Show the legacy Python migration revision
-	cd agent && uv run alembic current
-
-legacy-migrate-down: ## Roll back one legacy Python migration
-	cd agent && uv run alembic downgrade -1
-
-legacy-migrate-new: ## Create a legacy migration: make legacy-migrate-new m="add table"
-	cd agent && uv run alembic revision -m "$(m)"
 
 # -----------------------------------------------------------------------------
 # Build and cleanup

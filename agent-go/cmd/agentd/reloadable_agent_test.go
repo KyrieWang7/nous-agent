@@ -7,10 +7,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 )
 
 type reloadTestAgent struct {
@@ -19,14 +19,14 @@ type reloadTestAgent struct {
 	release <-chan struct{}
 }
 
-func (a reloadTestAgent) Run(context.Context, langgraphapi.AgentRequest) (langgraphapi.AgentResult, error) {
+func (a reloadTestAgent) Run(context.Context, runmanager.AgentRequest) (runmanager.AgentResult, error) {
 	if a.started != nil {
 		a.started <- struct{}{}
 	}
 	if a.release != nil {
 		<-a.release
 	}
-	return langgraphapi.AgentResult{Output: a.output}, nil
+	return runmanager.AgentResult{Output: a.output}, nil
 }
 
 func TestReloadableAgentBuildsNextRunFromChangedConfig(t *testing.T) {
@@ -47,12 +47,12 @@ func TestReloadableAgentBuildsNextRunFromChangedConfig(t *testing.T) {
 	}
 	defer reloader.Close()
 
-	first, err := reloader.Run(context.Background(), langgraphapi.AgentRequest{})
+	first, err := reloader.Run(context.Background(), runmanager.AgentRequest{})
 	if err != nil || first.Output != "one" {
 		t.Fatalf("first run = %#v, err = %v", first, err)
 	}
 	writeReloadConfig(t, path, "two")
-	second, err := reloader.Run(context.Background(), langgraphapi.AgentRequest{})
+	second, err := reloader.Run(context.Background(), runmanager.AgentRequest{})
 	if err != nil || second.Output != "two" {
 		t.Fatalf("second run = %#v, err = %v", second, err)
 	}
@@ -93,12 +93,12 @@ func TestReloadableAgentDefersCloseUntilActiveRunEnds(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, runErr := reloader.Run(context.Background(), langgraphapi.AgentRequest{})
+		_, runErr := reloader.Run(context.Background(), runmanager.AgentRequest{})
 		done <- runErr
 	}()
 	<-started
 	writeReloadConfig(t, path, "two")
-	if _, err := reloader.Run(context.Background(), langgraphapi.AgentRequest{}); err != nil {
+	if _, err := reloader.Run(context.Background(), runmanager.AgentRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	if closes.Load() != 0 {
@@ -131,7 +131,7 @@ func TestReloadableAgentRejectsProcessLevelConfigChange(t *testing.T) {
 	defer reloader.Close()
 
 	writeReloadConfigWithAddress(t, path, "one", ":9999")
-	if _, err := reloader.Run(context.Background(), langgraphapi.AgentRequest{}); err == nil {
+	if _, err := reloader.Run(context.Background(), runmanager.AgentRequest{}); err == nil {
 		t.Fatal("server address change was accepted without restart")
 	}
 }
@@ -164,7 +164,7 @@ func TestReloadableAgentCanSwitchCatalogDirectories(t *testing.T) {
 	defer reloader.Close()
 
 	writeReloadConfigWithSkills(t, path, "two", secondCatalog)
-	result, err := reloader.Run(context.Background(), langgraphapi.AgentRequest{})
+	result, err := reloader.Run(context.Background(), runmanager.AgentRequest{})
 	if err != nil || result.Output != "two" {
 		t.Fatalf("run after catalog switch = %#v, err = %v", result, err)
 	}

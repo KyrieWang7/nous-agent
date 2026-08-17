@@ -152,6 +152,36 @@ func TestEventStore_Contract(t *testing.T) {
 	}
 }
 
+func TestMemoryEventStoreDeduplicatesIdempotencyKeyAndSequence(t *testing.T) {
+	s := runtime.NewMemoryEventStore()
+	first := runtime.MustEvent("run-1", "thread-1", runtime.EventToolStart, nil)
+	first.Seq = 1
+	first.IdempotencyKey = "tool:call-1:start"
+	duplicateKey := first
+	duplicateKey.Data = []byte(`{"changed":true}`)
+	duplicateSeq := runtime.MustEvent("run-1", "thread-1", runtime.EventToolResult, nil)
+	duplicateSeq.Seq = 1
+	if err := s.PutBatch(context.Background(), []runtime.Event{first, duplicateKey, duplicateSeq}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(context.Background(), "run-1", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].IdempotencyKey != first.IdempotencyKey {
+		t.Fatalf("stored events = %+v", got)
+	}
+}
+
+func TestMemoryEventStoreReportsSequenceHighWaterMark(t *testing.T) {
+	store := runtime.NewMemoryEventStore()
+	seed(t, store, "run-1", 7)
+	last, err := store.LastSeq(context.Background(), "run-1")
+	if err != nil || last != 7 {
+		t.Fatalf("LastSeq() = %d, %v; want 7", last, err)
+	}
+}
+
 // --- Replay 分页 ---
 
 // token 级流式一轮就能产生上千条 delta。单次取一页或设总量上限会静默截断，

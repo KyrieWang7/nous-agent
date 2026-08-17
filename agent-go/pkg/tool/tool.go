@@ -1,7 +1,7 @@
 // Package tool 定义工具的声明、注册与执行。
 //
-// 本包不认识中间件：BeforeTool/AfterTool 的介入通过 Interceptor 这个窄接口进入，
-// 由 pkg/middleware 提供适配器。依赖方向是 middleware → tool，不可反向
+// 本包不认识 lifecycle 实现：BeforeTool/AfterTool 通过 Interceptor 窄接口进入，
+// 由 runtime/lifecycle 提供适配器。依赖方向是 lifecycle → tool，不可反向。
 // （设计文档 §2 依赖纪律）。
 package tool
 
@@ -15,16 +15,16 @@ import (
 
 // Metadata 描述工具的执行特征。并发分段与权限判定都读它（设计文档 §7.1、§7.2）。
 type Metadata struct {
-	// RequiredPermission is an optional minimum permission mode. It is kept as
-	// a string so tool remains independent of pkg/permission.
-	RequiredPermission string
+	// RequiredSandboxMode is an optional minimum sandbox mode. It remains a
+	// string so tool stays independent of pkg/permission.
+	RequiredSandboxMode string
 
 	// IsReadOnly 表示该工具不修改任何状态。
 	IsReadOnly bool
 
 	// IsAgentState marks orchestration state owned by the Harness itself (for
 	// example task and Swarm lifecycle records). These writes do not escape to
-	// the user's filesystem, so workspace_write may allow them without treating
+	// the user's filesystem, so workspace-write may allow them without treating
 	// arbitrary external side effects as workspace changes.
 	IsAgentState bool
 
@@ -69,7 +69,7 @@ type Result struct {
 	IsError       bool
 	Artifacts     []Artifact
 	// AdditionalKwargs is persisted alongside the tool message and projected
-	// unchanged to the LangGraph-compatible wire format. It is intentionally
+	// unchanged to the HTTP event stream. It is intentionally
 	// generic because provider/UI contracts (for example the subagent status
 	// contract) should not make the tool package depend on a specific consumer.
 	AdditionalKwargs map[string]any
@@ -78,7 +78,7 @@ type Result struct {
 // Handler 执行一次工具调用。
 //
 // 返回的 error 表示"执行框架层面出错"（沙箱不可用、参数无法解析），
-// 由 ToolErrorHandling 中间件转成 error Result。工具的业务失败应走 Result.IsError。
+// 由 ToolErrorHandling handler 转成 error Result。工具的业务失败应走 Result.IsError。
 type Handler func(ctx context.Context, call Call) (*Result, error)
 
 // Definition 是一个工具的完整声明。
@@ -132,10 +132,10 @@ type Decision struct {
 	Args json.RawMessage
 }
 
-// Interceptor 是执行器与中间件链之间的窄接口。
+// Interceptor 是执行器与 lifecycle dispatcher 之间的窄接口。
 //
-// pkg/tool 不 import pkg/middleware：后者的 State 持有 tool.Result，
-// 反向依赖会成环。由 pkg/middleware 提供实现此接口的适配器。
+// pkg/tool 不 import runtime/lifecycle：后者的 State 持有 tool.Result，
+// 反向依赖会成环。由 runtime/lifecycle 提供实现此接口的适配器。
 type Interceptor interface {
 	// BeforeTool 在工具执行前介入，可拒绝、改写入参或结束回合。
 	BeforeTool(ctx context.Context, call Call) (Decision, error)

@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/migrations"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	runtimepostgres "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/postgres"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ory/dockertest/v3"
 )
@@ -99,15 +99,15 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(built.Close)
-	postgresStore, err := langgraphapi.NewPostgresStore(pool)
+	postgresStore, err := httpapi.NewPostgresStore(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	postgresEvents, err := runtime.NewPostgresEventStore(pool)
+	postgresEvents, err := runtimepostgres.NewEventStore(pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	api, err := langgraphapi.New(langgraphapi.Options{
+	api, err := httpapi.New(httpapi.Options{
 		Agent: built.agent, Store: postgresStore, EventStore: postgresEvents,
 		AllowedTools: built.tools, Pricer: buildPricer(cfg.Models),
 	})

@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 )
 
 const (
-	// NameRuntimeOptions is the middleware identity used by declarative chains.
+	// NameRuntimeOptions is the handler identity used by lifecycle composition.
 	NameRuntimeOptions = "modelRuntimeOptions"
 
 	ValueModelName       = "model_name"
@@ -23,55 +23,59 @@ const (
 //
 // Construct it from the same Router used by the loop so capability decisions
 // and sampling cannot resolve different named models. BeforeAgent publishes
-// vision support early enough for ViewImage regardless of middleware order;
+// vision support early enough for ViewImage regardless of handler order;
 // BeforeModel applies request fields after the loop has built ModelInput.
 type RuntimeOptions struct {
 	router *Router
 }
 
-// RuntimeOptions returns middleware backed by this router's model catalog.
+// RuntimeOptions returns a lifecycle handler backed by this router's catalog.
 func (r *Router) RuntimeOptions() *RuntimeOptions {
 	return &RuntimeOptions{router: r}
 }
 
 func (*RuntimeOptions) Name() string { return NameRuntimeOptions }
 
-func (o *RuntimeOptions) BeforeAgent(_ context.Context, st *middleware.State) error {
-	return o.applyPreferred(st)
+func (o *RuntimeOptions) BeforeAgent(ctx context.Context, st *lifecycle.State) error {
+	return o.applyPreferred(ctx, st)
 }
 
-func (o *RuntimeOptions) BeforeModel(_ context.Context, st *middleware.State) error {
-	return o.applyPreferred(st)
+func (o *RuntimeOptions) BeforeModel(ctx context.Context, st *lifecycle.State) error {
+	return o.applyPreferred(ctx, st)
 }
 
-func (o *RuntimeOptions) applyPreferred(st *middleware.State) error {
+func (o *RuntimeOptions) applyPreferred(ctx context.Context, st *lifecycle.State) error {
 	if o == nil || o.router == nil {
 		return fmt.Errorf("modelrouter: runtime options require a router")
 	}
 	if st == nil {
 		return fmt.Errorf("modelrouter: runtime options require state")
 	}
-	m, err := o.router.preferredModel(st)
+	m, err := o.router.preferredModel(ctx, st)
 	if err != nil {
 		return err
 	}
 	return applyRuntimeOptions(st, m)
 }
 
-func (r *Router) preferredModel(st *middleware.State) (model.Model, error) {
+func (r *Router) preferredModel(ctx context.Context, st *lifecycle.State) (model.Model, error) {
 	if name := selectedModelName(st); name != "" {
-		return r.namedModel(name)
+		configured, err := r.namedModel(name)
+		if err != nil {
+			return nil, err
+		}
+		return r.resolveModel(ctx, st, r.cfg.NamedCapabilities[name], configured)
 	}
 
 	for _, tier := range r.chainFor(r.tierFor(st)) {
-		if m, ok := r.cfg.Models[tier]; ok {
-			return m, nil
+		if configured, ok := r.cfg.Models[tier]; ok {
+			return r.resolveModel(ctx, st, r.cfg.TierCapabilities[tier], configured)
 		}
 	}
 	return nil, ErrUnavailable
 }
 
-func applyRuntimeOptions(st *middleware.State, m model.Model) error {
+func applyRuntimeOptions(st *lifecycle.State, m model.Model) error {
 	if st == nil {
 		return fmt.Errorf("modelrouter: runtime options require state")
 	}
@@ -108,7 +112,7 @@ func applyRuntimeOptions(st *middleware.State, m model.Model) error {
 	return nil
 }
 
-func thinkingEnabled(st *middleware.State) (bool, error) {
+func thinkingEnabled(st *lifecycle.State) (bool, error) {
 	value, ok := st.Value(ValueThinkingEnabled)
 	if !ok || value == nil {
 		// Match the Python harness: thinking is enabled by default and then
@@ -122,7 +126,7 @@ func thinkingEnabled(st *middleware.State) (bool, error) {
 	return enabled, nil
 }
 
-func reasoningEffort(st *middleware.State) (string, error) {
+func reasoningEffort(st *lifecycle.State) (string, error) {
 	value, ok := st.Value(ValueReasoningEffort)
 	if !ok || value == nil {
 		return "", nil

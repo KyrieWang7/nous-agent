@@ -402,7 +402,12 @@ func TestClientDisconnected_UnknownRunIsNoop(t *testing.T) {
 func TestRunStatus_Terminal(t *testing.T) {
 	t.Parallel()
 
-	terminal := []runtime.RunStatus{runtime.StatusCompleted, runtime.StatusCancelled, runtime.StatusFailed}
+	terminal := []runtime.RunStatus{
+		runtime.StatusCompleted,
+		runtime.StatusCancelled,
+		runtime.StatusFailed,
+		runtime.StatusInterrupted,
+	}
 	for _, s := range terminal {
 		if !s.Terminal() {
 			t.Errorf("%q.Terminal() = false", s)

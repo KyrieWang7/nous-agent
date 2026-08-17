@@ -9,18 +9,18 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/modelrouter"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 )
 
 // newState 构造一个已经组装好 ModelInput 的 State。
-func newState(msgs ...message.Message) *middleware.State {
+func newState(msgs ...message.Message) *lifecycle.State {
 	h := message.NewHistory()
 	h.Load(msgs)
 
-	st := middleware.NewState(middleware.StateInit{History: h})
+	st := lifecycle.NewState(lifecycle.StateInit{History: h})
 	st.ModelInput = &model.Request{Messages: h.All()}
 	return st
 }
@@ -105,7 +105,7 @@ func TestSample_RequiresModelInput(t *testing.T) {
 		modelrouter.TierStandard: faux.New(faux.Text("x")),
 	}})
 
-	st := middleware.NewState(middleware.StateInit{History: message.NewHistory()})
+	st := lifecycle.NewState(lifecycle.StateInit{History: message.NewHistory()})
 	if _, _, err := r.Sample(context.Background(), st); err == nil {
 		t.Fatal("Sample() without a model input succeeded")
 	}
@@ -642,7 +642,7 @@ func TestSample_StreamingObserverReceivesDeltas(t *testing.T) {
 			modelrouter.TierStandard: faux.New(faux.Text("abcdefgh")),
 		},
 		Stream: true,
-		OnStreamEvent: func(_ context.Context, _ *middleware.State, ev model.StreamEvent) {
+		OnStreamEvent: func(_ context.Context, _ *lifecycle.State, ev model.StreamEvent) {
 			if ev.Type == model.StreamTextDelta {
 				deltas = append(deltas, ev.Delta)
 			}

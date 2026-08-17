@@ -12,6 +12,14 @@ import (
 const modulePath = "github.com/KyrieWang7/nous-agent/agent-go"
 
 func main() {
+	if err := rejectRemovedDirectories("pkg/middleware"); err != nil {
+		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
+		os.Exit(1)
+	}
+	if err := rejectRemovedFiles("internal/transport/httpapi/harness.go"); err != nil {
+		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
+		os.Exit(1)
+	}
 	deps, err := loadDeps()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
@@ -32,6 +40,32 @@ func main() {
 	os.Exit(1)
 }
 
+func rejectRemovedFiles(paths ...string) error {
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		switch {
+		case err == nil && !info.IsDir():
+			return fmt.Errorf("removed architecture file %s exists", path)
+		case err == nil:
+			return fmt.Errorf("removed architecture path %s exists as a directory", path)
+		case !os.IsNotExist(err):
+			return fmt.Errorf("checking removed architecture file %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func rejectRemovedDirectories(paths ...string) error {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("removed architecture directory %s exists", path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("checking removed architecture directory %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
 // goListPackage 是 `go list -json` 输出里我们关心的部分。
 type goListPackage struct {
 	ImportPath string   `json:"ImportPath"`
@@ -39,7 +73,9 @@ type goListPackage struct {
 	Standard   bool     `json:"Standard"`
 }
 
-// loadDeps 返回本模块内每个包 → 其模块内全部（含间接）依赖。
+// loadDeps 返回本模块内每个包 → 其全部（含间接）依赖。模块内依赖使用
+// 相对路径，标准库和第三方依赖放入 external/ 命名空间，避免把标准库的
+// internal/* 误认成本模块 internal/*，同时允许规则识别具体外部依赖。
 func loadDeps() (map[string][]string, error) {
 	cmd := exec.Command("go", "list", "-deps=false", "-json", "./...")
 	out, err := cmd.Output()
@@ -66,13 +102,15 @@ func loadDeps() (map[string][]string, error) {
 			continue
 		}
 
-		var localDeps []string
+		var packageDeps []string
 		for _, d := range p.Deps {
 			if rel := relative(d); rel != "" {
-				localDeps = append(localDeps, rel)
+				packageDeps = append(packageDeps, rel)
+			} else {
+				packageDeps = append(packageDeps, "external/"+d)
 			}
 		}
-		deps[local] = localDeps
+		deps[local] = packageDeps
 	}
 
 	if len(deps) == 0 {

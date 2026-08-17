@@ -1,8 +1,7 @@
 /**
  * Message types for the chat thread.
  *
- * These are plain TypeScript interfaces derived from the LangGraph wire
- * protocol so that the frontend does not depend on any SDK at runtime.
+ * These plain TypeScript interfaces define the Agent API message projection.
  */
 
 export type ImageDetail = "auto" | "low" | "high";

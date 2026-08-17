@@ -201,19 +201,42 @@ func (f *remoteFS) WriteFile(ctx context.Context, filename string, data []byte) 
 }
 
 func (f *remoteFS) List(ctx context.Context, filename string) ([]sandbox.Entry, error) {
+	entries, _, err := f.list(ctx, filename, 0)
+	return entries, err
+}
+
+func (f *remoteFS) ListLimit(ctx context.Context, filename string, limit int) ([]sandbox.Entry, bool, error) {
+	if limit <= 0 {
+		return nil, false, errors.New("remote sandbox: list limit must be positive")
+	}
+	return f.list(ctx, filename, limit)
+}
+
+func (f *remoteFS) list(ctx context.Context, filename string, limit int) ([]sandbox.Entry, bool, error) {
 	resolved, err := f.Resolve(filename)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var response struct {
 		Entries []remoteEntry `json:"entries"`
 	}
-	err = f.handle.provider.call(ctx, http.MethodPost, f.handle.endpoint("/fs/list"), map[string]any{"path": resolved}, &response)
+	requestLimit := limit
+	if requestLimit > 0 {
+		requestLimit++
+	}
+	err = f.handle.provider.call(ctx, http.MethodPost, f.handle.endpoint("/fs/list"), map[string]any{"path": resolved, "limit": requestLimit}, &response)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := limit > 0 && len(response.Entries) > limit
+	if truncated {
+		response.Entries = response.Entries[:limit]
+	}
 	entries := make([]sandbox.Entry, 0, len(response.Entries))
 	for _, entry := range response.Entries {
 		entries = append(entries, entry.sandboxEntry())
 	}
-	return entries, err
+	return entries, truncated, nil
 }
 
 func (f *remoteFS) Stat(ctx context.Context, filename string) (sandbox.Entry, error) {

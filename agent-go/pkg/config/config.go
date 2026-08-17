@@ -24,6 +24,7 @@ type Config struct {
 	DefaultModel  string                    `yaml:"default_model"`
 	Sandbox       SandboxConfig             `yaml:"sandbox"`
 	Permissions   PermissionConfig          `yaml:"permissions"`
+	Plan          PlanConfig                `yaml:"plan"`
 	Loop          LoopConfig                `yaml:"loop"`
 	Runtime       RuntimeConfig             `yaml:"runtime"`
 	Skills        SkillsConfig              `yaml:"skills"`
@@ -88,8 +89,13 @@ type SandboxConfig struct {
 	RemoteHeaders map[string]string `yaml:"remote_headers"`
 }
 type PermissionConfig struct {
-	Mode          permission.Mode            `yaml:"mode"`
-	ToolOverrides map[string]permission.Mode `yaml:"tool_overrides"`
+	Preset        permission.Preset                           `yaml:"preset"`
+	Presets       map[permission.Preset]permission.PresetSpec `yaml:"presets"`
+	PromptTimeout time.Duration                               `yaml:"prompt_timeout"`
+	ApprovalTTL   time.Duration                               `yaml:"approval_ttl"`
+}
+type PlanConfig struct {
+	Guidance string `yaml:"guidance"`
 }
 type LoopConfig struct {
 	MaxIterations        int           `yaml:"max_iterations"`
@@ -98,7 +104,10 @@ type LoopConfig struct {
 	ToolConcurrency      int           `yaml:"tool_concurrency"`
 	TokenBudget          int           `yaml:"token_budget"`
 	CostBudgetMicros     int64         `yaml:"cost_budget_micros"`
-	MiddlewareTimeout    time.Duration `yaml:"middleware_timeout"`
+	ToolCallBudget       int           `yaml:"tool_call_budget"`
+	SubagentBudget       int           `yaml:"subagent_budget"`
+	MaxRecursionDepth    int           `yaml:"max_recursion_depth"`
+	LifecycleTimeout     time.Duration `yaml:"lifecycle_timeout"`
 }
 type RuntimeConfig struct {
 	EventBufferSize   int           `yaml:"event_buffer_size"`
@@ -205,10 +214,13 @@ type HookConfig struct {
 
 func Defaults() Config {
 	return Config{
-		Server:        ServerConfig{Address: ":7776"},
-		Sandbox:       SandboxConfig{Enabled: true, Provider: "local", ExecTimeout: 30 * time.Second},
-		Permissions:   PermissionConfig{Mode: permission.ModeWorkspaceWrite},
-		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, MiddlewareTimeout: 30 * time.Second},
+		Server:      ServerConfig{Address: ":7776"},
+		Sandbox:     SandboxConfig{Enabled: true, Provider: "local", ExecTimeout: 30 * time.Second},
+		Permissions: PermissionConfig{Preset: permission.PresetWorkspaceWrite},
+		Plan: PlanConfig{Guidance: "You are in plan mode. Explore the problem, identify constraints, and maintain a concrete plan without implementing it. " +
+			"When the plan is complete, call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
+			"Do not begin implementation until the user approves the plan; if they keep planning, revise it using their feedback and present it again."},
+		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, ToolCallBudget: 200, SubagentBudget: 20, MaxRecursionDepth: 1, LifecycleTimeout: 30 * time.Second},
 		Runtime:       RuntimeConfig{EventBufferSize: 500, EventTTL: 24 * time.Hour, HeartbeatInterval: 15 * time.Second},
 		Subagents:     SubagentConfig{Enabled: true, MaxConcurrent: 3, MaxTurns: 50, TaskTTL: 24 * time.Hour, Timeout: 15 * time.Minute},
 		Memory:        MemoryConfig{MaxFacts: 50, ConfidenceThreshold: .7, InjectionTokens: 1000},
@@ -337,8 +349,14 @@ func (c *Config) Validate(providers []string) error {
 	} else if _, ok := seen[c.DefaultModel]; !ok {
 		return fmt.Errorf("config: default_model %q is not declared", c.DefaultModel)
 	}
-	if c.Permissions.Mode != "" && !c.Permissions.Mode.Valid() {
-		return fmt.Errorf("config: invalid permission mode %q", c.Permissions.Mode)
+	if _, err := permission.NewPolicy(permission.Config{Preset: c.Permissions.Preset, Presets: c.Permissions.Presets}); err != nil {
+		return fmt.Errorf("config: invalid permission policy: %w", err)
+	}
+	if c.Permissions.PromptTimeout < 0 || c.Permissions.ApprovalTTL < 0 {
+		return errors.New("config: permissions prompt_timeout and approval_ttl cannot be negative")
+	}
+	if strings.TrimSpace(c.Plan.Guidance) == "" {
+		return errors.New("config: plan.guidance is required")
 	}
 	if c.Loop.TokenBudget < 0 || c.Loop.CostBudgetMicros < 0 {
 		return errors.New("config: loop token_budget and cost_budget_micros cannot be negative")
@@ -386,6 +404,15 @@ func (c *Config) Validate(providers []string) error {
 	}
 	if c.Subagents.MaxConcurrent <= 0 || c.Subagents.MaxConcurrent > 4 {
 		return errors.New("config: subagents.max_concurrent must be between 1 and 4")
+	}
+	if c.Loop.ToolCallBudget <= 0 {
+		return errors.New("config: loop.tool_call_budget must be greater than zero")
+	}
+	if c.Loop.SubagentBudget <= 0 {
+		return errors.New("config: loop.subagent_budget must be greater than zero")
+	}
+	if c.Loop.MaxRecursionDepth <= 0 {
+		return errors.New("config: loop.max_recursion_depth must be greater than zero")
 	}
 	if c.Subagents.MaxTurns <= 0 || c.Subagents.MaxTurns > 100 {
 		return errors.New("config: subagents.max_turns must be between 1 and 100")

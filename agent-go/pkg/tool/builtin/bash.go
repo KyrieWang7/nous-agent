@@ -13,7 +13,7 @@ import (
 
 // Bash 返回命令执行工具。
 //
-// 它不做命令内容的安全判定 —— 那归 SandboxAudit 中间件与 pkg/permission。
+// 它不做命令内容的安全判定 —— 那归 SandboxAudit lifecycle handler 与 pkg/permission。
 // 本工具只负责在沙箱里执行并如实回报结果（设计文档 §2 依赖纪律）。
 func Bash() tool.Definition {
 	return tool.Definition{

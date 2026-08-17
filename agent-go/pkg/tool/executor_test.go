@@ -299,6 +299,54 @@ func TestExecutor_UnknownToolBecomesErrorResult(t *testing.T) {
 	}
 }
 
+type recordingTransactionObserver struct {
+	starts int
+	ends   int
+	denies int
+}
+
+type recordingTransaction struct{ observer *recordingTransactionObserver }
+
+func (o *recordingTransactionObserver) Start(context.Context, tool.Call) (tool.Transaction, error) {
+	o.starts++
+	return &recordingTransaction{observer: o}, nil
+}
+
+func (t *recordingTransaction) Finish(*tool.Result, error) error {
+	t.observer.ends++
+	return nil
+}
+
+func (t *recordingTransaction) Deny(string) error {
+	t.observer.denies++
+	return nil
+}
+
+func (t *recordingTransaction) Cancel(error) error { return nil }
+
+func TestExecutor_TransactionObserverWrapsExecutionAndDeny(t *testing.T) {
+	r := tool.NewRegistry()
+	mustRegister(t, r, def("echo", nil2))
+	ex := tool.NewExecutor(r, tool.ExecutorOptions{})
+	observer := &recordingTransactionObserver{}
+	ctx := tool.WithTransactionObserver(context.Background(), observer)
+	if _, err := ex.Run(ctx, []tool.Call{call("1", "echo")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if observer.starts != 1 || observer.ends != 1 {
+		t.Fatalf("observer counts after execution = starts %d ends %d", observer.starts, observer.ends)
+	}
+	deny := &fakeInterceptor{before: func(context.Context, tool.Call) (tool.Decision, error) {
+		return tool.Decision{Deny: true, Reason: "approval required"}, nil
+	}}
+	if _, err := ex.Run(ctx, []tool.Call{call("2", "echo")}, deny); err != nil {
+		t.Fatal(err)
+	}
+	if observer.starts != 2 || observer.denies != 1 || observer.ends != 1 {
+		t.Fatalf("observer counts after deny = starts %d ends %d denies %d", observer.starts, observer.ends, observer.denies)
+	}
+}
+
 func TestExecutor_ContextCancellationStopsRemainingSegments(t *testing.T) {
 	t.Parallel()
 

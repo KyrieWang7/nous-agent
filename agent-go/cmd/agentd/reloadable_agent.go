@@ -11,9 +11,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 )
 
 type agentBuilder func(config.Config) (builtAgent, error)
@@ -71,10 +71,10 @@ func newReloadableAgent(configPath string, cfg config.Config, initial builtAgent
 	}, nil
 }
 
-func (a *reloadableAgent) Run(ctx context.Context, req langgraphapi.AgentRequest) (langgraphapi.AgentResult, error) {
+func (a *reloadableAgent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager.AgentResult, error) {
 	prepared, err := a.PrepareRun()
 	if err != nil {
-		return langgraphapi.AgentResult{}, err
+		return runmanager.AgentResult{}, err
 	}
 	defer prepared.Release()
 	if run, ok := runtime.RunContextFrom(ctx); ok {
@@ -85,14 +85,17 @@ func (a *reloadableAgent) Run(ctx context.Context, req langgraphapi.AgentRequest
 	return prepared.Agent.Run(ctx, req)
 }
 
-func (a *reloadableAgent) PrepareRun() (langgraphapi.PreparedRun, error) {
+func (a *reloadableAgent) PrepareRun() (runmanager.PreparedRun, error) {
 	generation, err := a.acquire()
 	if err != nil {
-		return langgraphapi.PreparedRun{}, err
+		return runmanager.PreparedRun{}, err
 	}
-	return langgraphapi.PreparedRun{
+	return runmanager.PreparedRun{
 		Agent: generation.built.agent, AllowedTools: append([]string(nil), generation.built.tools...),
-		Pricer: generation.built.pricer, Release: func() { a.release(generation) },
+		Pricer: generation.built.pricer, BudgetLimits: generation.built.budget,
+		AllowedCapabilities: append([]string(nil), generation.built.capabilities...),
+		MaxRecursionDepth:   generation.built.maxDepth,
+		Release:             func() { a.release(generation) },
 	}, nil
 }
 

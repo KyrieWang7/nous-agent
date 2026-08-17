@@ -12,8 +12,8 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/harness"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/faux"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -80,8 +80,8 @@ func TestM0_FullTurnWithToolCall(t *testing.T) {
 	}
 }
 
-// 中间件链、工具执行、内核三者协作：权限式拒绝让工具不执行且模型能改换方案。
-func TestM0_DenyingMiddlewarePreventsExecutionAndModelRecovers(t *testing.T) {
+// Lifecycle dispatcher、工具执行、内核三者协作：权限式拒绝让工具不执行且模型能改换方案。
+func TestM0_DenyingLifecycleHandlerPreventsExecutionAndModelRecovers(t *testing.T) {
 	t.Parallel()
 
 	var toolArgs []string
@@ -91,9 +91,9 @@ func TestM0_DenyingMiddlewarePreventsExecutionAndModelRecovers(t *testing.T) {
 			faux.ToolCall("ls", `{"path":"/etc"}`),
 			faux.Text("I cannot read that path, so here is what I can tell you."),
 		),
-		Tools:      []tool.Definition{lsTool(&toolArgs)},
-		Middleware: []middleware.Middleware{denyOutsideWorkspace{}},
-		Limits:     loop.Limits{MaxIterations: 5},
+		Tools:             []tool.Definition{lsTool(&toolArgs)},
+		LifecycleHandlers: []lifecycle.Handler{denyOutsideWorkspace{}},
+		Limits:            loop.Limits{MaxIterations: 5},
 	})
 	if err != nil {
 		t.Fatalf("harness.New() error = %v", err)
@@ -129,38 +129,38 @@ func TestM0_DenyingMiddlewarePreventsExecutionAndModelRecovers(t *testing.T) {
 	}
 }
 
-// 声明了却没进链的中间件必须让装配失败。
-func TestM0_DeclaredButMissingMiddlewareFailsAssembly(t *testing.T) {
+// 声明了却没进入生命周期序列的处理器必须让装配失败。
+func TestM0_DeclaredButMissingLifecycleHandlerFailsAssembly(t *testing.T) {
 	t.Parallel()
 
 	_, err := harness.New(harness.Options{
-		Model:              faux.New(faux.Text("x")),
-		DeclaredMiddleware: []string{"guardrailOutput"},
+		Model:            faux.New(faux.Text("x")),
+		DeclaredHandlers: []string{"guardrailOutput"},
 	})
 	if err == nil {
-		t.Fatal("harness.New() succeeded with a declared-but-absent middleware")
+		t.Fatal("harness.New() succeeded with a declared-but-absent lifecycle handler")
 	}
 	if !strings.Contains(err.Error(), "guardrailOutput") {
-		t.Errorf("error = %q, want it to name the missing middleware", err)
+		t.Errorf("error = %q, want it to name the missing lifecycle handler", err)
 	}
 }
 
-func TestM0_ExtrasAreAnchoredIntoTheChain(t *testing.T) {
+func TestM0_ExtensionsAreAnchoredIntoLifecycle(t *testing.T) {
 	t.Parallel()
 
 	h, err := harness.New(harness.Options{
-		Model:      faux.New(faux.Text("x")),
-		Middleware: []middleware.Middleware{named{"first"}, named{middleware.TerminalName}},
-		Extras:     []middleware.Middleware{anchoredAfter{name: "injected", after: "first"}},
+		Model:             faux.New(faux.Text("x")),
+		LifecycleHandlers: []lifecycle.Handler{named{"first"}, named{lifecycle.TerminalName}},
+		Extensions:        []lifecycle.Handler{anchoredAfter{name: "injected", after: "first"}},
 	})
 	if err != nil {
 		t.Fatalf("harness.New() error = %v", err)
 	}
 
-	got := strings.Join(h.Chain().Names(), ",")
-	want := "first,injected," + middleware.TerminalName
+	got := strings.Join(h.Lifecycle().Names(), ",")
+	want := "first,injected," + lifecycle.TerminalName
 	if got != want {
-		t.Fatalf("chain = %s, want %s", got, want)
+		t.Fatalf("lifecycle = %s, want %s", got, want)
 	}
 }
 
@@ -168,9 +168,9 @@ func TestM0_ConflictingAnchorsFailAssembly(t *testing.T) {
 	t.Parallel()
 
 	_, err := harness.New(harness.Options{
-		Model:      faux.New(faux.Text("x")),
-		Middleware: []middleware.Middleware{named{"first"}},
-		Extras: []middleware.Middleware{
+		Model:             faux.New(faux.Text("x")),
+		LifecycleHandlers: []lifecycle.Handler{named{"first"}},
+		Extensions: []lifecycle.Handler{
 			anchoredAfter{name: "a", after: "first"},
 			anchoredAfter{name: "b", after: "first"},
 		},
@@ -208,7 +208,7 @@ type denyOutsideWorkspace struct{}
 
 func (denyOutsideWorkspace) Name() string { return "permission" }
 
-func (denyOutsideWorkspace) BeforeTool(_ context.Context, st *middleware.State) (tool.Decision, error) {
+func (denyOutsideWorkspace) BeforeTool(_ context.Context, st *lifecycle.State) (tool.Decision, error) {
 	if st.ToolCall != nil && strings.Contains(string(st.ToolCall.Args), "/etc") {
 		return tool.Decision{Deny: true, Reason: "path outside the workspace"}, nil
 	}
@@ -225,6 +225,6 @@ type anchoredAfter struct {
 }
 
 func (a anchoredAfter) Name() string { return a.name }
-func (a anchoredAfter) Anchor() middleware.Anchor {
-	return middleware.Anchor{After: a.after}
+func (a anchoredAfter) Anchor() lifecycle.Anchor {
+	return lifecycle.Anchor{After: a.after}
 }

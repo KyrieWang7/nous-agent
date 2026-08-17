@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/langgraphapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/acp"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/compaction"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
@@ -25,8 +25,6 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/mcp"
 	mem "github.com/KyrieWang7/nous-agent/agent-go/pkg/memory"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware"
-	mw "github.com/KyrieWang7/nous-agent/agent-go/pkg/middleware/builtin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/anthropic"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/openai"
@@ -35,6 +33,13 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/plugin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/prompt"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
+	lifecyclehandlers "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle/handlers"
+	runtimeplugin "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/plugin"
+	runtimepostgres "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/postgres"
+	runtimeredis "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/redis"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/local"
 	remotesandbox "github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/remote"
@@ -56,7 +61,7 @@ const (
 <delegated_task>
 You are a delegated subagent. Complete the assigned prompt directly, do not
 create nested tasks, and return concrete findings to the team lead. When Swarm
-messaging tools are available, use send_message with to="team-lead" to report
+messaging tools are available, use send_message with to="lead" to report
 or coordinate, and do not change team lifecycle.
 </delegated_task>`
 )
@@ -76,7 +81,7 @@ func run() error {
 		return err
 	}
 
-	apiOpts := langgraphapi.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval, Pricer: buildPricer(cfg.Models)}
+	apiOpts := httpapi.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval, Pricer: buildPricer(cfg.Models)}
 	apiOpts.Bus = runtime.NewMemoryBus(runtime.BusOptions{
 		RingCapacity:     cfg.Runtime.EventBufferSize,
 		SubscriberBuffer: cfg.Runtime.EventBufferSize,
@@ -90,15 +95,23 @@ func run() error {
 			return err
 		}
 		defer pool.Close()
-		apiOpts.Store, err = langgraphapi.NewPostgresStore(pool)
+		apiOpts.Store, err = httpapi.NewPostgresStore(pool)
 		if err != nil {
 			return err
 		}
-		postgresEvents, err = runtime.NewPostgresEventStore(pool)
+		postgresEvents, err = runtimepostgres.NewEventStore(pool)
 		if err != nil {
 			return err
 		}
 		apiOpts.EventStore = postgresEvents
+		apiOpts.MetadataStore, err = runtimepostgres.NewMetadataStore(pool)
+		if err != nil {
+			return err
+		}
+		apiOpts.Snapshots, err = runtimepostgres.NewSnapshotStore(pool)
+		if err != nil {
+			return err
+		}
 	}
 	if cfg.Runtime.RedisURL != "" {
 		redisOpts, parseErr := redis.ParseURL(cfg.Runtime.RedisURL)
@@ -114,13 +127,16 @@ func run() error {
 		}
 		cancel()
 		defer func() { _ = client.Close() }()
-		taskStore = subagent.NewRedisTaskStore(client)
-		redisEvents := runtime.NewRedisEventStore(client, cfg.Runtime.EventTTL)
+		taskStore, err = runtimeredis.NewTaskStore(client)
+		if err != nil {
+			return err
+		}
+		redisEvents := runtimeredis.NewEventStore(client, cfg.Runtime.EventTTL)
 		apiOpts.EventStore = redisEvents
 		if postgresEvents != nil {
 			apiOpts.EventStore = runtime.MultiEventStore{Primary: redisEvents, Mirrors: []runtime.EventStore{postgresEvents}}
 		}
-		apiOpts.Registry, err = runtime.NewRegistry(context.Background(), runtime.RegistryOptions{Backend: runtime.NewRedisRegistryBackend(client), Owner: cfg.Server.Address, TTL: cfg.Runtime.EventTTL})
+		apiOpts.Registry, err = runtime.NewRegistry(context.Background(), runtime.RegistryOptions{Backend: runtimeredis.NewRegistryBackend(client), Owner: cfg.Server.Address, TTL: cfg.Runtime.EventTTL})
 		if err != nil {
 			return err
 		}
@@ -128,12 +144,36 @@ func run() error {
 	if apiOpts.Registry != nil {
 		apiOpts.OwnRegistry = true
 	}
-	built, err := buildAgent(cfg, taskStore, pool)
+	var approvalStore runtime.ApprovalStore = runtime.NewMemoryApprovalStore()
+	if pool != nil {
+		approvalStore, err = runtimepostgres.NewApprovalStore(pool)
+		if err != nil {
+			return err
+		}
+	}
+	approvalManager, err := runtime.NewApprovalManager(approvalStore)
+	if err != nil {
+		return err
+	}
+	apiOpts.Approvals = approvalManager
+	var questionStore runtime.QuestionStore = runtime.NewMemoryQuestionStore()
+	if pool != nil {
+		questionStore, err = runtimepostgres.NewQuestionStore(pool)
+		if err != nil {
+			return err
+		}
+	}
+	questionManager, err := runtime.NewQuestionManager(questionStore)
+	if err != nil {
+		return err
+	}
+	apiOpts.Questions = questionManager
+	built, err := buildAgent(cfg, taskStore, pool, approvalManager)
 	if err != nil {
 		return err
 	}
 	reloadable, err := newReloadableAgent(*configPath, cfg, built, func(reloaded config.Config) (builtAgent, error) {
-		return buildAgent(reloaded, taskStore, pool)
+		return buildAgent(reloaded, taskStore, pool, approvalManager)
 	})
 	if err != nil {
 		built.Close()
@@ -142,7 +182,7 @@ func run() error {
 	defer reloadable.Close()
 	apiOpts.Agent = reloadable
 	apiOpts.AllowedTools = built.tools
-	api, err := langgraphapi.New(apiOpts)
+	api, err := httpapi.New(apiOpts)
 	if err != nil {
 		return err
 	}
@@ -157,7 +197,7 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx) //nolint:contextcheck // shutdown must outlive the cancelled signal context
 	}()
-	slog.Info("Nous agent-go listening", "address", cfg.Server.Address, "native_api", "/api/v1", "compat_api", "/threads")
+	slog.Info("Nous agent-go listening", "address", cfg.Server.Address, "api", "/api/v1")
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -179,11 +219,14 @@ func openPool(databaseURL string) (*pgxpool.Pool, error) {
 }
 
 type builtAgent struct {
-	agent  langgraphapi.Agent
-	tools  []string
-	pricer *runtime.Pricer
-	close  []func() error
-	chain  *middleware.Chain
+	agent        runmanager.Agent
+	tools        []string
+	pricer       *runtime.Pricer
+	budget       runtime.BudgetAmount
+	maxDepth     int
+	capabilities []string
+	close        []func() error
+	chain        *lifecycle.Dispatcher
 }
 
 func (b builtAgent) Close() {
@@ -194,7 +237,9 @@ func (b builtAgent) Close() {
 	}
 }
 
-func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.Pool) (builtAgent, error) {
+func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.Pool, approvalManagers ...*runtime.ApprovalManager) (builtAgent, error) {
+	capabilities := capability.NewRegistry()
+	generationID := fmt.Sprintf("agentd-%d", time.Now().UTC().UnixNano())
 	mc, err := cfg.SelectedModel()
 	if err != nil {
 		return builtAgent{}, err
@@ -206,10 +251,22 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, modelErr
 		}
 		namedModels[modelConfig.Name] = configured
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "model." + modelConfig.Name, Kind: capability.KindModel,
+			Description: modelConfig.Model, Scope: capability.ScopeGlobal,
+		}, configured); err != nil {
+			return builtAgent{}, err
+		}
 	}
 	m := namedModels[mc.Name]
 	if m == nil {
 		return builtAgent{}, fmt.Errorf("agentd: default model %q was not built", mc.Name)
+	}
+	if err := registerRuntimeValue(capabilities, capability.Definition{
+		Name: "model.default", Kind: capability.KindModel,
+		Description: mc.Model, Scope: capability.ScopeGlobal,
+	}, m); err != nil {
+		return builtAgent{}, err
 	}
 
 	var compactor loop.Compactor
@@ -227,17 +284,19 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			MaxSummaryTokens: cfg.Summarization.MaxSummaryTokens,
 			MaxInputMessages: cfg.Summarization.MaxInputMessages,
 			MaxInputChars:    cfg.Summarization.MaxInputChars,
-		}, compaction.NewModelSummariser(runtime.InstrumentModel(m, runtime.BucketMiddleware, "compaction")))
+		}, compaction.NewModelSummariser(runtime.InstrumentModel(m, runtime.BucketAuxiliary, "compaction")))
 		if err != nil {
 			return builtAgent{}, err
 		}
 	}
 	router, err := modelrouter.New(modelrouter.Config{
-		Models:        map[modelrouter.Tier]model.Model{modelrouter.TierStandard: m},
-		NamedModels:   namedModels,
-		Stream:        true,
-		Compactor:     compactor,
-		OnStreamEvent: publishModelStreamEvent,
+		Models:            map[modelrouter.Tier]model.Model{modelrouter.TierStandard: m},
+		NamedModels:       namedModels,
+		TierCapabilities:  map[modelrouter.Tier]string{modelrouter.TierStandard: "model.default"},
+		NamedCapabilities: modelCapabilityNames(namedModels),
+		Stream:            true,
+		Compactor:         compactor,
+		OnStreamEvent:     publishModelStreamEvent,
 	})
 	if err != nil {
 		return builtAgent{}, err
@@ -245,6 +304,15 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 
 	registry := tool.NewRegistry()
 	var closers []func() error
+	assembled := false
+	defer func() {
+		if assembled {
+			return
+		}
+		for i := len(closers) - 1; i >= 0; i-- {
+			_ = closers[i]()
+		}
+	}()
 	var sandboxProvider sandbox.Provider
 	if cfg.Sandbox.Enabled {
 		switch cfg.Sandbox.Provider {
@@ -267,11 +335,32 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		if err := registry.RegisterAll(builtin.All()...); err != nil {
 			return builtAgent{}, err
 		}
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "sandbox.default", Kind: capability.KindSandbox,
+			Description: cfg.Sandbox.Provider, Scope: capability.ScopeThread,
+		}, sandboxProvider); err != nil {
+			return builtAgent{}, err
+		}
 	}
-	if err := registry.Register(mw.ClarificationTool()); err != nil {
+	if err := registry.Register(lifecyclehandlers.ClarificationTool()); err != nil {
 		return builtAgent{}, err
 	}
 	if err := registry.Register(builtin.WriteTodos()); err != nil {
+		return builtAgent{}, err
+	}
+	if err := registry.Register(builtin.ExitPlanMode("interaction.questions")); err != nil {
+		return builtAgent{}, err
+	}
+	if err := capabilities.Register(capability.Entry{
+		Definition: capability.Definition{Name: "interaction.questions", Kind: capability.KindInteraction, Description: "durable user question channel", Scope: capability.ScopeRun},
+		Resolver: func(ctx context.Context, _ capability.ResolveRequest) (any, error) {
+			run, ok := runtime.RunContextFrom(ctx)
+			if !ok || run.Questions == nil {
+				return nil, errors.New("agentd: user question capability is unavailable")
+			}
+			return run.Questions, nil
+		},
+	}); err != nil {
 		return builtAgent{}, err
 	}
 	for _, toolConfig := range cfg.Tools {
@@ -322,8 +411,16 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			_ = client.Close()
 			return builtAgent{}, fmt.Errorf("agentd: registering MCP server %q: %w", name, err)
 		}
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "mcp." + name, Kind: capability.KindMCP,
+			Description: server.Type, Scope: capability.ScopeGlobal,
+		}, client); err != nil {
+			_ = client.Close()
+			return builtAgent{}, err
+		}
 		closers = append(closers, client.Close)
 	}
+	var runtimePlugins []runtimeplugin.Plugin
 	if cfg.Plugins.Enabled {
 		reserved := append(registry.Names(), "task", "team_create", "team_delete", "list_teammates", "send_message", "invoke_acp_agent")
 		contributions, pluginErr := plugin.Load(cfg.Plugins.Directories, reserved)
@@ -331,13 +428,11 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, pluginErr
 		}
 		for _, contribution := range contributions {
-			if _, modeErr := permission.ParseMode(contribution.RequiredPermission); modeErr != nil {
+			if _, modeErr := permission.ParseSandboxMode(contribution.RequiredSandboxMode); modeErr != nil {
 				return builtAgent{}, fmt.Errorf("agentd: plugin tool %q: %w", contribution.Definition.Name, modeErr)
 			}
-			if err := registry.Register(contribution.Definition); err != nil {
-				return builtAgent{}, err
-			}
 		}
+		runtimePlugins = commandToolPlugins(contributions)
 	}
 	if len(cfg.ACPAgents) > 0 {
 		agents := make(map[string]acp.AgentConfig, len(cfg.ACPAgents))
@@ -356,8 +451,29 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, err
 		}
 	}
-	policy, err := permission.NewPolicy(permission.Config{Mode: cfg.Permissions.Mode, ToolOverrides: cfg.Permissions.ToolOverrides})
+	var approvalManager *runtime.ApprovalManager
+	if len(approvalManagers) > 0 {
+		approvalManager = approvalManagers[0]
+	}
+	approvalTTL := cfg.Permissions.ApprovalTTL
+	if approvalTTL <= 0 {
+		approvalTTL = cfg.Permissions.PromptTimeout
+	}
+	if approvalTTL <= 0 {
+		approvalTTL = 2 * time.Minute
+	}
+	policy, err := permission.NewPolicy(permission.Config{
+		Preset: cfg.Permissions.Preset, Presets: cfg.Permissions.Presets,
+		Prompter:      &permission.DurablePrompter{Manager: approvalManager, TTL: approvalTTL},
+		PromptTimeout: cfg.Permissions.PromptTimeout,
+	})
 	if err != nil {
+		return builtAgent{}, err
+	}
+	if err := registerRuntimeValue(capabilities, capability.Definition{
+		Name: "policy.tools", Kind: capability.KindPolicy,
+		Description: string(cfg.Permissions.Preset), Scope: capability.ScopeRun,
+	}, policy); err != nil {
 		return builtAgent{}, err
 	}
 	var swarmManager *swarm.Manager
@@ -389,10 +505,22 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 				return builtAgent{}, getErr
 			}
 			promptSkills = append(promptSkills, prompt.Skill{Name: meta.Name, Description: meta.Description, Path: loaded.Path})
+			if err := registerRuntimeValue(capabilities, capability.Definition{
+				Name: "skill." + meta.Name, Kind: capability.KindSkill,
+				Description: meta.Description, Scope: capability.ScopeGlobal,
+			}, loaded); err != nil {
+				return builtAgent{}, err
+			}
+		}
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "skill.registry", Kind: capability.KindSkill,
+			Description: "loaded skill catalog", Scope: capability.ScopeGlobal,
+		}, skillRegistry); err != nil {
+			return builtAgent{}, err
 		}
 	}
-	telemetryMiddleware := telemetry.New("nous-agent-go")
-	var hookMiddleware middleware.Middleware
+	telemetryObserver := telemetry.New("nous-agent-go")
+	var hookHandler lifecycle.Handler
 	var hookRunner *hooks.Runner
 	var configuredHooks []hooks.Hook
 	for _, hookConfig := range cfg.Hooks {
@@ -420,12 +548,12 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		if runnerErr != nil {
 			return builtAgent{}, runnerErr
 		}
-		hookMiddleware = mw.NewHook(hookRunner)
+		hookHandler = lifecyclehandlers.NewHook(hookRunner)
 	}
-	var guardrailInput middleware.Middleware
-	var guardrailOutput middleware.Middleware
+	var guardrailInput lifecycle.Handler
+	var guardrailOutput lifecycle.Handler
 	if cfg.Guardrails.Enabled {
-		provider, providerErr := guardrail.NewModelProvider(runtime.InstrumentModel(m, runtime.BucketMiddleware, "guardrail"))
+		provider, providerErr := guardrail.NewModelProvider(runtime.InstrumentModel(m, runtime.BucketAuxiliary, "guardrail"))
 		if providerErr != nil {
 			return builtAgent{}, providerErr
 		}
@@ -434,37 +562,39 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, evaluatorErr
 		}
 		if cfg.Guardrails.Input {
-			guardrailInput = mw.NewGuardrailInput(evaluator)
+			guardrailInput = lifecyclehandlers.NewGuardrailInput(evaluator)
 		}
 		if cfg.Guardrails.Output {
-			guardrailOutput = mw.NewGuardrailOutput(evaluator)
+			guardrailOutput = lifecyclehandlers.NewGuardrailOutput(evaluator)
 		}
 	}
 	toolSet := runtimeToolSet{
-		registry:        registry,
-		policy:          policy,
-		defaultSubagent: cfg.Subagents.Enabled,
-		defaultSwarm:    cfg.Swarm.Enabled,
+		registry:         registry,
+		policyCapability: "policy.tools",
+		defaultSubagent:  cfg.Subagents.Enabled,
+		defaultSwarm:     cfg.Swarm.Enabled,
 	}
-	baseChain := func() []middleware.Middleware {
-		chain := []middleware.Middleware{
-			mw.NewThreadData(cfg.Sandbox.BaseDir, true),
-			mw.NewUploads(),
-			mw.NewTodo(),
+	planPolicy, err := lifecyclehandlers.NewPlanPolicy(cfg.Plan.Guidance)
+	if err != nil {
+		return builtAgent{}, err
+	}
+	baseLifecycle := func() []lifecycle.Handler {
+		chain := []lifecycle.Handler{
+			lifecyclehandlers.NewThreadData(cfg.Sandbox.BaseDir, true),
+			lifecyclehandlers.NewUploads(),
+			planPolicy,
 			router.RuntimeOptions(),
-			mw.NewViewImage(),
-			mw.NewSwarmSession(swarmManager),
-			telemetryMiddleware,
-			mw.NewDanglingToolCall(),
-			mw.NewPermission(policy, registry),
-			mw.NewSandboxAudit(mw.AuditOptions{}),
-			mw.NewToolErrorHandling(),
-			mw.NewToolOutputBudget(mw.BudgetOptions{ExemptTools: []string{"read_file"}}),
-			mw.NewRuntimeEvents(),
-			mw.NewTokenUsage(),
+			lifecyclehandlers.NewViewImage(),
+			lifecyclehandlers.NewSwarmSession(swarmManager),
+			telemetryObserver,
+			lifecyclehandlers.NewDanglingToolCall(),
+			lifecyclehandlers.NewPermission("policy.tools", registry),
+			lifecyclehandlers.NewSandboxAudit(lifecyclehandlers.AuditOptions{}),
+			lifecyclehandlers.NewToolErrorHandling(),
+			lifecyclehandlers.NewToolOutputBudget(lifecyclehandlers.BudgetOptions{ExemptTools: []string{"read_file"}}),
 		}
-		if hookMiddleware != nil {
-			chain = append(chain, hookMiddleware)
+		if hookHandler != nil {
+			chain = append(chain, hookHandler)
 		}
 		if guardrailInput != nil {
 			chain = append(chain, guardrailInput)
@@ -473,12 +603,12 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			chain = append(chain, guardrailOutput)
 		}
 		chain = append(chain,
-			mw.NewSubagentLimit(cfg.Subagents.MaxConcurrent),
-			mw.NewLoopDetection(mw.LoopDetectionOptions{}),
-			mw.NewSafetyFinishReason(),
+			lifecyclehandlers.NewSubagentLimit(cfg.Subagents.MaxConcurrent),
+			lifecyclehandlers.NewLoopDetection(lifecyclehandlers.LoopDetectionOptions{}),
+			lifecyclehandlers.NewSafetyFinishReason(),
 		)
 		if swarmManager != nil {
-			chain = append(chain, mw.NewInboxPoller(swarmManager, cfg.Swarm.PollLimit, cfg.Swarm.MessagePollInterval))
+			chain = append(chain, lifecyclehandlers.NewInboxPoller(swarmManager, cfg.Swarm.PollLimit, cfg.Swarm.MessagePollInterval))
 		}
 		return chain
 	}
@@ -500,15 +630,15 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	}
 	childPrompt := prompt.Production(promptOptions, prompt.RuntimeOptions{}) + delegatedTaskPrompt
 	manager := subagent.NewManager(func(def subagent.Definition, allowed []string) (*loop.Runner, error) {
-		childChain := baseChain()
-		childDeclared := baseMiddlewareNames(cfg, hookMiddleware != nil, swarmManager != nil)
+		childLifecycle := baseLifecycle()
+		childDeclared := baseLifecycleNames(cfg, hookHandler != nil, swarmManager != nil)
 		if cfg.Skills.Enabled {
-			childChain = append(childChain, mw.NewSkillActivation(skillRegistry, registry, cfg.Skills.Force))
-			childDeclared = append(childDeclared, mw.NameSkillActivation)
+			childLifecycle = append(childLifecycle, lifecyclehandlers.NewSkillActivation("skill.registry", registry, cfg.Skills.Force))
+			childDeclared = append(childDeclared, lifecyclehandlers.NameSkillActivation)
 		}
-		childChain = append(childChain, mw.NewClarification())
-		childDeclared = append(childDeclared, middleware.TerminalName)
-		child, err := harness.New(harness.Options{Sampler: router, Registry: registry, Middleware: childChain, DeclaredMiddleware: childDeclared, ToolSet: newRestrictedToolSet(toolSet, allowed), Publisher: subagentProgressPublisher{}, Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
+		childLifecycle = append(childLifecycle, lifecyclehandlers.NewClarification())
+		childDeclared = append(childDeclared, lifecycle.TerminalName)
+		child, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: childLifecycle, DeclaredHandlers: childDeclared, ToolSet: newRestrictedToolSet(toolSet, allowed), Publisher: subagentProgressPublisher{}, Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, GenerationID: generationID})
 		if err != nil {
 			return nil, err
 		}
@@ -529,43 +659,70 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		if err := manager.Register(def); err != nil {
 			return builtAgent{}, err
 		}
+		definition := def
+		if err := capabilities.Register(capability.Entry{
+			Definition: capability.Definition{Name: "agent." + definition.Name, Kind: capability.KindAgent, Description: definition.Description, Scope: capability.ScopeRun},
+			Resolver: func(context.Context, capability.ResolveRequest) (any, error) {
+				return definition, nil
+			},
+		}); err != nil {
+			return builtAgent{}, err
+		}
 	}
-	if err := registry.Register(telemetryMiddleware.InstrumentToolDefinition(manager.TaskTool())); err != nil {
+	if err := registerRuntimeValue(capabilities, capability.Definition{
+		Name: "agent.subagents", Kind: capability.KindAgent,
+		Description: "subagent dispatcher", Scope: capability.ScopeRun,
+	}, manager); err != nil {
 		return builtAgent{}, err
 	}
-	chain := baseChain()
+	if err := registry.Register(telemetryObserver.InstrumentToolDefinition(manager.TaskTool())); err != nil {
+		return builtAgent{}, err
+	}
+	chain := baseLifecycle()
 	if cfg.Memory.Enabled {
 		var store mem.Store = mem.NewMemoryStore()
 		if pool != nil {
-			store, err = mem.NewPostgresStore(pool)
+			store, err = runtimepostgres.NewMemoryStore(pool)
 			if err != nil {
 				return builtAgent{}, err
 			}
 		}
-		manager, managerErr := mem.New(runtime.InstrumentModel(m, runtime.BucketMiddleware, "memory"), store, mem.Options{MaxFacts: cfg.Memory.MaxFacts, ConfidenceThreshold: cfg.Memory.ConfidenceThreshold, InjectionTokens: cfg.Memory.InjectionTokens})
+		memoryManager, managerErr := mem.New(runtime.InstrumentModel(m, runtime.BucketAuxiliary, "memory"), store, mem.Options{MaxFacts: cfg.Memory.MaxFacts, ConfidenceThreshold: cfg.Memory.ConfidenceThreshold, InjectionTokens: cfg.Memory.InjectionTokens})
 		if managerErr != nil {
 			return builtAgent{}, managerErr
 		}
-		chain = append(chain, mw.NewMemory(manager))
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "memory.store", Kind: capability.KindMemory,
+			Description: "durable scoped memory store", Scope: capability.ScopeThread,
+		}, store); err != nil {
+			return builtAgent{}, err
+		}
+		if err := registerRuntimeValue(capabilities, capability.Definition{
+			Name: "memory.manager", Kind: capability.KindMemory,
+			Description: "memory extraction and prompt projection", Scope: capability.ScopeThread,
+		}, memoryManager); err != nil {
+			return builtAgent{}, err
+		}
+		chain = append(chain, lifecyclehandlers.NewMemory("memory.manager"))
 	}
 	if cfg.Title.Enabled {
-		chain = append(chain, mw.NewTitle(runtime.InstrumentModel(m, runtime.BucketMiddleware, "title"), cfg.Title.MaxWords, cfg.Title.MaxChars))
+		chain = append(chain, lifecyclehandlers.NewTitle(runtime.InstrumentModel(m, runtime.BucketAuxiliary, "title"), cfg.Title.MaxWords, cfg.Title.MaxChars))
 	}
 	if cfg.Skills.Enabled {
-		chain = append(chain, mw.NewSkillActivation(skillRegistry, registry, cfg.Skills.Force))
+		chain = append(chain, lifecyclehandlers.NewSkillActivation("skill.registry", registry, cfg.Skills.Force))
 	}
-	chain = append(chain, mw.NewClarification())
-	declared := append(baseMiddlewareNames(cfg, hookMiddleware != nil, swarmManager != nil), middleware.TerminalName)
+	chain = append(chain, lifecyclehandlers.NewClarification())
+	declared := append(baseLifecycleNames(cfg, hookHandler != nil, swarmManager != nil), lifecycle.TerminalName)
 	if cfg.Memory.Enabled {
-		declared = append(declared, mw.NameMemory)
+		declared = append(declared, lifecyclehandlers.NameMemory)
 	}
 	if cfg.Title.Enabled {
-		declared = append(declared, mw.NameTitle)
+		declared = append(declared, lifecyclehandlers.NameTitle)
 	}
 	if cfg.Skills.Enabled {
-		declared = append(declared, mw.NameSkillActivation)
+		declared = append(declared, lifecyclehandlers.NameSkillActivation)
 	}
-	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, Middleware: chain, DeclaredMiddleware: declared, ToolSet: toolSet, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, MiddlewareTimeout: cfg.Loop.MiddlewareTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget})
+	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: chain, DeclaredHandlers: declared, ToolSet: toolSet, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, Plugins: runtimePlugins, GenerationID: generationID})
 	if err != nil {
 		return builtAgent{}, err
 	}
@@ -579,7 +736,39 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		valueSwarmEnabled:          cfg.Swarm.Enabled,
 		modelrouter.ValueModelName: mc.Name,
 	}
-	return builtAgent{agent: langgraphapi.HarnessAgent{Runner: h.Runner(), SystemPrompt: promptBuilder(initialValues), SystemPromptBuilder: promptBuilder, Sandbox: sandboxProvider, InitialValues: initialValues}, tools: registry.Names(), pricer: buildPricer(cfg.Models), close: closers, chain: h.Chain()}, nil
+	closers = append(closers, h.Close)
+	sandboxCapability := ""
+	if sandboxProvider != nil {
+		sandboxCapability = "sandbox.default"
+	}
+	assembled = true
+	budgetLimits := runtime.BudgetAmount{Tokens: int64(cfg.Loop.TokenBudget), CostMicros: cfg.Loop.CostBudgetMicros, ToolCalls: int64(cfg.Loop.ToolCallBudget), Subagents: int64(cfg.Loop.SubagentBudget)}
+	capabilityNames := h.Runtime().Generation.Capabilities().Names()
+	return builtAgent{agent: harness.Agent{
+		Runner: h.Runner(), SystemPrompt: promptBuilder(initialValues), SystemPromptBuilder: promptBuilder,
+		InitialValues: initialValues, Capabilities: h.Runtime().Generation.Capabilities(),
+		GenerationID: generationID, SandboxCapability: sandboxCapability, BudgetLimits: budgetLimits, MaxRecursionDepth: cfg.Loop.MaxRecursionDepth,
+		AllowedCapabilities: capabilityNames,
+	}, tools: registry.Names(), pricer: buildPricer(cfg.Models), budget: budgetLimits,
+		capabilities: capabilityNames, maxDepth: cfg.Loop.MaxRecursionDepth, close: closers, chain: h.Lifecycle()}, nil
+}
+
+func registerRuntimeValue(registry *capability.Registry, definition capability.Definition, value any) error {
+	if registry.Has(definition.Name) {
+		return nil
+	}
+	if err := capability.RegisterValue(registry, capability.Value{Definition: definition, Value: value}); err != nil {
+		return fmt.Errorf("agentd: registering runtime capability %q: %w", definition.Name, err)
+	}
+	return nil
+}
+
+func modelCapabilityNames(models map[string]model.Model) map[string]string {
+	names := make(map[string]string, len(models))
+	for name := range models {
+		names[name] = "model." + name
+	}
+	return names
 }
 
 func subagentTimeout(cfg config.Config, parent runtime.RunContext, req subagent.DispatchRequest) time.Duration {
@@ -587,9 +776,6 @@ func subagentTimeout(cfg config.Config, parent runtime.RunContext, req subagent.
 		return cfg.Swarm.TeammateTimeout
 	}
 	name := strings.TrimSpace(req.SubagentType)
-	if name == "" {
-		name = strings.TrimSpace(req.Agent)
-	}
 	return cfg.Subagents.TimeoutFor(name)
 }
 
@@ -624,26 +810,25 @@ func buildPricer(models []config.ModelConfig) *runtime.Pricer {
 	return runtime.NewPricer(prices, runtime.Price{})
 }
 
-func baseMiddlewareNames(cfg config.Config, hasHooks, hasSwarm bool) []string {
+func baseLifecycleNames(cfg config.Config, hasHooks, hasSwarm bool) []string {
 	names := []string{
-		mw.NameThreadData, mw.NameUploads, mw.NameTodo, modelrouter.NameRuntimeOptions,
-		mw.NameViewImage, mw.NameSwarmSession,
-		telemetry.Name, mw.NameDanglingToolCall, mw.NamePermission,
-		mw.NameSandboxAudit, mw.NameToolErrorHandling, mw.NameToolOutputBudget,
-		mw.NameRuntimeEvents, mw.NameTokenUsage,
+		lifecyclehandlers.NameThreadData, lifecyclehandlers.NameUploads, lifecyclehandlers.NamePlanPolicy, modelrouter.NameRuntimeOptions,
+		lifecyclehandlers.NameViewImage, lifecyclehandlers.NameSwarmSession,
+		telemetry.Name, lifecyclehandlers.NameDanglingToolCall, lifecyclehandlers.NamePermission,
+		lifecyclehandlers.NameSandboxAudit, lifecyclehandlers.NameToolErrorHandling, lifecyclehandlers.NameToolOutputBudget,
 	}
 	if hasHooks {
-		names = append(names, mw.NameHook)
+		names = append(names, lifecyclehandlers.NameHook)
 	}
 	if cfg.Guardrails.Enabled && cfg.Guardrails.Input {
-		names = append(names, mw.NameGuardrailInput)
+		names = append(names, lifecyclehandlers.NameGuardrailInput)
 	}
 	if cfg.Guardrails.Enabled && cfg.Guardrails.Output {
-		names = append(names, mw.NameGuardrailOutput)
+		names = append(names, lifecyclehandlers.NameGuardrailOutput)
 	}
-	names = append(names, mw.NameSubagentLimit, mw.NameLoopDetection, mw.NameSafetyFinishReason)
+	names = append(names, lifecyclehandlers.NameSubagentLimit, lifecyclehandlers.NameLoopDetection, lifecyclehandlers.NameSafetyFinishReason)
 	if hasSwarm {
-		names = append(names, mw.NameInboxPoller)
+		names = append(names, lifecyclehandlers.NameInboxPoller)
 	}
 	return names
 }
@@ -657,7 +842,7 @@ func mapBool(values map[string]any, key string, fallback bool) bool {
 	return ok && enabled
 }
 
-func publishModelStreamEvent(ctx context.Context, st *middleware.State, ev model.StreamEvent) {
+func publishModelStreamEvent(ctx context.Context, st *lifecycle.State, ev model.StreamEvent) {
 	run, ok := runtime.RunContextFrom(ctx)
 	if !ok || run.Publish == nil {
 		return
@@ -694,12 +879,12 @@ func publishModelStreamEvent(ctx context.Context, st *middleware.State, ev model
 
 type subagentProgressPublisher struct{}
 
-func (subagentProgressPublisher) PublishReply(ctx context.Context, st *middleware.State, _ bool) {
+func (subagentProgressPublisher) PublishReply(ctx context.Context, st *lifecycle.State, _ bool) {
 	run, ok := runtime.RunContextFrom(ctx)
 	if !ok || run.Publish == nil || run.SubagentTaskID == "" || st == nil || st.ModelOutput == nil {
 		return
 	}
-	run.Publish(ctx, runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventSubagentProgress, runtime.SubagentProgress{
+	_, _ = run.Publish(ctx, runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventSubagentProgress, runtime.SubagentProgress{
 		TaskID:       run.SubagentTaskID,
 		MessageID:    fmt.Sprintf("%s:%d", st.RunID, st.Iteration),
 		MessageIndex: st.Iteration + 1,

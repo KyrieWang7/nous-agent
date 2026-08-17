@@ -1,6 +1,5 @@
 /**
- * MessageManager — pure-TypeScript replica of the LangGraph SDK's
- * `MessageTupleManager` (libs/sdk/src/ui/messages.ts).
+ * MessageManager accumulates incremental Agent API message chunks.
  *
  * Accumulates SSE `messages` (messages-tuple) chunks by id, correctly
  * concatenating content, deep-merging additional_kwargs (with string

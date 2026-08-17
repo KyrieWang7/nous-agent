@@ -1,247 +1,246 @@
-// Package permission 实现 5 级权限模型。
-//
-// 判定是 fail-closed 的：任何内部错误都返回拒绝。一个"判不出来所以放行"的
-// 权限系统比没有权限系统更危险，因为它看起来像在限制（设计文档 §8.1）。
+// Package permission owns the independent sandbox and approval policies used
+// by the tool admission gate. Presets are product-facing bundles; execution
+// always evaluates the two mechanism policies separately.
 package permission
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
-// Mode 是权限级别。
-type Mode string
+type SandboxMode string
 
 const (
-	// ModeReadOnly 只允许只读工具。
-	ModeReadOnly Mode = "read_only"
-
-	// ModeWorkspaceWrite 允许只读 + 工作区内写。
-	ModeWorkspaceWrite Mode = "workspace_write"
-
-	// ModePrompt 高风险工具需要用户确认。
-	ModePrompt Mode = "prompt"
-
-	// ModeAllow 全部放行。默认级别。
-	ModeAllow Mode = "allow"
-
-	// ModeDangerFullAccess 完全不受限，连沙箱要求也不检查。
-	ModeDangerFullAccess Mode = "danger_full_access"
+	SandboxReadOnly         SandboxMode = "read-only"
+	SandboxWorkspaceWrite   SandboxMode = "workspace-write"
+	SandboxDangerFullAccess SandboxMode = "danger-full-access"
 )
 
-// Valid 报告 m 是否是已知级别。
-func (m Mode) Valid() bool {
-	switch m {
-	case ModeReadOnly, ModeWorkspaceWrite, ModePrompt, ModeAllow, ModeDangerFullAccess:
-		return true
-	default:
-		return false
+func (m SandboxMode) Valid() bool { return slices.Contains(SandboxModes(), m) }
+
+func SandboxModes() []SandboxMode {
+	return []SandboxMode{SandboxReadOnly, SandboxWorkspaceWrite, SandboxDangerFullAccess}
+}
+
+func ParseSandboxMode(value string) (SandboxMode, error) {
+	mode := SandboxMode(strings.TrimSpace(strings.ToLower(value)))
+	if !mode.Valid() {
+		return "", fmt.Errorf("permission: unknown sandbox mode %q; valid modes: %v", value, SandboxModes())
+	}
+	return mode, nil
+}
+
+type ApprovalPolicy string
+
+const (
+	ApprovalAsk   ApprovalPolicy = "ask"
+	ApprovalNever ApprovalPolicy = "never"
+)
+
+func (p ApprovalPolicy) Valid() bool { return p == ApprovalAsk || p == ApprovalNever }
+
+type Preset string
+
+const (
+	PresetReadOnly         Preset = "read-only"
+	PresetWorkspaceWrite   Preset = "workspace-write"
+	PresetDangerFullAccess Preset = "danger-full-access"
+	PresetCustom           Preset = "custom"
+)
+
+type PresetSpec struct {
+	Sandbox  SandboxMode    `yaml:"sandbox" json:"sandbox"`
+	Approval ApprovalPolicy `yaml:"approval" json:"approval"`
+}
+
+func DefaultPresets() map[Preset]PresetSpec {
+	return map[Preset]PresetSpec{
+		PresetReadOnly:         {Sandbox: SandboxReadOnly, Approval: ApprovalNever},
+		PresetWorkspaceWrite:   {Sandbox: SandboxWorkspaceWrite, Approval: ApprovalAsk},
+		PresetDangerFullAccess: {Sandbox: SandboxDangerFullAccess, Approval: ApprovalNever},
 	}
 }
 
-// Modes 返回全部合法级别，供错误信息与配置校验使用。
-func Modes() []Mode {
-	return []Mode{ModeReadOnly, ModeWorkspaceWrite, ModePrompt, ModeAllow, ModeDangerFullAccess}
-}
-
-// Decision 是一次授权判定的结果。
 type Decision struct {
-	Allowed bool
-	Reason  string
+	Allowed      bool
+	Reason       string
+	Sandbox      SandboxMode
+	Required     SandboxMode
+	ApprovalUsed bool
 }
 
-// Prompter 向用户征求确认。ModePrompt 下使用。
-//
-// 返回 error 一律视为拒绝：征求确认失败时不能替用户点同意。
 type Prompter interface {
 	Confirm(ctx context.Context, req ConfirmRequest) (bool, error)
 }
 
-// ConfirmRequest 是一次确认请求。
 type ConfirmRequest struct {
-	ToolName string
-	Args     json.RawMessage
-	Reason   string
+	ToolCallID string
+	ToolName   string
+	Args       json.RawMessage
+	Reason     string
 }
 
-// Config 配置权限策略。
 type Config struct {
-	// Mode 是默认级别。空时用 ModeAllow。
-	Mode Mode
-
-	// ToolOverrides 按工具名覆盖级别，例如 {"bash": "danger_full_access"}。
-	ToolOverrides map[string]Mode
-
-	// Prompter 在 ModePrompt 下征求确认。为 nil 时 ModePrompt 等同于拒绝 ——
-	// 没有人能回答的确认请求只能是拒绝。
-	Prompter Prompter
-
-	// PromptTimeout 是等待确认的上限。<= 0 时用 2 分钟。超时视为拒绝。
+	Preset        Preset
+	Presets       map[Preset]PresetSpec
+	Prompter      Prompter
 	PromptTimeout time.Duration
 }
 
-// Policy 是权限判定引擎。
 type Policy struct {
-	mode      Mode
-	overrides map[string]Mode
-	prompter  Prompter
-	timeout   time.Duration
+	preset   Preset
+	sandbox  SandboxMode
+	approval ApprovalPolicy
+	prompter Prompter
+	timeout  time.Duration
 }
 
-// NewPolicy 校验配置并返回判定引擎。
-//
-// 未知级别在这里就失败，不留到运行时：一个拼错的 mode 若被当成默认值处理，
-// 就是静默降级为放行。
 func NewPolicy(cfg Config) (*Policy, error) {
-	mode := cfg.Mode
-	if mode == "" {
-		mode = ModeAllow
+	presets := cfg.Presets
+	if presets == nil {
+		presets = DefaultPresets()
 	}
-	if !mode.Valid() {
-		return nil, fmt.Errorf("permission: unknown mode %q; valid modes: %v", cfg.Mode, Modes())
+	if _, reserved := presets[PresetCustom]; reserved {
+		return nil, fmt.Errorf("permission: preset %q is reserved", PresetCustom)
 	}
-
-	overrides := make(map[string]Mode, len(cfg.ToolOverrides))
-	for name, m := range cfg.ToolOverrides {
-		if !m.Valid() {
-			return nil, fmt.Errorf("permission: unknown mode %q for tool %q; valid modes: %v", m, name, Modes())
+	for name, spec := range presets {
+		if strings.TrimSpace(string(name)) == "" {
+			return nil, fmt.Errorf("permission: preset name is required")
 		}
-		overrides[name] = m
+		if !spec.Sandbox.Valid() {
+			return nil, fmt.Errorf("permission: preset %q has invalid sandbox mode %q", name, spec.Sandbox)
+		}
+		if !spec.Approval.Valid() {
+			return nil, fmt.Errorf("permission: preset %q has invalid approval policy %q", name, spec.Approval)
+		}
 	}
-
+	preset := cfg.Preset
+	if preset == "" {
+		preset = PresetWorkspaceWrite
+	}
+	spec, ok := presets[preset]
+	if !ok {
+		return nil, fmt.Errorf("permission: unknown preset %q", preset)
+	}
 	timeout := cfg.PromptTimeout
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
-
-	return &Policy{mode: mode, overrides: overrides, prompter: cfg.Prompter, timeout: timeout}, nil
+	return &Policy{
+		preset: preset, sandbox: spec.Sandbox, approval: spec.Approval,
+		prompter: cfg.Prompter, timeout: timeout,
+	}, nil
 }
 
-// Mode 返回某个工具生效的级别。
-func (p *Policy) Mode(toolName string) Mode {
-	if m, ok := p.overrides[toolName]; ok {
-		return m
+func (p *Policy) Preset() Preset                 { return p.preset }
+func (p *Policy) SandboxMode() SandboxMode       { return p.sandbox }
+func (p *Policy) ApprovalPolicy() ApprovalPolicy { return p.approval }
+
+// ForDelegation pins approval to never without changing the inherited sandbox
+// ceiling. Only trusted child-run assembly may select this derived policy.
+func (p *Policy) ForDelegation() *Policy {
+	if p == nil {
+		return nil
 	}
-	return p.mode
+	derived := *p
+	derived.approval = ApprovalNever
+	return &derived
 }
 
-// Authorize 判定一次工具调用是否放行。
-//
-// 判定只看工具元数据与级别，不看参数内容 —— 参数级的审计（例如 bash 命令
-// 是否危险）归 SandboxAudit 中间件，两者职责不同不该混在一处。
-func (p *Policy) Authorize(ctx context.Context, d tool.Definition, args json.RawMessage) Decision {
-	mode := p.Mode(d.Name)
-	if ok, reason := meetsRequiredPermission(mode, d.Metadata.RequiredPermission); !ok {
-		return Decision{Reason: fmt.Sprintf("%s requires permission %s: %s", d.Name, d.Metadata.RequiredPermission, reason)}
+func (p *Policy) AuthorizeCall(ctx context.Context, definition tool.Definition, call tool.Call) Decision {
+	required, err := requiredSandboxMode(definition)
+	if err != nil {
+		return Decision{Reason: err.Error(), Sandbox: p.sandbox}
 	}
-
-	switch mode {
-	case ModeDangerFullAccess, ModeAllow:
-		return Decision{Allowed: true}
-
-	case ModeReadOnly:
-		if d.Metadata.IsReadOnly {
-			return Decision{Allowed: true}
-		}
-		return Decision{Reason: fmt.Sprintf(
-			"%s modifies state and the current permission mode is %s", d.Name, mode)}
-
-	case ModeWorkspaceWrite:
-		if d.Metadata.IsReadOnly || d.Metadata.RequiresSandbox || d.Metadata.IsAgentState {
-			return Decision{Allowed: true}
-		}
-		return Decision{Reason: fmt.Sprintf(
-			"%s writes outside the workspace and the current permission mode is %s", d.Name, mode)}
-
-	case ModePrompt:
-		return p.confirm(ctx, d, args)
-
-	default:
-		// 不可达：NewPolicy 已校验。真到了这里说明有人绕过构造器，
-		// fail-closed 拒绝。
-		return Decision{Reason: fmt.Sprintf("permission: unhandled mode %q", mode)}
+	decision := Decision{Sandbox: p.sandbox, Required: required}
+	if sandboxRank(p.sandbox) >= sandboxRank(required) {
+		decision.Allowed = true
+		return decision
 	}
-}
-
-// confirm 在 ModePrompt 下征求用户确认。
-func (p *Policy) confirm(ctx context.Context, d tool.Definition, args json.RawMessage) Decision {
+	if p.approval == ApprovalNever {
+		decision.Reason = fmt.Sprintf("%s requires sandbox mode %s but preset %s provides %s and approval policy is never", definition.Name, required, p.preset, p.sandbox)
+		return decision
+	}
+	if p.approval != ApprovalAsk {
+		decision.Reason = fmt.Sprintf("permission: unhandled approval policy %q", p.approval)
+		return decision
+	}
+	decision.ApprovalUsed = true
 	if p.prompter == nil {
-		return Decision{Reason: fmt.Sprintf(
-			"%s requires confirmation but no prompter is configured", d.Name)}
-	}
-	// 只读工具不打扰用户：prompt 模式的意图是拦住有副作用的操作。
-	if d.Metadata.IsReadOnly {
-		return Decision{Allowed: true}
+		decision.Reason = fmt.Sprintf("%s requires sandbox escalation from %s to %s but no approval service is configured", definition.Name, p.sandbox, required)
+		return decision
 	}
 
 	askCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-
-	ok, err := p.prompter.Confirm(askCtx, ConfirmRequest{
-		ToolName: d.Name,
-		Args:     args,
-		Reason:   fmt.Sprintf("%s has side effects", d.Name),
+	approved, err := p.prompter.Confirm(askCtx, ConfirmRequest{
+		ToolCallID: call.ID,
+		ToolName:   definition.Name,
+		Args:       call.Args,
+		Reason:     fmt.Sprintf("%s requires sandbox escalation from %s to %s", definition.Name, p.sandbox, required),
 	})
-	switch {
-	case err != nil:
-		// 征求确认失败不能替用户点同意。
-		return Decision{Reason: fmt.Sprintf("%s was not confirmed: %v", d.Name, err)}
-	case !ok:
-		return Decision{Reason: fmt.Sprintf("%s was declined by the user", d.Name)}
-	default:
-		return Decision{Allowed: true}
+	if err != nil {
+		decision.Reason = fmt.Sprintf("%s escalation was not approved: %v", definition.Name, err)
+		return decision
 	}
+	if !approved {
+		decision.Reason = fmt.Sprintf("%s sandbox escalation was declined", definition.Name)
+		return decision
+	}
+	decision.Allowed = true
+	return decision
 }
 
-// AllowedTools 从候选集里筛出该级别允许调用的工具名。
-//
-// 内核每轮用它算工具集：不允许调用的工具连 schema 都不投递，
-// 省得模型反复尝试再反复被拒（设计文档 §7.3）。
-func (p *Policy) AllowedTools(r *tool.Registry, candidates []string) []string {
+func (p *Policy) AllowedTools(registry *tool.Registry, candidates []string) []string {
 	out := make([]string, 0, len(candidates))
 	for _, name := range candidates {
-		d, err := r.Get(name)
+		definition, err := registry.Get(name)
 		if err != nil {
-			continue // 未注册的名字不放进工具集
+			continue
 		}
-		// 这里不做 ModePrompt 的确认：披露与调用是两件事，
-		// prompt 模式下工具应当可见，只是调用时需要确认。
-		mode := p.Mode(name)
-		meetsRequired, _ := meetsRequiredPermission(mode, d.Metadata.RequiredPermission)
-		if (mode == ModePrompt && meetsRequired) || p.Authorize(context.Background(), d, nil).Allowed {
+		required, err := requiredSandboxMode(definition)
+		if err != nil {
+			continue
+		}
+		if sandboxRank(p.sandbox) >= sandboxRank(required) || p.approval == ApprovalAsk {
 			out = append(out, name)
 		}
 	}
 	return out
 }
 
-func meetsRequiredPermission(current Mode, required string) (bool, string) {
-	if strings.TrimSpace(required) == "" {
-		return true, ""
+func requiredSandboxMode(definition tool.Definition) (SandboxMode, error) {
+	if raw := strings.TrimSpace(definition.Metadata.RequiredSandboxMode); raw != "" {
+		mode, err := ParseSandboxMode(raw)
+		if err != nil {
+			return "", fmt.Errorf("%s declares invalid required sandbox mode: %w", definition.Name, err)
+		}
+		return mode, nil
 	}
-	minimum, err := ParseMode(required)
-	if err != nil {
-		return false, err.Error()
+	if definition.Metadata.IsReadOnly {
+		return SandboxReadOnly, nil
 	}
-	rank := map[Mode]int{
-		ModeReadOnly: 0, ModeWorkspaceWrite: 1, ModePrompt: 2, ModeAllow: 3, ModeDangerFullAccess: 4,
+	if definition.Metadata.RequiresSandbox || definition.Metadata.IsAgentState {
+		return SandboxWorkspaceWrite, nil
 	}
-	if rank[current] < rank[minimum] {
-		return false, fmt.Sprintf("current mode %s is below the required mode", current)
-	}
-	return true, ""
+	return SandboxDangerFullAccess, nil
 }
 
-// ParseMode 把配置里的字符串解析为 Mode，未知值返回 error。
-func ParseMode(s string) (Mode, error) {
-	m := Mode(strings.TrimSpace(strings.ToLower(s)))
-	if !m.Valid() {
-		return "", fmt.Errorf("permission: unknown mode %q; valid modes: %v", s, Modes())
+func sandboxRank(mode SandboxMode) int {
+	switch mode {
+	case SandboxReadOnly:
+		return 0
+	case SandboxWorkspaceWrite:
+		return 1
+	case SandboxDangerFullAccess:
+		return 2
+	default:
+		return -1
 	}
-	return m, nil
 }

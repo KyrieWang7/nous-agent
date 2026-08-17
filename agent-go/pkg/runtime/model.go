@@ -8,7 +8,7 @@ import (
 
 // InstrumentModel attributes auxiliary model calls to a run Journal. It is
 // used for compaction, title, memory, and guardrail calls; lead-loop accounting
-// remains in TokenUsage middleware.
+// remains in TokenUsage lifecycle.
 func InstrumentModel(inner model.Model, bucket Bucket, source string) model.Model {
 	if inner == nil {
 		return nil
