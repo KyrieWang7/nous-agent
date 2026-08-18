@@ -10,8 +10,8 @@ import (
 func TestProductionIsStableAndSorted(t *testing.T) {
 	opts := prompt.ProductionOptions{
 		Skills: []prompt.Skill{
-			{Name: "zeta", Description: "Z", Path: "/skills/zeta/SKILL.md"},
-			{Name: "alpha", Description: "A", Path: "/skills/alpha/SKILL.md"},
+			{Name: "zeta", Description: "Z"},
+			{Name: "alpha", Description: "A"},
 		},
 		Subagents: []prompt.Subagent{
 			{Name: "verification", Description: "Verify work"},
@@ -50,8 +50,8 @@ func TestProductionCapabilitySections(t *testing.T) {
 }
 
 func TestProductionEscapesCatalogMetadata(t *testing.T) {
-	got := prompt.Production(prompt.ProductionOptions{Skills: []prompt.Skill{{Name: `bad\"name`, Description: "<inject>", Path: "a&b"}}}, prompt.RuntimeOptions{})
-	for _, escaped := range []string{"&#34;", "&lt;inject&gt;", "a&amp;b"} {
+	got := prompt.Production(prompt.ProductionOptions{Skills: []prompt.Skill{{Name: `bad\"name`, Description: "<inject>"}}}, prompt.RuntimeOptions{})
+	for _, escaped := range []string{"&#34;", "&lt;inject&gt;"} {
 		if !strings.Contains(got, escaped) {
 			t.Fatalf("prompt is missing escaped value %q", escaped)
 		}

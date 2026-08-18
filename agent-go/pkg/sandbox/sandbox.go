@@ -178,6 +178,21 @@ type EnforcementProvider interface {
 	Verify(context.Context) error
 }
 
+// StartupReconciler lets a provider remove resources which survived a
+// controller restart. The controller has no durable leases, so every resource
+// owned by the previous process is orphaned at startup.
+type StartupReconciler interface {
+	Reconcile(context.Context) error
+}
+
+// WorkspaceProvider separates ephemeral resource identity from durable
+// workspace identity. Controllers use a random resource key for container
+// lifecycle and a stable thread key for files shared with the gateway.
+type WorkspaceProvider interface {
+	Provider
+	AcquireWorkspace(ctx context.Context, resourceKey, workspaceKey string) (Handle, error)
+}
+
 // Lease 是对沙箱实例的惰性持有。
 //
 // lazy_init 的落点：sandbox capability 在 run 开始时建立 Lease，但真正的

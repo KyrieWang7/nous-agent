@@ -24,7 +24,6 @@ You are Nous, an open-source AI assistant. Work directly in the provided workspa
 type Skill struct {
 	Name        string
 	Description string
-	Path        string
 }
 
 // Subagent describes one registered child-agent profile.
@@ -108,9 +107,8 @@ func skillsSection(skills []Skill) string {
 	var out strings.Builder
 	out.WriteString("Relevant skills are activated lazily. Once a skill is activated, follow its injected instructions.\n\n<available_skills>\n")
 	for _, item := range ordered {
-		fmt.Fprintf(&out, "  <skill name=\"%s\" path=\"%s\">%s</skill>\n",
+		fmt.Fprintf(&out, "  <skill name=\"%s\">%s</skill>\n",
 			html.EscapeString(strings.TrimSpace(item.Name)),
-			html.EscapeString(strings.TrimSpace(item.Path)),
 			html.EscapeString(strings.TrimSpace(item.Description)),
 		)
 	}

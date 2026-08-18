@@ -56,6 +56,46 @@ func (p *Provider) Verify(ctx context.Context) error {
 	return nil
 }
 
+// Reconcile removes only containers owned by sandboxd. Since controller leases
+// are intentionally in-memory, all such containers are orphaned after restart.
+func (p *Provider) Reconcile(ctx context.Context) error {
+	if err := p.prepareBaseDir(); err != nil {
+		return err
+	}
+	out, err := exec.CommandContext(ctx, "docker", "ps", "-aq",
+		"--filter", "label=io.nous-agent.sandbox=true",
+		"--filter", "label=io.nous-agent.managed-by=sandboxd").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker sandbox: list managed containers: %w: %s", err, out)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return nil
+	}
+	out, err = exec.CommandContext(ctx, "docker", append([]string{"rm", "-f"}, ids...)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker sandbox: remove orphaned containers: %w: %s", err, out)
+	}
+	return nil
+}
+
+func (p *Provider) prepareBaseDir() error {
+	uid, gid, err := p.userIDs()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(p.opts.BaseDir, 0o2770); err != nil {
+		return fmt.Errorf("docker sandbox: create shared workspace root: %w", err)
+	}
+	if err := os.Chown(p.opts.BaseDir, uid, gid); err != nil {
+		return fmt.Errorf("docker sandbox: chown shared workspace root: %w", err)
+	}
+	if err := os.Chmod(p.opts.BaseDir, 0o2770); err != nil {
+		return fmt.Errorf("docker sandbox: chmod shared workspace root: %w", err)
+	}
+	return nil
+}
+
 func NewProvider(opts Options) *Provider {
 	if opts.Image == "" {
 		opts.Image = "alpine:3.20"
@@ -96,7 +136,11 @@ func NewProvider(opts Options) *Provider {
 	return &Provider{opts: opts, handles: map[string]*handle{}}
 }
 func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, error) {
-	if key == "" {
+	return p.AcquireWorkspace(ctx, key, key)
+}
+
+func (p *Provider) AcquireWorkspace(ctx context.Context, key, workspaceKey string) (sandbox.Handle, error) {
+	if key == "" || workspaceKey == "" {
 		return nil, errors.New("docker sandbox: key is empty")
 	}
 	if !path.IsAbs(p.opts.VirtualRoot) {
@@ -108,22 +152,18 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 		return h, nil
 	}
 	safe := sanitize(key)
-	root := filepath.Join(p.opts.BaseDir, safe)
+	workspaceSafe := sanitize(workspaceKey)
+	root := filepath.Join(p.opts.BaseDir, workspaceSafe)
 	hostRoot := root
 	if p.opts.HostBaseDir != "" {
-		hostRoot = filepath.Join(filepath.Clean(p.opts.HostBaseDir), safe)
+		hostRoot = filepath.Join(filepath.Clean(p.opts.HostBaseDir), workspaceSafe)
 	}
-	if err := os.MkdirAll(root, 0o750); err != nil {
+	if err := os.MkdirAll(root, 0o2770); err != nil {
 		return nil, err
 	}
-	parts := strings.SplitN(p.opts.User, ":", 2)
-	uid, uidErr := strconv.Atoi(parts[0])
-	gid := uid
-	if len(parts) == 2 {
-		gid, uidErr = strconv.Atoi(parts[1])
-	}
-	if uidErr != nil {
-		return nil, fmt.Errorf("docker sandbox: invalid user %q", p.opts.User)
+	uid, gid, err := p.userIDs()
+	if err != nil {
+		return nil, err
 	}
 	// The controller container runs as root and must hand the bind mount to
 	// the non-root workload user. Host-side development processes (notably
@@ -134,7 +174,10 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 			return nil, fmt.Errorf("docker sandbox: chown workspace: %w", err)
 		}
 	}
-	root, err := filepath.EvalSymlinks(root)
+	if err := os.Chmod(root, 0o2770); err != nil {
+		return nil, fmt.Errorf("docker sandbox: chmod workspace: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil, fmt.Errorf("docker sandbox: resolve root: %w", err)
 	}
@@ -153,23 +196,48 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 		return nil, fmt.Errorf("docker sandbox: start: %w: %s", err, out)
 	}
 	h := &handle{name: name, root: root, opts: p.opts}
-	h.fs = &hostFS{root: root, virtualRoot: p.opts.VirtualRoot}
+	h.fs = &hostFS{root: root, virtualRoot: p.opts.VirtualRoot, uid: uid, gid: gid}
 	p.handles[key] = h
 	return h, nil
+}
+
+func (p *Provider) userIDs() (int, int, error) {
+	parts := strings.SplitN(p.opts.User, ":", 2)
+	uid, err := strconv.Atoi(parts[0])
+	gid := uid
+	if len(parts) == 2 {
+		gid, err = strconv.Atoi(parts[1])
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("docker sandbox: invalid user %q", p.opts.User)
+	}
+	return uid, gid, nil
 }
 func (p *Provider) Release(ctx context.Context, key string) error {
 	p.mu.Lock()
 	h := p.handles[key]
-	delete(p.handles, key)
 	p.mu.Unlock()
 	if h == nil {
 		return nil
 	}
 	out, err := exec.CommandContext(ctx, "docker", "rm", "-f", h.name).CombinedOutput()
 	if err != nil {
+		if strings.Contains(strings.ToLower(string(out)), "no such container") {
+			p.forget(key, h)
+			return nil
+		}
 		return fmt.Errorf("docker sandbox: remove: %w: %s", err, out)
 	}
+	p.forget(key, h)
 	return nil
+}
+
+func (p *Provider) forget(key string, h *handle) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handles[key] == h {
+		delete(p.handles, key)
+	}
 }
 
 type handle struct {
@@ -229,6 +297,8 @@ func (h *handle) Exec(ctx context.Context, c sandbox.Command) (*sandbox.ExecResu
 type hostFS struct {
 	root        string
 	virtualRoot string
+	uid         int
+	gid         int
 }
 
 func (f *hostFS) Resolve(path string) (string, error) {
@@ -324,10 +394,51 @@ func (f *hostFS) WriteFile(ctx context.Context, path string, data []byte) error 
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+	if err := f.ensureDir(filepath.Dir(p)); err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o640)
+	if err := os.WriteFile(p, data, 0o660); err != nil {
+		return err
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Chown(p, f.uid, f.gid); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(p, 0o660); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (f *hostFS) ensureDir(target string) error {
+	root, err := filepath.EvalSymlinks(f.root)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return sandbox.ErrEscape
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		if err := os.Mkdir(current, 0o2770); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if os.Geteuid() == 0 {
+			if err := os.Chown(current, f.uid, f.gid); err != nil {
+				return err
+			}
+		}
+		if err := os.Chmod(current, 0o2770); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (f *hostFS) List(ctx context.Context, path string) ([]sandbox.Entry, error) {
 	entries, _, err := f.list(ctx, path, 0)

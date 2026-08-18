@@ -54,6 +54,8 @@ func WriteTodos() tool.Definition {
 			if len(args.Todos) == 0 {
 				return errResult(errors.New("write_todos requires at least one task")), nil
 			}
+			planning, _ := run.Values["is_plan_mode"].(bool)
+			inProgress := 0
 			todos := make([]map[string]string, 0, len(args.Todos))
 			for _, item := range args.Todos {
 				content := strings.TrimSpace(item.Content)
@@ -65,7 +67,16 @@ func WriteTodos() tool.Definition {
 				default:
 					return errResult(fmt.Errorf("write_todos invalid task status %q", item.Status)), nil
 				}
+				if planning && item.Status != "pending" {
+					return errResult(errors.New("write_todos requires every task to be pending until the plan is approved")), nil
+				}
+				if item.Status == "in_progress" {
+					inProgress++
+				}
 				todos = append(todos, map[string]string{"content": content, "status": item.Status})
+			}
+			if inProgress > 1 {
+				return errResult(errors.New("write_todos allows at most one task to be in_progress")), nil
 			}
 			run.Values["todos"] = todos
 			if run.PersistValues == nil {
@@ -122,9 +133,9 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 			questionID := planReviewID(run.RunID, call.ID, args.Plan)
 			question, err := questions.Create(ctx, runtime.QuestionRequest{
 				ID: questionID, RunID: run.RunID, ThreadID: run.ThreadID, ToolCallID: call.ID,
-				Header: "Plan review", Question: "Approve this plan and leave plan mode?", Detail: args.Plan,
+				Header: "Review the complete plan", Question: "Approve this complete plan once and execute all todos?", Detail: args.Plan,
 				Options: []runtime.QuestionOption{
-					{Label: planApproveLabel, Description: "Leave plan mode and carry out the plan from the next step."},
+					{Label: planApproveLabel, Description: "Approve the entire plan once, leave plan mode, and execute every todo."},
 					{Label: planKeepPlanningLabel, Description: "Stay in plan mode and return feedback to the model."},
 				},
 				Intent: "plan-review",
@@ -171,18 +182,69 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 				}
 				return errResult(fmt.Errorf("the user chose to keep planning; feedback: %s", feedback)), nil
 			}
-			planEvent := runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventPlanModeChanged, runtime.PlanModeChanged{Active: false})
-			planEvent.IdempotencyKey = questionID + ":plan-mode-inactive"
+			todos, err := activateFirstPendingTodo(run.Values["todos"])
+			if err != nil {
+				return nil, fmt.Errorf("exit_plan_mode: activating approved plan: %w", err)
+			}
+			if run.PersistValues == nil {
+				return nil, errors.New("exit_plan_mode: thread state persistence is unavailable")
+			}
 			if run.Publish == nil {
 				return nil, errors.New("exit_plan_mode: durable event publisher is unavailable")
 			}
-			if _, err := run.Publish(context.WithoutCancel(ctx), planEvent); err != nil {
-				return nil, fmt.Errorf("exit_plan_mode: persisting plan mode: %w", err)
-			}
+			previousTodos := run.Values["todos"]
 			run.Values["is_plan_mode"] = false
+			run.Values["todos"] = todos
+			if err := run.PersistValues(context.WithoutCancel(ctx), run.Values); err != nil {
+				run.Values["is_plan_mode"] = true
+				run.Values["todos"] = previousTodos
+				return nil, fmt.Errorf("exit_plan_mode: persisting approved plan state: %w", err)
+			}
+			planEvent := runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventPlanModeChanged, runtime.PlanModeChanged{Active: false})
+			planEvent.IdempotencyKey = questionID + ":plan-mode-inactive"
+			if _, err := run.Publish(context.WithoutCancel(ctx), planEvent); err != nil {
+				run.Values["is_plan_mode"] = true
+				run.Values["todos"] = previousTodos
+				rollbackErr := run.PersistValues(context.WithoutCancel(ctx), run.Values)
+				return nil, errors.Join(fmt.Errorf("exit_plan_mode: persisting plan mode: %w", err), rollbackErr)
+			}
 			return &tool.Result{Content: "Plan approved. Plan mode exited; carry out the plan starting with the next step."}, nil
 		},
 	}
+}
+
+func activateFirstPendingTodo(value any) ([]map[string]string, error) {
+	var todos []map[string]string
+	switch items := value.(type) {
+	case []map[string]string:
+		for _, item := range items {
+			todos = append(todos, map[string]string{"content": item["content"], "status": item["status"]})
+		}
+	case []any:
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				return nil, errors.New("invalid persisted todo item")
+			}
+			todos = append(todos, map[string]string{"content": strings.TrimSpace(fmt.Sprint(item["content"])), "status": strings.TrimSpace(fmt.Sprint(item["status"]))})
+		}
+	default:
+		return nil, errors.New("approved plan has no task list")
+	}
+	activated := false
+	for _, item := range todos {
+		if item["status"] != "pending" {
+			return nil, fmt.Errorf("approved plan contains non-pending task %q", item["content"])
+		}
+		if !activated {
+			item["status"] = "in_progress"
+			activated = true
+		}
+	}
+	if !activated {
+		return nil, errors.New("approved plan has no pending task")
+	}
+	return todos, nil
 }
 
 func hasTodos(value any) bool {

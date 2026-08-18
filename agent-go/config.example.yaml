@@ -181,7 +181,7 @@ swarm:
 
 summarization:
   enabled: true
-  trigger_tokens: 96000
+  trigger_tokens: 80000
   keep_messages: 10
   max_summary_tokens: 1024
   max_input_messages: 200
@@ -206,7 +206,7 @@ loop:
   stop_reinjection_limit: 3
   deadline: 30m
   tool_concurrency: 4
-  token_budget: 100000
+  token_budget: 500000
   # Optional hard cost ceiling in integer micro-units for the whole run.
   cost_budget_micros: 0
   tool_call_budget: 200

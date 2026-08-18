@@ -90,10 +90,7 @@ func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]str
 }
 
 func planningToolAllowed(definition tool.Definition) bool {
-	if definition.Group == "planning" || definition.Name == "ask_clarification" {
-		return true
-	}
-	return definition.Metadata.IsReadOnly && definition.Name != "present_files"
+	return definition.Group == "planning" || definition.Name == "ask_clarification"
 }
 
 // restrictedToolSet applies one subagent profile after runtime feature and

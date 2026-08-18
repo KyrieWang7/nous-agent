@@ -231,6 +231,12 @@ func (ci *toolInterceptor) BeforeTool(ctx context.Context, call tool.Call) (tool
 			st.ToolCall.Args = decision.Args
 			out.Args = decision.Args
 		}
+		if decision.SandboxMode != "" {
+			if out.SandboxMode != "" && out.SandboxMode != decision.SandboxMode {
+				return tool.Decision{}, fmt.Errorf("lifecycle: conflicting sandbox modes %q and %q", out.SandboxMode, decision.SandboxMode)
+			}
+			out.SandboxMode = decision.SandboxMode
+		}
 		if decision.EndTurn {
 			out.EndTurn = true
 			out.Reason = firstNonEmpty(out.Reason, decision.Reason)

@@ -81,24 +81,27 @@ func (a Agent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager
 	if a.SystemPromptBuilder != nil {
 		systemPrompt = a.SystemPromptBuilder(values)
 	}
-	result, err := a.Runner.Run(ctx, loop.Request{
+	result, runErr := a.Runner.Run(ctx, loop.Request{
 		ThreadID: req.ThreadID, RunID: req.RunID, AssistantID: req.AssistantID,
 		SystemPrompt: systemPrompt, History: history, Prompt: req.Prompt,
 		ContentBlocks: req.ContentBlocks, Values: values,
 	})
-	if err != nil {
-		return runmanager.AgentResult{}, err
-	}
 	agentResult := runmanager.AgentResult{
-		Messages: history.Since(watermark), Output: result.Output,
-		Iterations: result.Iterations, Compacted: result.Compacted,
-		Streamed: result.Streamed, Values: result.Values, RiskLevel: result.RiskLevel,
-		Usage: runmanager.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens},
+		Messages: history.Since(watermark),
 	}
-	if result.Compacted {
-		agentResult.Transcript = history.All()
+	if result != nil {
+		agentResult.Output = result.Output
+		agentResult.Iterations = result.Iterations
+		agentResult.Compacted = result.Compacted
+		agentResult.Streamed = result.Streamed
+		agentResult.Values = result.Values
+		agentResult.RiskLevel = result.RiskLevel
+		agentResult.Usage = runmanager.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens}
+		if result.Compacted {
+			agentResult.Transcript = history.All()
+		}
 	}
-	return agentResult, nil
+	return agentResult, runErr
 }
 
 func (a Agent) resolveSandbox(ctx context.Context, req runmanager.AgentRequest, view capability.View) (sandbox.Provider, error) {

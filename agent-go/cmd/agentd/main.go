@@ -510,7 +510,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			if getErr != nil {
 				return builtAgent{}, getErr
 			}
-			promptSkills = append(promptSkills, prompt.Skill{Name: meta.Name, Description: meta.Description, Path: loaded.Path})
+			promptSkills = append(promptSkills, prompt.Skill{Name: meta.Name, Description: meta.Description})
 			if err := registerRuntimeValue(capabilities, capability.Definition{
 				Name: "skill." + meta.Name, Kind: capability.KindSkill,
 				Description: meta.Description, Scope: capability.ScopeGlobal,

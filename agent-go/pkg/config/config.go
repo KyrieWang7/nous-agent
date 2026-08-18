@@ -225,8 +225,8 @@ func Defaults() Config {
 		Server:      ServerConfig{Address: ":7776"},
 		Sandbox:     SandboxConfig{Enabled: true, Provider: "local", ExecTimeout: 30 * time.Second},
 		Permissions: PermissionConfig{Preset: permission.PresetWorkspaceWrite},
-		Plan: PlanConfig{Guidance: "You are in plan mode. Explore the problem, identify constraints, and maintain a concrete plan without implementing it. " +
-			"Call write_todos with the executable steps, then call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
+		Plan: PlanConfig{Guidance: "You are in plan mode. Think through the request, identify constraints, and prepare a concrete plan without using execution capabilities. " +
+			"Call write_todos before any work with every executable step set to pending, then call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
 			"Do not begin implementation until the user approves the plan; if they keep planning, revise it using their feedback and present it again."},
 		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, ToolCallBudget: 200, SubagentBudget: 20, MaxRecursionDepth: 1, LifecycleTimeout: 30 * time.Second},
 		Runtime:       RuntimeConfig{EventBufferSize: 500, EventTTL: 24 * time.Hour, HeartbeatInterval: 15 * time.Second},

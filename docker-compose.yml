@@ -17,6 +17,8 @@ services:
       SANDBOX_BASE_DIR: /var/lib/nous-sandbox
       SANDBOX_HOST_BASE_DIR: "${SANDBOX_HOST_BASE_DIR:-/tmp/nous-agent-sandboxes}"
       SANDBOX_IMAGE: "${SANDBOX_IMAGE:-alpine:3.20}"
+      SANDBOX_TTL: "${SANDBOX_TTL:-30m}"
+      SANDBOX_REAP_INTERVAL: "${SANDBOX_REAP_INTERVAL:-1m}"
     volumes:
       - ./agent-go:/app
       - "${DOCKER_HOST_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
@@ -81,12 +83,18 @@ services:
       NOUS_SKILLS_ROOT: /opt/nous/skills
       NOUS_WORKSPACE_ROOT: /data/workspaces
       CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:7775,http://127.0.0.1:7775}"
+    group_add:
+      - "65532"
+    depends_on:
+      sandboxd:
+        condition: service_healthy
     volumes:
       - ./agent-go/config.example.yaml:/etc/nous-agent/config.yaml:ro
       - ./skills/public:/opt/nous/skills/public:ro
       - gateway_custom_skills:/opt/nous/skills/custom
       - gateway_config:/config
       - agent_go_data:/data
+      - "${SANDBOX_HOST_BASE_DIR:-/tmp/nous-agent-sandboxes}:/data/workspaces"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

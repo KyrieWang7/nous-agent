@@ -74,6 +74,30 @@ func TestHostFSResolveCustomVirtualRoot(t *testing.T) {
 	}
 }
 
+func TestHostFSWriteCreatesSharedWorkspacePermissions(t *testing.T) {
+	root := t.TempDir()
+	f := &hostFS{root: root, virtualRoot: "/mnt/user-data", uid: os.Geteuid(), gid: os.Getegid()}
+	if err := f.WriteFile(context.Background(), "/mnt/user-data/outputs/nested/report.md", []byte("report")); err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{filepath.Join(root, "outputs"), filepath.Join(root, "outputs", "nested")} {
+		info, err := os.Stat(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o770 {
+			t.Fatalf("directory %s mode = %o, want 770", directory, info.Mode().Perm())
+		}
+	}
+	info, err := os.Stat(filepath.Join(root, "outputs", "nested", "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o660 {
+		t.Fatalf("file mode = %o, want 660", info.Mode().Perm())
+	}
+}
+
 func TestHostFSResolveRejectsSymlinkEscape(t *testing.T) {
 	t.Parallel()
 

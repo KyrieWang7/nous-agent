@@ -1,11 +1,12 @@
 "use client";
 
-import { FilesIcon, XIcon } from "lucide-react";
+import { FilesIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { usePromptInputController } from "@/components/ai-elements/prompt-input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   ResizableHandle,
@@ -362,6 +363,19 @@ export default function ChatPage() {
                         />
                       </div>
                     </div>
+                    {thread.error != null && (
+                      <Alert
+                        variant="destructive"
+                        className="mb-2 rounded-md bg-background/95"
+                      >
+                        <TriangleAlertIcon />
+                        <AlertDescription>
+                          {thread.error instanceof Error
+                            ? thread.error.message
+                            : "The run stopped before completion."}
+                        </AlertDescription>
+                      </Alert>
+                    )}
                     {thread.pendingQuestion?.intent === "plan-review" ? (
                       <PlanReview
                         question={thread.pendingQuestion}

@@ -10,7 +10,7 @@ import (
 var (
 	ErrMaxIterations   = errors.New("loop: max iterations reached")
 	ErrDeadline        = errors.New("loop: wall-clock deadline exceeded")
-	ErrBudgetExhausted = errors.New("loop: cost budget exhausted")
+	ErrBudgetExhausted = errors.New("loop: run budget exhausted")
 )
 
 // Limits 是内核的安全上限。

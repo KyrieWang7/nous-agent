@@ -21,6 +21,8 @@ import (
 
 const maxResponseBytes = 16 << 20
 
+var errInvalidLease = errors.New("remote sandbox: invalid or expired lease")
+
 type Options struct {
 	BaseURL, TenantID, VirtualRoot string
 	Headers                        map[string]string
@@ -69,9 +71,17 @@ func (p *Provider) Acquire(ctx context.Context, threadID string) (sandbox.Handle
 	p.mu.Lock()
 	if existing := p.leases[threadID]; existing != nil {
 		p.mu.Unlock()
-		return existing, nil
+		err := p.heartbeat(ctx, existing)
+		if err == nil {
+			return existing, nil
+		}
+		if !errors.Is(err, errInvalidLease) && !errors.Is(err, sandbox.ErrNotFound) {
+			return nil, err
+		}
+		p.forget(threadID, existing)
+	} else {
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
 	var response acquireResponse
 	if err := p.call(ctx, http.MethodPost, "/v2/sandboxes/acquire", map[string]any{"tenant_id": p.opts.TenantID, "thread_id": threadID}, &response); err != nil {
 		return nil, err
@@ -97,13 +107,30 @@ func (p *Provider) Acquire(ctx context.Context, threadID string) (sandbox.Handle
 func (p *Provider) Release(ctx context.Context, threadID string) error {
 	p.mu.Lock()
 	h := p.leases[threadID]
-	delete(p.leases, threadID)
 	p.mu.Unlock()
 	if h == nil {
 		return nil
 	}
 	endpoint := "/v2/sandboxes/" + url.PathEscape(h.id) + "?lease_id=" + url.QueryEscape(h.leaseID)
-	return p.call(ctx, http.MethodDelete, endpoint, nil, nil)
+	err := p.call(ctx, http.MethodDelete, endpoint, nil, nil)
+	if err != nil && !errors.Is(err, errInvalidLease) && !errors.Is(err, sandbox.ErrNotFound) {
+		return err
+	}
+	p.forget(threadID, h)
+	return nil
+}
+
+func (p *Provider) heartbeat(ctx context.Context, h *handle) error {
+	endpoint := "/v2/sandboxes/" + url.PathEscape(h.id) + "/heartbeat"
+	return p.call(ctx, http.MethodPost, endpoint, map[string]string{"lease_id": h.leaseID}, nil)
+}
+
+func (p *Provider) forget(threadID string, h *handle) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.leases[threadID] == h {
+		delete(p.leases, threadID)
+	}
 }
 
 func (p *Provider) call(ctx context.Context, method, endpoint string, requestBody, responseBody any) error {
@@ -140,6 +167,9 @@ func (p *Provider) call(ctx context.Context, method, endpoint string, requestBod
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode == http.StatusNotFound {
 			return sandbox.ErrNotFound
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("%w: %s", errInvalidLease, strings.TrimSpace(string(raw)))
 		}
 		return fmt.Errorf("remote sandbox: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}

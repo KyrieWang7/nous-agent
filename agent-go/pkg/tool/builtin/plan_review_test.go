@@ -28,6 +28,10 @@ func TestExitPlanModeApprovesThroughQuestionCapability(t *testing.T) {
 	if active, _ := fixture.values["is_plan_mode"].(bool); active {
 		t.Fatal("plan mode stayed active after durable approval")
 	}
+	todos := fixture.values["todos"].([]map[string]string)
+	if todos[0]["status"] != "in_progress" {
+		t.Fatalf("approved todos = %#v, want first task in_progress", todos)
+	}
 	if got := fixture.eventTypes(); len(got) != 3 || got[0] != runtime.EventQuestionRequested || got[1] != runtime.EventQuestionResolved || got[2] != runtime.EventPlanModeChanged {
 		t.Fatalf("events=%#v", got)
 	}
@@ -145,6 +149,10 @@ func newPlanReviewFixture(t *testing.T, fail func(runtime.Event) error) *planRev
 				return seq, fail(event)
 			}
 			return seq, nil
+		},
+		PersistValues: func(_ context.Context, values map[string]any) error {
+			fixture.values = values
+			return nil
 		},
 	}
 	fixture.ctx = runtime.WithRunContext(context.Background(), run)

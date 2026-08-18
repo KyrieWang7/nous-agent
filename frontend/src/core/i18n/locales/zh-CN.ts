@@ -173,6 +173,17 @@ export const zhCN: Translations = {
     startConversation: "开始新的对话以查看消息",
   },
 
+  planReview: {
+    title: "审核整份计划",
+    description: "批准一次后，将连续执行这份计划中的所有待办事项。",
+    onceHint: "此次批准针对整份计划，不是审批某一条待办。",
+    feedbackPlaceholder: "需要继续完善计划时，可在此补充意见（可选）",
+    keepPlanning: "继续规划",
+    approveEntirePlan: "批准整份计划并开始执行",
+    dismiss: "关闭计划审核",
+    submitError: "提交计划审核失败",
+  },
+
   // Chats
   chats: {
     searchChats: "搜索对话",

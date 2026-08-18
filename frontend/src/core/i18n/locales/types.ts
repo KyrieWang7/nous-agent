@@ -124,6 +124,17 @@ export interface Translations {
     startConversation: string;
   };
 
+  planReview: {
+    title: string;
+    description: string;
+    onceHint: string;
+    feedbackPlaceholder: string;
+    keepPlanning: string;
+    approveEntirePlan: string;
+    dismiss: string;
+    submitError: string;
+  };
+
   // Chats
   chats: {
     searchChats: string;

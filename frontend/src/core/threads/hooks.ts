@@ -50,6 +50,15 @@ import type {
   TokenUsage,
 } from "./types";
 
+function isCancellationError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  if (!(error instanceof Error) && typeof error !== "string") return false;
+  const message = (error instanceof Error ? error.message : error)
+    .trim()
+    .toLowerCase();
+  return message === "context canceled" || message === "context cancelled";
+}
+
 // ---------------------------------------------------------------------------
 // useThreadHistory — load thread state for existing conversations
 // ---------------------------------------------------------------------------
@@ -389,6 +398,7 @@ function useSSEStream(
         setState((prev) => ({
           ...prev,
           pendingQuestion: customData as unknown as PendingUserQuestion,
+          error: isCancellationError(prev.error) ? undefined : prev.error,
         }));
       } else if (customData.type === "question_resolved") {
         setState((prev) =>
@@ -499,6 +509,10 @@ function useSSEStream(
       const errMsg =
         errData.error?.message ?? errData.message ?? "Stream error";
       console.info(`[SSE] Backend error: ${errMsg}`);
+      if (isCancellationError(errMsg)) {
+        setState((prev) => ({ ...prev, isLoading: false, error: undefined }));
+        return;
+      }
       toast.error(errMsg);
       setState((prev) => ({
         ...prev,
@@ -559,9 +573,8 @@ function useSSEStream(
         // dropped one or more message deltas. The persisted projection is the
         // source of truth, so reconcile it once at the terminal boundary.
         try {
-          const persisted = await getAPIClient().threads.getState<AgentThreadState>(
-            threadId,
-          );
+          const persisted =
+            await getAPIClient().threads.getState<AgentThreadState>(threadId);
           if (persisted.values?.messages?.length) {
             flushSync(() => {
               setState((prev) => ({
@@ -584,8 +597,12 @@ function useSSEStream(
 
         setState((prev) => ({ ...prev, isLoading: false }));
       } catch (err: unknown) {
-        if (err instanceof Error && err.name === "AbortError") {
-          setState((prev) => ({ ...prev, isLoading: false }));
+        if (isCancellationError(err)) {
+          setState((prev) => ({
+            ...prev,
+            isLoading: false,
+            error: undefined,
+          }));
           return;
         }
         console.error("SSE stream error:", err);

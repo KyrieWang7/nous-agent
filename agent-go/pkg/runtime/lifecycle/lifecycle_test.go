@@ -380,6 +380,18 @@ func TestChain_ToolInterceptorPropagatesRewrittenArgs(t *testing.T) {
 	}
 }
 
+func TestChain_ToolInterceptorPropagatesSandboxMode(t *testing.T) {
+	t.Parallel()
+	c := mustChain(t, sandboxSelector{name: "permission", mode: "workspace-write"})
+	decision, err := c.ToolInterceptor(newState()).BeforeTool(context.Background(), tool.Call{ID: "1", Name: "write_file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.SandboxMode != "workspace-write" {
+		t.Fatalf("sandbox mode = %q, want workspace-write", decision.SandboxMode)
+	}
+}
+
 func TestChain_ToolInterceptorAfterToolSeesResultAndExecErr(t *testing.T) {
 	t.Parallel()
 
@@ -746,6 +758,16 @@ func (d denier) BeforeTool(context.Context, *lifecycle.State) (tool.Decision, er
 type rewriter struct {
 	name string
 	args string
+}
+
+type sandboxSelector struct {
+	name string
+	mode string
+}
+
+func (s sandboxSelector) Name() string { return s.name }
+func (s sandboxSelector) BeforeTool(context.Context, *lifecycle.State) (tool.Decision, error) {
+	return tool.Decision{SandboxMode: s.mode}, nil
 }
 
 func (r rewriter) Name() string { return r.name }

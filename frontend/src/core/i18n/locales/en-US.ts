@@ -176,6 +176,18 @@ export const enUS: Translations = {
     startConversation: "Start a conversation to see messages here",
   },
 
+  planReview: {
+    title: "Review the complete plan",
+    description: "Approve once to execute every todo in this plan.",
+    onceHint:
+      "This approval applies to the entire plan, not an individual todo.",
+    feedbackPlaceholder: "Feedback for another planning pass (optional)",
+    keepPlanning: "Keep planning",
+    approveEntirePlan: "Approve entire plan and start",
+    dismiss: "Dismiss plan review",
+    submitError: "Could not submit plan review",
+  },
+
   // Chats
   chats: {
     searchChats: "Search chats",

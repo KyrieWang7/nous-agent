@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -27,6 +28,7 @@ type Enforcement struct {
 type Options struct {
 	TTL, ReapInterval time.Duration
 	Enforcement       Enforcement
+	Logger            *slog.Logger
 }
 type Lease struct {
 	ID          string      `json:"id"`
@@ -39,8 +41,9 @@ type Lease struct {
 }
 type record struct {
 	Lease
-	key    string
-	handle sandbox.Handle
+	key        string
+	handle     sandbox.Handle
+	reclaiming bool
 }
 type Manager struct {
 	provider  sandbox.Provider
@@ -66,6 +69,11 @@ func New(provider sandbox.Provider, opts Options) (*Manager, error) {
 	if err := enforced.Verify(verifyCtx); err != nil {
 		return nil, fmt.Errorf("sandbox controller: backend verification failed: %w", err)
 	}
+	if reconciler, ok := provider.(sandbox.StartupReconciler); ok {
+		if err := reconciler.Reconcile(verifyCtx); err != nil {
+			return nil, fmt.Errorf("sandbox controller: startup reconciliation failed: %w", err)
+		}
+	}
 	if opts.Enforcement.Backend == "" || opts.Enforcement.Isolation == "" || opts.Enforcement.NetworkDefault != "none" || !opts.Enforcement.NonRoot || !opts.Enforcement.ReadOnlyRoot || !opts.Enforcement.ResourceLimits {
 		return nil, errors.New("sandbox controller: backend enforcement facts are incomplete; require isolated, network-none, non-root, read-only-root and resource limits")
 	}
@@ -74,6 +82,9 @@ func New(provider sandbox.Provider, opts Options) (*Manager, error) {
 	}
 	if opts.ReapInterval <= 0 {
 		opts.ReapInterval = min(opts.TTL/4, time.Minute)
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
 	m := &Manager{provider: provider, opts: opts, byID: map[string]*record{}, byKey: map[string]*record{}, stop: make(chan struct{}), done: make(chan struct{})}
 	go m.reapLoop()
@@ -86,7 +97,7 @@ func (m *Manager) Acquire(ctx context.Context, tenantID, threadID string) (Lease
 	key := tenantID + "\x00" + threadID
 	now := time.Now().UTC()
 	m.mu.Lock()
-	if rec := m.byKey[key]; rec != nil && now.Before(rec.ExpiresAt) {
+	if rec := m.byKey[key]; rec != nil && !rec.reclaiming && now.Before(rec.ExpiresAt) {
 		rec.ExpiresAt = now.Add(m.opts.TTL)
 		lease := rec.Lease
 		m.mu.Unlock()
@@ -101,13 +112,13 @@ func (m *Manager) Acquire(ctx context.Context, tenantID, threadID string) (Lease
 	if err != nil {
 		return Lease{}, err
 	}
-	h, err := m.provider.Acquire(ctx, id)
+	h, err := m.acquireBackend(ctx, id, threadID)
 	if err != nil {
 		return Lease{}, fmt.Errorf("sandbox controller: backend acquire: %w", err)
 	}
 	rec := &record{Lease: Lease{ID: id, LeaseID: leaseID, TenantID: tenantID, ThreadID: threadID, Root: h.Root(), ExpiresAt: now.Add(m.opts.TTL), Enforcement: m.opts.Enforcement}, key: key, handle: h}
 	m.mu.Lock()
-	if existing := m.byKey[key]; existing != nil && now.Before(existing.ExpiresAt) {
+	if existing := m.byKey[key]; existing != nil && !existing.reclaiming && now.Before(existing.ExpiresAt) {
 		m.mu.Unlock()
 		_ = m.provider.Release(ctx, id)
 		return existing.Lease, nil
@@ -116,6 +127,14 @@ func (m *Manager) Acquire(ctx context.Context, tenantID, threadID string) (Lease
 	m.mu.Unlock()
 	return rec.Lease, nil
 }
+
+func (m *Manager) acquireBackend(ctx context.Context, resourceID, threadID string) (sandbox.Handle, error) {
+	if provider, ok := m.provider.(sandbox.WorkspaceProvider); ok {
+		return provider.AcquireWorkspace(ctx, resourceID, threadID)
+	}
+	return m.provider.Acquire(ctx, resourceID)
+}
+
 func (m *Manager) Use(id, leaseID string) (sandbox.Handle, Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -124,7 +143,7 @@ func (m *Manager) Use(id, leaseID string) (sandbox.Handle, Lease, error) {
 		return nil, Lease{}, errors.New("sandbox controller: backend enforcement is no longer verified")
 	}
 	rec := m.byID[id]
-	if rec == nil || rec.LeaseID != leaseID || !time.Now().UTC().Before(rec.ExpiresAt) {
+	if rec == nil || rec.reclaiming || rec.LeaseID != leaseID || !time.Now().UTC().Before(rec.ExpiresAt) {
 		return nil, Lease{}, ErrLease
 	}
 	rec.ExpiresAt = time.Now().UTC().Add(m.opts.TTL)
@@ -150,10 +169,22 @@ func (m *Manager) Release(ctx context.Context, id, leaseID string) error {
 		m.mu.Unlock()
 		return ErrLease
 	}
-	delete(m.byID, id)
-	delete(m.byKey, rec.key)
+	if rec.reclaiming {
+		m.mu.Unlock()
+		return ErrLease
+	}
+	rec.reclaiming = true
 	m.mu.Unlock()
-	return m.provider.Release(ctx, id)
+	if err := m.provider.Release(ctx, id); err != nil {
+		m.mu.Lock()
+		if m.byID[id] == rec {
+			rec.reclaiming = false
+		}
+		m.mu.Unlock()
+		return err
+	}
+	m.forget(rec)
+	return nil
 }
 func (m *Manager) Enforcement() Enforcement { return m.opts.Enforcement }
 func (m *Manager) Close() error             { m.closeOnce.Do(func() { close(m.stop) }); <-m.done; return nil }
@@ -173,10 +204,9 @@ func (m *Manager) reapLoop() {
 func (m *Manager) reap(now time.Time) {
 	var expired []*record
 	m.mu.Lock()
-	for id, rec := range m.byID {
-		if !now.Before(rec.ExpiresAt) {
-			delete(m.byID, id)
-			delete(m.byKey, rec.key)
+	for _, rec := range m.byID {
+		if !rec.reclaiming && !now.Before(rec.ExpiresAt) {
+			rec.reclaiming = true
 			expired = append(expired, rec)
 		}
 	}
@@ -184,7 +214,28 @@ func (m *Manager) reap(now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, rec := range expired {
-		_ = m.provider.Release(ctx, rec.ID)
+		if err := m.provider.Release(ctx, rec.ID); err != nil {
+			m.mu.Lock()
+			if m.byID[rec.ID] == rec {
+				rec.reclaiming = false
+			}
+			m.mu.Unlock()
+			m.opts.Logger.Warn("sandbox reclamation failed; will retry", "sandbox_id", rec.ID, "tenant_id", rec.TenantID, "thread_id", rec.ThreadID, "error", err)
+			continue
+		}
+		m.forget(rec)
+		m.opts.Logger.Info("sandbox reclaimed", "sandbox_id", rec.ID, "tenant_id", rec.TenantID, "thread_id", rec.ThreadID)
+	}
+}
+
+func (m *Manager) forget(rec *record) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byID[rec.ID] == rec {
+		delete(m.byID, rec.ID)
+	}
+	if m.byKey[rec.key] == rec {
+		delete(m.byKey, rec.key)
 	}
 }
 func randomID(prefix string) (string, error) {

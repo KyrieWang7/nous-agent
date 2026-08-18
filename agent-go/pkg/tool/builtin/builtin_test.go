@@ -61,6 +61,16 @@ func TestWriteTodosRequiresManagedModeAndPersistsState(t *testing.T) {
 	if !persisted {
 		t.Fatal("todo state was not persisted")
 	}
+	if result := run(t, active, definition, `{"todos":[{"content":"Inspect","status":"completed"}]}`); !result.IsError || !strings.Contains(result.Content, "pending until the plan is approved") {
+		t.Fatalf("planning completed result = %#v", result)
+	}
+	executing := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		Values:        map[string]any{"mode": "pro", "is_plan_mode": false},
+		PersistValues: func(context.Context, map[string]any) error { return nil },
+	})
+	if result := run(t, executing, definition, `{"todos":[{"content":"One","status":"in_progress"},{"content":"Two","status":"in_progress"}]}`); !result.IsError || !strings.Contains(result.Content, "at most one") {
+		t.Fatalf("multiple in-progress result = %#v", result)
+	}
 }
 
 // --- 元数据（决定并发分段与沙箱要求）---

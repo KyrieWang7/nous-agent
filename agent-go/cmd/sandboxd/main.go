@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,16 +28,26 @@ func main() {
 }
 
 func run() error {
+	ttlDefault, err := envDuration("SANDBOX_TTL", 30*time.Minute)
+	if err != nil {
+		return err
+	}
+	reapDefault, err := envDuration("SANDBOX_REAP_INTERVAL", time.Minute)
+	if err != nil {
+		return err
+	}
 	address := flag.String("address", envOr("SANDBOXD_ADDRESS", ":7780"), "listen address")
 	token := flag.String("token", os.Getenv("SANDBOX_CONTROLLER_TOKEN"), "control-plane bearer token")
 	baseDir := flag.String("base-dir", envOr("SANDBOX_BASE_DIR", "/var/lib/nous-sandbox"), "controller-visible workspace directory")
 	hostBaseDir := flag.String("host-base-dir", os.Getenv("SANDBOX_HOST_BASE_DIR"), "Docker-host-visible workspace directory")
 	image := flag.String("image", envOr("SANDBOX_IMAGE", "alpine:3.20"), "sandbox workload image")
+	ttl := flag.Duration("ttl", ttlDefault, "idle sandbox lease lifetime")
+	reapInterval := flag.Duration("reap-interval", reapDefault, "expired sandbox scan interval")
 	flag.Parse()
 
 	provider := dockersandbox.NewProvider(dockersandbox.Options{Image: *image, BaseDir: *baseDir, HostBaseDir: *hostBaseDir, VirtualRoot: "/mnt/user-data", ExecTimeout: 30 * time.Second})
 	enforcement := controller.Enforcement{Backend: "docker", Isolation: "container", NetworkDefault: "none", NonRoot: true, ReadOnlyRoot: true, ResourceLimits: true}
-	manager, err := controller.New(provider, controller.Options{TTL: 30 * time.Minute, Enforcement: enforcement})
+	manager, err := controller.New(provider, controller.Options{TTL: *ttl, ReapInterval: *reapInterval, Enforcement: enforcement, Logger: slog.Default()})
 	if err != nil {
 		return err
 	}
@@ -66,4 +77,16 @@ func envOr(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s duration %q: %w", name, value, err)
+	}
+	return parsed, nil
 }

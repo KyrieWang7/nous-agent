@@ -65,6 +65,40 @@ func TestManagerPersistsCanonicalTranscriptBeforeProjectionSnapshot(t *testing.T
 	}
 }
 
+func TestManagerPersistsPartialTranscriptWhenAgentFails(t *testing.T) {
+	store := &testMetadataStore{}
+	var transcriptEvents int
+	agent := agentFunc(func(context.Context, AgentRequest) (AgentResult, error) {
+		return AgentResult{
+			Messages: []message.Message{
+				{Role: message.RoleUser, Content: "work"},
+				{Role: message.RoleAssistant, Content: "partial"},
+			},
+			Values: map[string]any{"todos": []any{map[string]any{"content": "work", "status": "in_progress"}}},
+		}, errors.New("budget exhausted")
+	})
+	manager, registry := newTestManager(t, agent, store, nil, func(event runtime.Event) (int64, error) {
+		if event.Type == runtime.EventTranscriptAppend {
+			transcriptEvents++
+		}
+		return int64(transcriptEvents + 1), nil
+	}, nil)
+	defer registry.Close()
+	manager.Execute(context.Background(), registeredTestRun(t, registry), Input{Prompt: "work"})
+	if transcriptEvents != 1 {
+		t.Fatalf("transcript events = %d, want 1", transcriptEvents)
+	}
+	if len(store.history) != 2 || store.history[1].Content != "partial" {
+		t.Fatalf("saved history = %#v", store.history)
+	}
+	if store.completion.Status != "error" || store.terminal.Status != "error" {
+		t.Fatalf("completion=%#v terminal=%#v", store.completion, store.terminal)
+	}
+	if len(store.values) == 0 {
+		t.Fatal("partial run values were not persisted")
+	}
+}
+
 func TestManagerConvertsAgentPanicAndReleasesPreparedGenerationOnce(t *testing.T) {
 	var releases atomic.Int32
 	prepared := preparingAgent{prepared: PreparedRun{

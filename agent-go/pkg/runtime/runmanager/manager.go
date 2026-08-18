@@ -234,6 +234,11 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 	}
 
 	status := statusForError(runErr)
+	if runErr != nil {
+		if persistErr := m.persistPartialResult(persistCtx, run, history, result); persistErr != nil {
+			runErr = errors.Join(runErr, persistErr)
+		}
+	}
 	if runErr == nil {
 		if journal.Totals().LLMCalls == 0 {
 			journal.Observe(runtime.Entry{Bucket: runtime.BucketLead, Source: "lead", CallID: run.RunID, Usage: model.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens}})
@@ -459,6 +464,48 @@ func (m *Manager) saveSnapshot(ctx context.Context, run Run, seq int64, previous
 	if err := m.snapshots.Save(ctx, replay.Snapshot{RunID: run.RunID, ThreadID: run.ThreadID, LastSeq: seq, Messages: messages, CreatedAt: time.Now().UTC()}); err != nil {
 		m.logger.WarnContext(ctx, "saving replay snapshot", "run_id", run.RunID, "error", err)
 	}
+}
+
+// persistPartialResult preserves the transcript and state produced before an
+// execution error. A failed run remains part of the conversation and must be
+// replayable after refresh just like a successful run.
+func (m *Manager) persistPartialResult(ctx context.Context, run Run, previous []message.Message, result AgentResult) error {
+	toSave := result.Messages
+	replaced := false
+	if result.Compacted && result.Transcript != nil {
+		toSave = result.Transcript
+		replaced = true
+	}
+	if len(toSave) == 0 && result.Output != "" {
+		toSave = []message.Message{{Role: message.RoleAssistant, Content: result.Output, IsError: true}}
+	}
+	var errs []error
+	if len(toSave) > 0 {
+		eventType, payload := runtime.EventTranscriptAppend, any(runtime.TranscriptAppend{Messages: toSave})
+		if replaced {
+			eventType, payload = runtime.EventTranscriptReplace, runtime.TranscriptReplace{Messages: toSave}
+		}
+		event := runtime.MustEvent(run.RunID, run.ThreadID, eventType, payload)
+		event.IdempotencyKey = "run:" + run.RunID + ":transcript"
+		seq, err := m.publishEvent(ctx, event)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("persisting failed run transcript: %w", err))
+		} else if err := m.store.SaveHistory(ctx, run.ThreadID, toSave, replaced); err != nil {
+			errs = append(errs, fmt.Errorf("saving failed run history: %w", err))
+		} else {
+			m.saveSnapshot(ctx, run, seq, previous, toSave, replaced)
+		}
+	}
+	if len(result.Values) > 0 {
+		if err := m.store.SaveThreadValues(ctx, run.ThreadID, result.Values); err != nil {
+			errs = append(errs, fmt.Errorf("saving failed run state: %w", err))
+		} else if values, err := m.store.LoadThreadValues(ctx, run.ThreadID); err != nil {
+			errs = append(errs, fmt.Errorf("loading failed run state: %w", err))
+		} else if err := m.project(ctx, run, Projection{Kind: ProjectionValues, Data: values}); err != nil {
+			errs = append(errs, fmt.Errorf("publishing failed run state: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (m *Manager) publishError(logCtx, persistCtx context.Context, run Run, operation string, cause error) {
