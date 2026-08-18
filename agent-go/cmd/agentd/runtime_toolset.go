@@ -62,7 +62,7 @@ func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]str
 			}
 		}
 		switch name {
-		case "task":
+		case "task", "swarm_batch":
 			if swarmEnabled && isLeadRun(st) && !hasSwarmTeam {
 				continue
 			}
@@ -125,7 +125,7 @@ func (r restrictedToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]
 			continue
 		}
 		switch name {
-		case "task", "ask_clarification", "present_files", "team_create", "team_delete":
+		case "task", "swarm_batch", "ask_clarification", "present_files", "team_create", "team_delete":
 			continue
 		}
 		out = append(out, name)

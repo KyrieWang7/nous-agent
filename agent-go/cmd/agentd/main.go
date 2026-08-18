@@ -428,7 +428,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	}
 	var runtimePlugins []runtimeplugin.Plugin
 	if cfg.Plugins.Enabled {
-		reserved := append(registry.Names(), "task", "team_create", "team_delete", "list_teammates", "send_message", "invoke_acp_agent")
+		reserved := append(registry.Names(), "task", "swarm_batch", "team_create", "team_delete", "list_teammates", "send_message", "invoke_acp_agent")
 		contributions, pluginErr := plugin.Load(cfg.Plugins.Directories, reserved)
 		if pluginErr != nil {
 			return builtAgent{}, pluginErr
@@ -682,6 +682,9 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		return builtAgent{}, err
 	}
 	if err := registry.Register(telemetryObserver.InstrumentToolDefinition(manager.TaskTool())); err != nil {
+		return builtAgent{}, err
+	}
+	if err := registry.Register(telemetryObserver.InstrumentToolDefinition(manager.SwarmBatchTool())); err != nil {
 		return builtAgent{}, err
 	}
 	chain := baseLifecycle()

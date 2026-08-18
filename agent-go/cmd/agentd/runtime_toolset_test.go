@@ -20,6 +20,7 @@ func TestRuntimeToolSetAppliesRunCapabilities(t *testing.T) {
 		testTool("write_file", "file:write", false),
 		testTool("ask_clarification", "interaction", true),
 		testTool("task", "subagent", false),
+		testTool("swarm_batch", "swarm", false),
 		testTool("team_create", "swarm", false),
 	} {
 		if err := registry.Register(definition); err != nil {
@@ -111,6 +112,7 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 	registry := tool.NewRegistry()
 	for _, definition := range []tool.Definition{
 		testTool("task", "subagent", false),
+		testTool("swarm_batch", "swarm", false),
 		testTool("team_create", "swarm", false),
 		testTool("team_delete", "swarm", false),
 		testTool("write_todos", "planning", false),
@@ -133,7 +135,7 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 		want   []string
 	}{
 		{name: "before team creation", want: []string{"team_create", "write_todos"}},
-		{name: "after team creation", teamID: "team-1", want: []string{"task", "team_delete", "write_todos"}},
+		{name: "after team creation", teamID: "team-1", want: []string{"swarm_batch", "task", "team_delete", "write_todos"}},
 		{name: "after team deletion", teamID: "", want: []string{"team_create", "write_todos"}},
 	}
 	for _, tt := range tests {
@@ -174,6 +176,7 @@ func TestRestrictedToolSetGivesSwarmTeammatesWorkToolsWithoutNestedOrchestration
 		testTool("read_file", "file:read", true),
 		testTool("write_file", "file:write", false),
 		testTool("task", "subagent", true),
+		testTool("swarm_batch", "swarm", true),
 		testTool("ask_clarification", "interaction", true),
 		testTool("present_files", "interaction", true),
 		testTool("team_create", "swarm", false),

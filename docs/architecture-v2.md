@@ -239,6 +239,12 @@ PolicyProvider
 - 保证投递给模型的 schema 顺序稳定；
 - 禁止子 Agent 扩大父 Agent 的权限和预算。
 
+Swarm 不进入 Kernel，也不建立第二套 Agent Loop。它作为 Agent capability
+之上的协作策略：`swarm_batch` 将稳定的 `objective + items` 契约映射为多个普通
+Subagent Session，复用父 run 的预算、权限、事件和持久化边界；可选 reviewer 在 worker
+终态后顺序执行，lead 再完成最终综合。Team、Member、Inbox 与广播回执保持 durable，
+批量调度只负责 fan-out/fan-in，不拥有模型循环。
+
 ### 3.3 Mode Policy
 
 产品可以提供 Flash、Thinking、Pro、Ultra 等交互模式，但模式语义必须在 Harness

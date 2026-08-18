@@ -55,9 +55,9 @@ Agent Loop 的核心语义不通过 middleware 扩展机制隐式改变；业务
 - OpenAI-compatible 与 Anthropic 模型路由，支持按 run 选择模型与 thinking 配置。
 - SSE 流式响应、事件回放、取消、断线重连和 PostgreSQL/Redis 持久化。
 - 沙箱文件系统、权限控制、Hooks、MCP、Skills、Todo、摘要压缩和 Guardrails。
-- 配置化 Web 工具、命令插件、ACP v1 Agent，以及远程/Kubernetes 沙箱服务。
+- 配置化 Web 工具、命令插件、ACP v1 Agent，以及统一 Remote Sandbox API v2：本地连接自建 Docker 沙箱，云端连接部署在独立机器上的自建或开源沙箱服务，不提供 Kubernetes backend。
 - Subagent 生命周期、并发限制、状态事件和父子 Token 归因。
-- Swarm 团队、可信身份、定向消息、逐成员广播回执和收件箱轮询。
+- Swarm 团队、可信身份、批量并发 worker、可选 reviewer、定向消息、逐成员广播回执和收件箱轮询。
 - Go 原生 PDF、DOCX、PPTX、XLSX 转 Markdown；旧 Office 格式由 Gateway 镜像内的 LibreOffice 归一化。
 
 前端事件投影使用 `metadata`、`values`、`messages`、`custom`、`error`、`end`。运行时内部保留更细的 `content_delta`、`reasoning_delta`、工具、任务、用量和审计事件。
@@ -126,7 +126,7 @@ make migrate-current
 
 Subagent 与 Swarm 以 Go 实现为准。Subagent 使用受限并发的子 Harness，子任务事件通过现有 `custom` 事件投影为 `task_started`、`task_running`、`task_completed`、`task_failed` 或 `task_timed_out`。
 
-Swarm 身份来自可信的 run context，模型不能伪造 `team_id` 或发送者。广播消息使用逐成员回执，不会被第一个轮询者独占。Swarm 依赖 PostgreSQL，并需在 Harness 配置或 run 能力中启用。
+Swarm 身份来自可信的 run context，模型不能伪造 `team_id` 或发送者。`swarm_batch` 以稳定任务契约并发分发 2-N 个 worker，可顺序追加 reviewer；worker 仍使用普通 Subagent Session 的预算、权限、持久化和事件链，最终结果由 lead 综合。广播消息使用逐成员回执，不会被第一个轮询者独占。Swarm 依赖 PostgreSQL，并需在 Harness 配置或 run 能力中启用。
 
 ## 历史数据迁移
 

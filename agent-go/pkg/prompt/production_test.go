@@ -42,7 +42,7 @@ func TestProductionCapabilitySections(t *testing.T) {
 		t.Fatal("disabled capability sections leaked into the prompt")
 	}
 	swarm := prompt.Production(opts, prompt.RuntimeOptions{Swarm: true})
-	for _, section := range []string{"## Subagents", "## Swarm Mode", "create the team with team_create", "task is unavailable", "trusted run context"} {
+	for _, section := range []string{"## Subagents", "## Swarm Mode", "create the team with team_create", "task is unavailable", "swarm_batch", "reviewer", "trusted run context"} {
 		if !strings.Contains(swarm, section) {
 			t.Fatalf("swarm prompt is missing %q", section)
 		}
