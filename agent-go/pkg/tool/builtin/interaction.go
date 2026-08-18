@@ -33,14 +33,14 @@ func WriteTodos() tool.Definition {
 	return tool.Definition{
 		Name:        "write_todos",
 		Group:       "planning",
-		Description: "Use in plan mode to replace the current task list with updated items and statuses.",
+		Description: "Create or replace the current structured task list. In planning, define the execution steps; during execution, update each step immediately as its status changes.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["content","status"]}}},"required":["todos"]}`),
 		Metadata:    tool.Metadata{IsAgentState: true},
 		Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
 			run, ok := runtime.RunContextFrom(ctx)
-			active, _ := run.Values["is_plan_mode"].(bool)
-			if !ok || !active {
-				return errResult(fmt.Errorf("write_todos is available only while plan mode is active")), nil
+			mode := runtime.Mode(strings.ToLower(strings.TrimSpace(fmt.Sprint(run.Values["mode"]))))
+			if !ok || (mode != runtime.ModePro && mode != runtime.ModeUltra) {
+				return errResult(fmt.Errorf("write_todos is available only in pro or ultra mode")), nil
 			}
 			var args struct {
 				Todos []struct {
@@ -51,7 +51,30 @@ func WriteTodos() tool.Definition {
 			if err := json.Unmarshal(call.Args, &args); err != nil {
 				return errResult(err), nil
 			}
-			raw, _ := json.Marshal(args.Todos)
+			if len(args.Todos) == 0 {
+				return errResult(errors.New("write_todos requires at least one task")), nil
+			}
+			todos := make([]map[string]string, 0, len(args.Todos))
+			for _, item := range args.Todos {
+				content := strings.TrimSpace(item.Content)
+				if content == "" {
+					return errResult(errors.New("write_todos task content cannot be empty")), nil
+				}
+				switch item.Status {
+				case "pending", "in_progress", "completed":
+				default:
+					return errResult(fmt.Errorf("write_todos invalid task status %q", item.Status)), nil
+				}
+				todos = append(todos, map[string]string{"content": content, "status": item.Status})
+			}
+			run.Values["todos"] = todos
+			if run.PersistValues == nil {
+				return nil, errors.New("write_todos: thread state persistence is unavailable")
+			}
+			if err := run.PersistValues(ctx, run.Values); err != nil {
+				return nil, fmt.Errorf("write_todos: %w", err)
+			}
+			raw, _ := json.Marshal(todos)
 			return &tool.Result{Content: "Task list updated: " + string(raw)}, nil
 		},
 	}
@@ -70,6 +93,12 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 			active, _ := run.Values["is_plan_mode"].(bool)
 			if !ok || !active {
 				return errResult(fmt.Errorf("exit_plan_mode is available only while plan mode is active")), nil
+			}
+			if !hasTodos(run.Values["todos"]) {
+				return errResult(errors.New("exit_plan_mode requires a non-empty task list; call write_todos first")), nil
+			}
+			if !hasIncompleteTodo(run.Values["todos"]) {
+				return errResult(errors.New("exit_plan_mode requires at least one task that remains to be executed")), nil
 			}
 			var args struct {
 				Plan string `json:"plan"`
@@ -154,6 +183,36 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 			return &tool.Result{Content: "Plan approved. Plan mode exited; carry out the plan starting with the next step."}, nil
 		},
 	}
+}
+
+func hasTodos(value any) bool {
+	switch items := value.(type) {
+	case []map[string]string:
+		return len(items) > 0
+	case []any:
+		return len(items) > 0
+	default:
+		return false
+	}
+}
+
+func hasIncompleteTodo(value any) bool {
+	switch items := value.(type) {
+	case []map[string]string:
+		for _, item := range items {
+			if item["status"] != "completed" {
+				return true
+			}
+		}
+	case []any:
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok || item["status"] != "completed" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func planReviewID(runID, toolCallID, plan string) string {

@@ -78,9 +78,19 @@ func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]str
 		if swarmEnabled && isLeadRun(st) && !isCoordinatorTool(definition) {
 			continue
 		}
+		if runBool(st, "is_plan_mode", false) && !planningToolAllowed(definition) {
+			continue
+		}
 		out = append(out, name)
 	}
 	return slices.Clone(out), nil, nil
+}
+
+func planningToolAllowed(definition tool.Definition) bool {
+	if definition.Group == "planning" || definition.Name == "ask_clarification" {
+		return true
+	}
+	return definition.Metadata.IsReadOnly && definition.Name != "present_files"
 }
 
 // restrictedToolSet applies one subagent profile after runtime feature and

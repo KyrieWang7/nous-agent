@@ -1,3 +1,6 @@
+deployment:
+  environment: production
+
 server:
   address: ":7776"
 
@@ -68,14 +71,15 @@ models:
 
 sandbox:
   enabled: true
-  provider: local
-  base_dir: ./.nous-agent/workspaces
+  provider: remote
+  remote_url: http://sandboxd:7780
+  tenant_id: nous-default
+  remote_headers:
+    Authorization: Bearer $SANDBOX_CONTROLLER_TOKEN
   exec_timeout: 30s
-  # Use a remote or Kubernetes-backed sandbox service instead:
-  # provider: remote
-  # remote_url: https://sandbox.internal
-  # remote_headers:
-  #   Authorization: Bearer $SANDBOX_TOKEN
+  # To connect to the existing Nous/DeerFlow AIO provisioner instead, use:
+  # provider: aio
+  # provisioner_url: http://provisioner:8002
 
 permissions:
   preset: workspace-write
@@ -83,8 +87,9 @@ permissions:
 plan:
   guidance: >-
     You are in plan mode. Explore the problem, identify constraints, and
-    maintain a concrete plan without implementing it. When the plan is complete,
-    call exit_plan_mode with the complete Markdown plan starting with a # heading.
+    maintain a concrete plan without implementing it. Call write_todos with the
+    executable steps, then call exit_plan_mode with the complete Markdown plan
+    starting with a # heading.
     Do not begin implementation until the user approves the plan; if they keep
     planning, revise it using their feedback and present it again.
 

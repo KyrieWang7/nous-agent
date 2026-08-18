@@ -121,7 +121,10 @@ func newPlanReviewFixture(t *testing.T, fail func(runtime.Event) error) *planRev
 		t.Fatal(err)
 	}
 	fixture := &planReviewFixture{
-		manager: manager, state: state, values: map[string]any{"is_plan_mode": true, "mode": "pro"},
+		manager: manager, state: state, values: map[string]any{
+			"is_plan_mode": true, "mode": "pro",
+			"todos": []map[string]string{{"content": "Build", "status": "pending"}},
+		},
 		requested: make(chan runtime.QuestionRequest, 1), definition: builtin.ExitPlanMode("interaction.questions"),
 	}
 	run := runtime.RunContext{

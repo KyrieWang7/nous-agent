@@ -45,6 +45,13 @@ func (a Agent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager
 	watermark := history.Watermark()
 	values := mergeRunValues(a.InitialValues, req.Config, req.Context)
 	run, hasRun := runtime.RunContextFrom(ctx)
+	if hasRun {
+		// RunManager admission owns canonical mode/policy derivation. Preserve
+		// those trusted values when adapting into the kernel; rebuilding only
+		// from product context would silently drop is_plan_mode and could revive
+		// process defaults such as subagent_enabled.
+		values = mergeRunValues(values, run.Values)
+	}
 	allowedCapabilities := a.AllowedCapabilities
 	if hasRun && run.AllowedCapabilities != nil {
 		allowedCapabilities = run.AllowedCapabilities

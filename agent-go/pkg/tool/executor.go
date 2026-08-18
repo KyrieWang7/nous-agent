@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 )
 
 // Outcome 是一次工具调用的最终结果，含调用本身与执行期错误。
@@ -202,6 +204,7 @@ func (e *Executor) runConcurrent(ctx context.Context, seg Segment, ic Intercepto
 //
 // 第二个返回值 stop 表示拦截器要求结束回合。
 func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome Outcome, stop bool, err error) {
+	callCtx := ctx
 	var tx Transaction
 	if observer := transactionObserverFrom(ctx); observer != nil {
 		var txErr error
@@ -248,9 +251,12 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 		if decision.Args != nil {
 			c.Args = decision.Args
 		}
+		if decision.SandboxMode != "" {
+			callCtx = sandbox.WithMode(ctx, sandbox.Mode(decision.SandboxMode))
+		}
 	}
 
-	res, execErr := e.callHandler(ctx, c)
+	res, execErr := e.callHandler(callCtx, c)
 
 	if ic != nil {
 		rewritten, afterErr := ic.AfterTool(ctx, c, res, execErr)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
 // NameToolErrorHandling 是工具错误处理生命周期处理器的名字。
@@ -35,7 +36,10 @@ func (ToolErrorHandling) AfterTool(_ context.Context, st *lifecycle.State) error
 		return nil
 	}
 
-	updated := *st.ToolResult
+	updated := tool.Result{}
+	if st.ToolResult != nil {
+		updated = *st.ToolResult
+	}
 	updated.IsError = true
 	updated.Content = fmt.Sprintf(
 		"Tool %q failed: %v\n\nThe tool did not run. Fix the arguments or use a different approach.",

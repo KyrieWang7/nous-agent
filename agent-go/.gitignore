@@ -3,6 +3,7 @@ coverage.out
 /dist/
 /agentd
 /tmp/
+/tmp-sandboxd/
 *.test
 *_test.log
 .env

@@ -193,6 +193,19 @@ func TestToolErrorHandling_ConvertsExecErrorToErrorResult(t *testing.T) {
 	}
 }
 
+func TestToolErrorHandling_ConvertsFrameworkErrorWithoutResult(t *testing.T) {
+	t.Parallel()
+
+	st := withCall("bash", `{}`)
+	st.ToolExecErr = errors.New("sandbox unavailable")
+	if err := handlers.NewToolErrorHandling().AfterTool(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if st.ToolResult == nil || !st.ToolResult.IsError || !strings.Contains(st.ToolResult.Content, "sandbox unavailable") {
+		t.Fatalf("result = %#v", st.ToolResult)
+	}
+}
+
 func TestToolErrorHandling_LeavesSuccessfulResultsAlone(t *testing.T) {
 	t.Parallel()
 

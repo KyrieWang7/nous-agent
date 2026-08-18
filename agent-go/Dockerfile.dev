@@ -1,6 +1,6 @@
 FROM golang:1.25-alpine
 
-RUN apk add --no-cache bash ca-certificates curl git \
+RUN apk add --no-cache bash ca-certificates curl docker-cli git \
     && go install github.com/air-verse/air@v1.63.0
 
 WORKDIR /app

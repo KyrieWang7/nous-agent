@@ -60,6 +60,31 @@ func TestRuntimeToolSetHonoursDefaultsAndPermission(t *testing.T) {
 	assertTools(t, ctx, resolver, map[string]any{valueSubagentEnabled: false}, []string{"read_file"})
 }
 
+func TestRuntimeToolSetRestrictsPlanPhaseToReadAndPlanningTools(t *testing.T) {
+	registry := tool.NewRegistry()
+	for _, definition := range []tool.Definition{
+		testTool("read_file", "file:read", true),
+		testTool("write_file", "file:write", false),
+		testTool("write_todos", "planning", false),
+		testTool("exit_plan_mode", "planning", false),
+		testTool("ask_clarification", "interaction", false),
+		testTool("present_files", "interaction", true),
+		testTool("task", "subagent", false),
+	} {
+		if err := registry.Register(definition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
+	assertTools(t, policyContext(t, policy), resolver, map[string]any{
+		"is_plan_mode": true, valueSubagentEnabled: true,
+	}, []string{"ask_clarification", "exit_plan_mode", "read_file", "write_todos"})
+}
+
 func TestRuntimeToolSetPinsDelegatedApprovalToNever(t *testing.T) {
 	registry := tool.NewRegistry()
 	for _, definition := range []tool.Definition{

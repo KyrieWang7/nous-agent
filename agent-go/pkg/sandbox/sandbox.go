@@ -61,10 +61,10 @@ func (r contextReader) Read(buffer []byte) (int, error) {
 
 // Entry 是一个目录项。
 type Entry struct {
-	Name  string
-	IsDir bool
-	Size  int64
-	Mode  string
+	Name  string `json:"name"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size"`
+	Mode  string `json:"mode"`
 }
 
 // Command 是一次命令执行请求。
@@ -82,17 +82,49 @@ type Command struct {
 	Env []string
 }
 
+// Mode is the effective per-call isolation policy selected by the Harness.
+// Providers enforce it; callers must never infer elevation from tool input.
+type Mode string
+
+const (
+	ModeReadOnly         Mode = "read-only"
+	ModeWorkspaceWrite   Mode = "workspace-write"
+	ModeDangerFullAccess Mode = "danger-full-access"
+)
+
+type modeContextKey struct{}
+
+// WithMode attaches the effective policy to exactly one tool invocation.
+func WithMode(ctx context.Context, mode Mode) context.Context {
+	return context.WithValue(ctx, modeContextKey{}, mode)
+}
+
+// ModeFromContext returns the effective policy, failing closed when admission
+// did not attach one.
+func ModeFromContext(ctx context.Context) (Mode, error) {
+	mode, ok := ctx.Value(modeContextKey{}).(Mode)
+	if !ok || mode == "" {
+		return "", errors.New("sandbox: effective mode is missing")
+	}
+	switch mode {
+	case ModeReadOnly, ModeWorkspaceWrite, ModeDangerFullAccess:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("sandbox: invalid effective mode %q", mode)
+	}
+}
+
 // ExecResult 是一次命令执行的结果。
 type ExecResult struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
 
 	// TimedOut 表示命令因超时被杀。此时 ExitCode 无意义。
-	TimedOut bool
+	TimedOut bool `json:"timed_out"`
 
 	// Truncated 表示输出因超过上限被截断。
-	Truncated bool
+	Truncated bool `json:"truncated"`
 }
 
 // FS 是沙箱内的文件操作。
@@ -136,6 +168,14 @@ type Handle interface {
 type Provider interface {
 	Acquire(ctx context.Context, key string) (Handle, error)
 	Release(ctx context.Context, key string) error
+}
+
+// EnforcementProvider is required by sandbox-controller before it exposes
+// command execution. Facts come from the backend implementation, not config.
+type EnforcementProvider interface {
+	Provider
+	Enforcement() map[string]bool
+	Verify(context.Context) error
 }
 
 // Lease 是对沙箱实例的惰性持有。

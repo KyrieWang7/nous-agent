@@ -130,6 +130,10 @@ type Decision struct {
 
 	// Args 非 nil 时替换工具入参（Hook 改写用）。
 	Args json.RawMessage
+
+	// SandboxMode is the effective mode selected by the permission capability.
+	// It is a string to keep pkg/tool independent from pkg/permission.
+	SandboxMode string
 }
 
 // Interceptor 是执行器与 lifecycle dispatcher 之间的窄接口。

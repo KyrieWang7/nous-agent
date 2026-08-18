@@ -42,10 +42,12 @@ export function groupMessages<T>(
   }
   const groups: MessageGroup[] = [];
   const filtered = messages.filter((m) => !isSummarizationMessage(m));
+  let activeProcessingGroup: AssistantProcessingGroup | null = null;
 
   for (const message of filtered) {
     const lastGroup = groups[groups.length - 1];
     if (message.type === "human") {
+      activeProcessingGroup = null;
       groups.push({
         id: message.id ?? crypto.randomUUID(),
         type: "human",
@@ -67,13 +69,8 @@ export function groupMessages<T>(
           type: "assistant:clarification",
           messages: [message],
         });
-      } else if (
-        lastGroup &&
-        lastGroup.type !== "human" &&
-        lastGroup.type !== "assistant" &&
-        lastGroup.type !== "assistant:clarification"
-      ) {
-        lastGroup.messages.push(message);
+      } else if (activeProcessingGroup) {
+        activeProcessingGroup.messages.push(message);
       } else {
         if (lastGroup && lastGroup.type !== "human") {
           lastGroup.messages.push(message);
@@ -101,17 +98,15 @@ export function groupMessages<T>(
             messages: [message],
           });
         } else {
-          if (lastGroup?.type !== "assistant:processing") {
-            groups.push({
+          if (!activeProcessingGroup) {
+            activeProcessingGroup = {
               id: msgId + ":processing",
               type: "assistant:processing",
               messages: [],
-            });
+            };
+            groups.push(activeProcessingGroup);
           }
-          const currentGroup = groups[groups.length - 1];
-          if (currentGroup) {
-            currentGroup.messages.push(message);
-          }
+          activeProcessingGroup.messages.push(message);
         }
       }
       if (hasContent(message) && !hasToolCalls(message)) {

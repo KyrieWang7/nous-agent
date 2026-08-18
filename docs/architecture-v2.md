@@ -118,6 +118,56 @@ Go 原生 schema 的字段重命名由普通数据库 migration 完成。例如 
 
 ## 3. 核心边界
 
+### 2.3 自建 Sandbox Control Plane
+
+Nous Agent 是云端服务，生产执行边界不是 agentd 进程，也不是部署 agentd 的节点。
+本地和云端使用同一套 Remote Sandbox API v2，只替换 sandbox-controller 的 backend：
+
+```text
+local/cloud: agentd -> independent sandbox service -> Docker or open-source runtime
+```
+
+`agentd` 不持有 Docker socket、sandbox runtime 管理凭据或云沙箱凭据。模型 API key、
+数据库凭据和 Gateway 凭据也不得传入 sandbox workload。FS、Bash、后续 PTY 与 LSP 必须
+解析到同一个 lease 和同一个执行世界，禁止各自创建独立容器。
+
+Remote Sandbox API v2 的最小契约为：
+
+```text
+POST   /v2/sandboxes/acquire
+POST   /v2/sandboxes/{sandbox_id}/heartbeat
+GET    /v2/sandboxes/{sandbox_id}
+DELETE /v2/sandboxes/{sandbox_id}?lease_id=...
+POST   /v2/sandboxes/{sandbox_id}/exec
+POST   /v2/sandboxes/{sandbox_id}/fs/read
+POST   /v2/sandboxes/{sandbox_id}/fs/write
+POST   /v2/sandboxes/{sandbox_id}/fs/list
+POST   /v2/sandboxes/{sandbox_id}/fs/stat
+GET    /v2/capabilities
+```
+
+Acquire 使用部署侧可信的 `tenant_id` 与 canonical `thread_id`，返回不可猜测的
+`sandbox_id`、`lease_id`、TTL、根路径和实际 enforcement facts。同一
+tenant/thread 的 acquire 幂等，跨 tenant 永不共享。后续请求必须同时携带 bearer token
+和 lease ID。租约在活动请求时续期；controller 重启后 reconciler 清理无主 workload。
+
+每次 Exec/FS 请求都携带 Harness permission capability 判定后的 `sandbox_mode`。审批只会
+把本次调用提升到工具要求的 mode，不修改 thread 默认策略。`danger-full-access` 仅表示
+sandbox workload 内的完整权限，绝不表示 host/node 权限。
+
+安全不变量：
+
+- controller 不可用、认证失败、lease 过期或 backend enforcement 不足时 fail-closed；
+- agentd 不得回退到宿主 shell 或进程内 Docker；
+- 生产环境仅允许 `sandbox.provider: remote`；
+- Docker workload 默认无网络、非 root、只读根文件系统、drop ALL capabilities、
+  `no-new-privileges`，并设置 CPU、内存、PID、输出和执行时限；
+- 外部开源 runtime 必须通过同一 backend enforcement contract 报告隔离、无网络、
+  non-root、只读根和资源限制事实；controller 在启动和每次 lease 使用时复核，
+  不满足即 fail-closed；
+- sandbox-controller 是独立部署单元，只有它持有 Docker 或外部开源 runtime 的
+  control-plane 权限；本地与云端均不引入 Kubernetes backend。
+
 ### 3.1 Agent Kernel
 
 保留 `agent-go/pkg/loop.Runner` 作为唯一的 Agent 语义编排者。每轮固定执行：
@@ -207,14 +257,18 @@ pro      -> thinking + plan policy + medium reasoning effort
 ultra    -> thinking + plan policy + delegation + high reasoning effort
 ```
 
-Plan Mode 是显式的 collaboration state，不以动态增删工具 schema 表示。Runtime 在 run
-admission 后写入 canonical `plan_mode_changed` audit event；PlanPolicy 在每次模型请求组装时
-根据 canonical `is_plan_mode` 注入 deployment-owned guidance。`write_todos` 始终保持注册以
-稳定模型工具目录，但在非 Plan 状态调用会返回结构化拒绝。`exit_plan_mode` 同样始终注册；
-它通过独立的 `interaction.questions` Capability 提交完整 Markdown plan，并等待用户选择
-Approve 或 Keep planning。只有 Approve 且 `plan_mode_changed(active=false)` durable 写成功后
-才退出 Plan；反馈、dismiss、取消、服务异常和事件存储失败都保持 Plan active。新建子 Agent
-默认 inactive，不继承父 Agent 的 Plan collaboration state。
+Plan Mode 是显式的 collaboration state。Runtime 在 run admission 后写入 canonical
+`plan_mode_changed` audit event；PlanPolicy 在每次模型请求组装时根据 canonical
+`is_plan_mode` 注入 deployment-owned guidance。Planning phase 的工具视图只包含只读探索、
+澄清、`write_todos` 和 `exit_plan_mode`，写操作、成品提交和 delegation 在审批前不可见。
+`write_todos` 把完整列表写入 durable thread values 并实时投影到 UI；Approve 后仍可调用它
+推进 pending / in_progress / completed 状态。`exit_plan_mode` 要求先存在至少一个未完成任务，
+通过独立的 `interaction.questions` Capability 提交完整 Markdown plan，并等待用户选择 Approve
+或 Keep planning。只有 Approve 且 `plan_mode_changed(active=false)` durable 写成功后才恢复
+execution phase 的业务工具；反馈、dismiss、取消、服务异常和事件存储失败都保持 Plan active。
+PlanPolicy 同时是 Kernel StopGate：未提交审批或仍有未完成 Todo 时，普通 final response 不能
+结束 run。新建子 Agent 默认 inactive，不继承父 Agent 的 Plan collaboration state；Ultra 的
+delegation 只在 execution phase 开放。
 
 User Question 是协作 Capability，不是安全 Approval。两者使用不同的类型、持久化表、事件和
 Run phase：问题回答只能表达用户对内容/计划的选择，永远不能授予 sandbox elevation 或工具

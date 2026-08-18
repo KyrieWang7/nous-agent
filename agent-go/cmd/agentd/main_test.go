@@ -62,7 +62,7 @@ func TestAgentHTTPStreamEndToEnd(t *testing.T) {
 	defer server.Close()
 
 	postJSON(t, server.URL+"/api/v1/threads", `{"thread_id":"e2e-thread"}`)
-	resp, err := http.Post(server.URL+"/api/v1/threads/e2e-thread/runs", "application/json", strings.NewReader(`{"input":{"messages":[{"type":"human","content":"say hello"}]},"on_disconnect":"continue"}`))
+	resp, err := http.Post(server.URL+"/api/v1/threads/e2e-thread/runs", "application/json", strings.NewReader(`{"input":{"messages":[{"type":"human","content":"say hello"}]},"context":{"mode":"flash"},"on_disconnect":"continue"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

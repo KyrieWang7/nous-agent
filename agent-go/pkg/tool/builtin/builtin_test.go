@@ -40,15 +40,26 @@ func run(t *testing.T, ctx context.Context, d tool.Definition, args string) *too
 	return res
 }
 
-func TestWriteTodosRequiresPlanMode(t *testing.T) {
+func TestWriteTodosRequiresManagedModeAndPersistsState(t *testing.T) {
 	definition := builtin.WriteTodos()
-	inactive := runtime.WithRunContext(context.Background(), runtime.RunContext{Values: map[string]any{"is_plan_mode": false}})
-	if result := run(t, inactive, definition, `{"todos":[]}`); !result.IsError || !strings.Contains(result.Content, "plan mode") {
+	inactive := runtime.WithRunContext(context.Background(), runtime.RunContext{Values: map[string]any{"mode": "thinking"}})
+	if result := run(t, inactive, definition, `{"todos":[{"content":"Inspect","status":"pending"}]}`); !result.IsError || !strings.Contains(result.Content, "pro or ultra") {
 		t.Fatalf("inactive result = %#v", result)
 	}
-	active := runtime.WithRunContext(context.Background(), runtime.RunContext{Values: map[string]any{"is_plan_mode": true}})
-	if result := run(t, active, definition, `{"todos":[]}`); result.IsError {
+	values := map[string]any{"mode": "pro", "is_plan_mode": true}
+	persisted := false
+	active := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		Values: values,
+		PersistValues: func(_ context.Context, got map[string]any) error {
+			persisted = len(got["todos"].([]map[string]string)) == 1
+			return nil
+		},
+	})
+	if result := run(t, active, definition, `{"todos":[{"content":"Inspect","status":"pending"}]}`); result.IsError {
 		t.Fatalf("active result = %#v", result)
+	}
+	if !persisted {
+		t.Fatal("todo state was not persisted")
 	}
 }
 

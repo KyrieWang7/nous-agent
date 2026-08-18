@@ -1,9 +1,8 @@
 {
   "task_required_fields": ["description", "prompt", "subagent_type"],
   "runtime_context_fields": [
-    "thinking_enabled",
-    "reasoning_effort",
-    "subagent_enabled",
+    "model_name",
+    "mode",
     "swarm_enabled"
   ],
   "task_event_sequence": ["task_started", "task_running", "task_completed"],

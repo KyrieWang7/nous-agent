@@ -66,7 +66,7 @@ func (p *Permission) BeforeTool(ctx context.Context, st *lifecycle.State) (tool.
 	}
 	decision := policy.AuthorizeCall(ctx, d, *st.ToolCall)
 	if decision.Allowed {
-		return tool.Decision{}, nil
+		return tool.Decision{SandboxMode: string(decision.Sandbox)}, nil
 	}
 	return tool.Decision{Deny: true, Reason: decision.Reason}, nil
 }

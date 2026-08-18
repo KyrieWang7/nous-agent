@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import docker
 from docker.errors import APIError, NotFound
@@ -17,6 +18,8 @@ from .backend import SandboxBackend, wait_for_sandbox_ready
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|DATABASE|REDIS|CREDENTIAL)", re.IGNORECASE)
 
 
 class LocalContainerBackend(SandboxBackend):
@@ -59,7 +62,12 @@ class LocalContainerBackend(SandboxBackend):
         self._remove_if_exists(container_name)
 
         volumes = self._build_volumes(extra_mounts)
-        environment = dict(self._environment)
+        # Never copy agent/gateway credentials into model-controlled workloads.
+        # Sandbox-specific non-secret settings can still be supplied explicitly.
+        environment = {
+            key: value for key, value in self._environment.items()
+            if not _SENSITIVE_ENV.search(key)
+        }
 
         try:
             container: Container = self._docker.containers.run(
@@ -70,7 +78,19 @@ class LocalContainerBackend(SandboxBackend):
                 network=self._network,
                 environment=environment,
                 volumes=volumes,
-                security_opt=["seccomp=unconfined"],
+                user="gem",
+                read_only=True,
+                tmpfs={
+                    "/tmp": "rw,noexec,nosuid,nodev,size=64m",
+                    "/run": "rw,noexec,nosuid,nodev,size=8m",
+                },
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges"],
+                mem_limit="512m",
+                nano_cpus=1_000_000_000,
+                pids_limit=128,
+                ulimits=[docker.types.Ulimit(name="nofile", soft=1024, hard=1024)],
+                labels={"io.nous-agent.sandbox": "true", "io.nous-agent.managed-by": "aio-provisioner"},
             )
         except APIError as e:
             raise RuntimeError(f"Failed to start sandbox container: {e}")
@@ -164,7 +184,8 @@ class LocalContainerBackend(SandboxBackend):
                 cmd=[
                     "sh", "-c",
                     "mkdir -p /mnt/user-data/workspace /mnt/user-data/uploads /mnt/user-data/outputs "
-                    "&& chmod -R 777 /mnt/user-data",
+                    "&& chown -R gem:gem /mnt/user-data "
+                    "&& chmod -R u+rwX,g+rwX,o-rwx /mnt/user-data",
                 ],
                 user="root",
             )

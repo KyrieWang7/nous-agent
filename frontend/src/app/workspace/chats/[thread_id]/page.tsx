@@ -242,7 +242,9 @@ export default function ChatPage() {
     threadId,
     thread,
     threadContext: {
-      ...settings.context,
+      model_name: settings.context.model_name,
+      mode: settings.context.mode,
+      swarm_enabled: settings.context.swarm_enabled,
     },
     afterSubmit() {
       if (isNewThreadFromPath && threadId) {

@@ -56,6 +56,8 @@ func projectRuntimeEvent(e runtime.Event) (wireEvent, error) {
 	}
 	meta := map[string]any{"run_id": e.RunID, "thread_id": e.ThreadID}
 	switch e.Type {
+	case runtime.EventStateValues:
+		return makeWireEvent("values", payload), nil
 	case runtime.EventContentDelta, runtime.EventReasoningDelta:
 		id, _ := payload["message_id"].(string)
 		if id == "" {

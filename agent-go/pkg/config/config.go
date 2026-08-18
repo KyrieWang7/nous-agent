@@ -19,6 +19,7 @@ import (
 )
 
 type Config struct {
+	Deployment    DeploymentConfig          `yaml:"deployment"`
 	Server        ServerConfig              `yaml:"server"`
 	Models        []ModelConfig             `yaml:"models"`
 	DefaultModel  string                    `yaml:"default_model"`
@@ -40,6 +41,10 @@ type Config struct {
 	Summarization SummarizationConfig       `yaml:"summarization"`
 	Guardrails    GuardrailsConfig          `yaml:"guardrails"`
 	Hooks         []HookConfig              `yaml:"hooks"`
+}
+
+type DeploymentConfig struct {
+	Environment string `yaml:"environment"`
 }
 
 type ServerConfig struct {
@@ -81,12 +86,14 @@ type ModelPricingConfig struct {
 	CachedInputPerMillionMicros int64 `yaml:"cached_input_per_million_micros"`
 }
 type SandboxConfig struct {
-	Enabled       bool              `yaml:"enabled"`
-	Provider      string            `yaml:"provider"`
-	BaseDir       string            `yaml:"base_dir"`
-	ExecTimeout   time.Duration     `yaml:"exec_timeout"`
-	RemoteURL     string            `yaml:"remote_url"`
-	RemoteHeaders map[string]string `yaml:"remote_headers"`
+	Enabled        bool              `yaml:"enabled"`
+	Provider       string            `yaml:"provider"`
+	BaseDir        string            `yaml:"base_dir"`
+	ExecTimeout    time.Duration     `yaml:"exec_timeout"`
+	RemoteURL      string            `yaml:"remote_url"`
+	RemoteHeaders  map[string]string `yaml:"remote_headers"`
+	TenantID       string            `yaml:"tenant_id"`
+	ProvisionerURL string            `yaml:"provisioner_url"`
 }
 type PermissionConfig struct {
 	Preset        permission.Preset                           `yaml:"preset"`
@@ -214,11 +221,12 @@ type HookConfig struct {
 
 func Defaults() Config {
 	return Config{
+		Deployment:  DeploymentConfig{Environment: "development"},
 		Server:      ServerConfig{Address: ":7776"},
 		Sandbox:     SandboxConfig{Enabled: true, Provider: "local", ExecTimeout: 30 * time.Second},
 		Permissions: PermissionConfig{Preset: permission.PresetWorkspaceWrite},
 		Plan: PlanConfig{Guidance: "You are in plan mode. Explore the problem, identify constraints, and maintain a concrete plan without implementing it. " +
-			"When the plan is complete, call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
+			"Call write_todos with the executable steps, then call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
 			"Do not begin implementation until the user approves the plan; if they keep planning, revise it using their feedback and present it again."},
 		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, ToolCallBudget: 200, SubagentBudget: 20, MaxRecursionDepth: 1, LifecycleTimeout: 30 * time.Second},
 		Runtime:       RuntimeConfig{EventBufferSize: 500, EventTTL: 24 * time.Hour, HeartbeatInterval: 15 * time.Second},
@@ -361,11 +369,24 @@ func (c *Config) Validate(providers []string) error {
 	if c.Loop.TokenBudget < 0 || c.Loop.CostBudgetMicros < 0 {
 		return errors.New("config: loop token_budget and cost_budget_micros cannot be negative")
 	}
-	if c.Sandbox.Enabled && c.Sandbox.Provider != "local" && c.Sandbox.Provider != "docker" && c.Sandbox.Provider != "remote" {
-		return fmt.Errorf("config: unsupported sandbox provider %q; available: [local docker remote]", c.Sandbox.Provider)
+	if c.Sandbox.Enabled && c.Sandbox.Provider != "local" && c.Sandbox.Provider != "docker" && c.Sandbox.Provider != "remote" && c.Sandbox.Provider != "aio" {
+		return fmt.Errorf("config: unsupported sandbox provider %q; available: [local docker remote aio]", c.Sandbox.Provider)
 	}
 	if c.Sandbox.Enabled && c.Sandbox.Provider == "remote" && strings.TrimSpace(c.Sandbox.RemoteURL) == "" {
 		return errors.New("config: sandbox.remote_url is required for the remote provider")
+	}
+	if c.Sandbox.Enabled && c.Sandbox.Provider == "remote" && strings.TrimSpace(c.Sandbox.TenantID) == "" {
+		return errors.New("config: sandbox.tenant_id is required for the remote provider")
+	}
+	if c.Sandbox.Enabled && c.Sandbox.Provider == "aio" && strings.TrimSpace(c.Sandbox.ProvisionerURL) == "" {
+		return errors.New("config: sandbox.provisioner_url is required for the aio provider")
+	}
+	environment := strings.ToLower(strings.TrimSpace(c.Deployment.Environment))
+	if environment != "development" && environment != "test" && environment != "production" {
+		return fmt.Errorf("config: deployment.environment must be development, test, or production, got %q", c.Deployment.Environment)
+	}
+	if environment == "production" && (!c.Sandbox.Enabled || c.Sandbox.Provider != "remote") {
+		return errors.New("config: production requires sandbox.enabled=true and sandbox.provider=remote")
 	}
 	groups := make(map[string]struct{}, len(c.ToolGroups))
 	for i, group := range c.ToolGroups {

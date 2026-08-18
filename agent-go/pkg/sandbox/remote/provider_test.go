@@ -21,22 +21,22 @@ func TestRemoteProviderLifecycleFilesAndExec(t *testing.T) {
 			t.Fatalf("missing authorization header")
 		}
 		switch request.URL.Path {
-		case "/v1/sandboxes/thread-1/acquire":
-			return remoteResponse(200, `{"id":"sandbox-1","root":"/mnt/user-data"}`), nil
-		case "/v1/sandboxes/sandbox-1/fs/read":
+		case "/v2/sandboxes/acquire":
+			return remoteResponse(200, `{"id":"sandbox-1","lease_id":"lease-1","root":"/mnt/user-data"}`), nil
+		case "/v2/sandboxes/sandbox-1/fs/read":
 			return remoteResponse(200, `{"data_base64":"`+base64.StdEncoding.EncodeToString([]byte("hello"))+`"}`), nil
-		case "/v1/sandboxes/sandbox-1/fs/list":
+		case "/v2/sandboxes/sandbox-1/fs/list":
 			return remoteResponse(200, `{"entries":[{"name":"file.txt","is_dir":false,"size":5,"mode":"-rw-r--r--"}]}`), nil
-		case "/v1/sandboxes/sandbox-1/exec":
+		case "/v2/sandboxes/sandbox-1/exec":
 			return remoteResponse(200, `{"stdout":"ok","stderr":"","exit_code":0,"timed_out":false,"truncated":false}`), nil
-		case "/v1/sandboxes/thread-1":
+		case "/v2/sandboxes/sandbox-1":
 			return remoteResponse(204, ""), nil
 		default:
 			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
 			return nil, nil
 		}
 	})}
-	provider, err := NewProvider(Options{BaseURL: "https://sandbox.test", Headers: map[string]string{"Authorization": "Bearer test"}, Client: client})
+	provider, err := NewProvider(Options{BaseURL: "https://sandbox.test", TenantID: "tenant-1", Headers: map[string]string{"Authorization": "Bearer test"}, Client: client})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,15 +44,16 @@ func TestRemoteProviderLifecycleFilesAndExec(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := handle.FS().ReadFile(context.Background(), "/mnt/user-data/file.txt")
+	callCtx := sandbox.WithMode(context.Background(), sandbox.ModeWorkspaceWrite)
+	data, err := handle.FS().ReadFile(callCtx, "/mnt/user-data/file.txt")
 	if err != nil || string(data) != "hello" {
 		t.Fatalf("read = %q, err = %v", data, err)
 	}
-	entries, err := handle.FS().List(context.Background(), "/mnt/user-data")
+	entries, err := handle.FS().List(callCtx, "/mnt/user-data")
 	if err != nil || len(entries) != 1 || entries[0].IsDir || entries[0].Size != 5 {
 		t.Fatalf("entries = %#v, err = %v", entries, err)
 	}
-	result, err := handle.Exec(context.Background(), sandbox.Command{Line: "echo ok"})
+	result, err := handle.Exec(callCtx, sandbox.Command{Line: "echo ok"})
 	if err != nil || result.Stdout != "ok" || result.ExitCode != 0 {
 		t.Fatalf("exec = %#v, err = %v", result, err)
 	}
@@ -62,7 +63,7 @@ func TestRemoteProviderLifecycleFilesAndExec(t *testing.T) {
 }
 
 func TestRemoteFSRejectsEscapingPath(t *testing.T) {
-	provider, _ := NewProvider(Options{BaseURL: "https://sandbox.test"})
+	provider, _ := NewProvider(Options{BaseURL: "https://sandbox.test", TenantID: "tenant-1"})
 	h := &handle{provider: provider, id: "sandbox-1", root: "/mnt/user-data"}
 	fsys := &remoteFS{handle: h}
 	if _, err := fsys.Resolve("/etc/passwd"); err != sandbox.ErrEscape {

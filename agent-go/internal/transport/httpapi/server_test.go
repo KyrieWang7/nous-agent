@@ -795,6 +795,26 @@ func TestRawRuntimePayloadCannotMasqueradeAsWireEnvelope(t *testing.T) {
 	}
 }
 
+func TestStateValuesRuntimeEventProjectsToValuesWireEvent(t *testing.T) {
+	e := runtime.MustEvent("run-1", "thread-1", runtime.EventStateValues, map[string]any{
+		"todos": []any{map[string]any{"content": "Inspect", "status": "pending"}},
+	})
+	w, err := decodeWireEvent(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Event != "values" {
+		t.Fatalf("event = %q, want values", w.Event)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload["todos"].([]any)) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
 func TestWireEventsKeepDistinctRuntimeTypes(t *testing.T) {
 	tests := []struct {
 		name string

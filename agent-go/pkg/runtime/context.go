@@ -49,6 +49,9 @@ type RunContext struct {
 	// Publish is the authoritative event path for a run. HTTP adapters use it
 	// to fan out to the live bus and durable replay store with one sequence.
 	Publish func(context.Context, Event) (int64, error)
+	// PersistValues durably replaces the current thread-state projection and
+	// publishes the same snapshot to live consumers.
+	PersistValues func(context.Context, map[string]any) error
 }
 type runContextKey struct{}
 

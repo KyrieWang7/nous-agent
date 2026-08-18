@@ -194,6 +194,7 @@ func (p *Policy) AuthorizeCall(ctx context.Context, definition tool.Definition, 
 		return decision
 	}
 	decision.Allowed = true
+	decision.Sandbox = required
 	return decision
 }
 

@@ -181,6 +181,11 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 			runValues["is_plan_mode"] = policy.PlanMode
 			runValues["subagent_enabled"] = policy.SubagentEnabled
 			runValues["swarm_enabled"] = policy.SwarmEnabled
+			if policy.PlanMode {
+				// A Pro/Ultra request starts a new plan. Previous todos remain in
+				// the transcript but must not satisfy this run's planning gate.
+				delete(runValues, "todos")
+			}
 			if policy.ReasoningEffort != "" {
 				runValues["reasoning_effort"] = policy.ReasoningEffort
 			} else {
@@ -203,11 +208,23 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 		}
 	}
 	if runErr == nil {
+		persistValues := func(valueCtx context.Context, values map[string]any) error {
+			snapshot := mergeMaps(values)
+			if saveErr := m.store.SaveThreadValues(context.WithoutCancel(valueCtx), run.ThreadID, snapshot); saveErr != nil {
+				return fmt.Errorf("saving thread state: %w", saveErr)
+			}
+			event := runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventStateValues, snapshot)
+			event.IdempotencyKey = fmt.Sprintf("run:%s:values:%d", run.RunID, time.Now().UTC().UnixNano())
+			if _, publishErr := m.publishEvent(context.WithoutCancel(valueCtx), event); publishErr != nil {
+				return fmt.Errorf("publishing thread state: %w", publishErr)
+			}
+			return nil
+		}
 		ctx = runtime.WithRunContext(ctx, runtime.RunContext{
 			RunID: run.RunID, EventRunID: run.RunID, ThreadID: run.ThreadID,
 			AllowedTools: allowedTools, AllowedCapabilities: allowedCapabilities,
 			Values: runValues, Journal: journal, StateMachine: state, Budget: budget,
-			MaxRecursionDepth: maxRecursionDepth, Approvals: m.approvals, Questions: m.questions, Publish: m.publishEvent,
+			MaxRecursionDepth: maxRecursionDepth, Approvals: m.approvals, Questions: m.questions, Publish: m.publishEvent, PersistValues: persistValues,
 		})
 		result, runErr = m.runAgent(ctx, agent, AgentRequest{
 			RunID: run.RunID, ThreadID: run.ThreadID, AssistantID: run.AssistantID,

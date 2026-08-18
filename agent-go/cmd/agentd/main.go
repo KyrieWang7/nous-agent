@@ -41,6 +41,7 @@ import (
 	runtimeredis "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/redis"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/aio"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/local"
 	remotesandbox "github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/remote"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/skill"
@@ -326,8 +327,13 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		case "remote":
 			sandboxProvider, err = remotesandbox.NewProvider(remotesandbox.Options{
 				BaseURL: cfg.Sandbox.RemoteURL, Headers: cfg.Sandbox.RemoteHeaders,
-				VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.Sandbox.ExecTimeout,
+				TenantID: cfg.Sandbox.TenantID, VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.Sandbox.ExecTimeout,
 			})
+			if err != nil {
+				return builtAgent{}, err
+			}
+		case "aio":
+			sandboxProvider, err = aio.NewProvider(aio.Options{ProvisionerURL: cfg.Sandbox.ProvisionerURL, Headers: cfg.Sandbox.RemoteHeaders, VirtualRoot: sandboxVirtualRoot, ExecTimeout: cfg.Sandbox.ExecTimeout})
 			if err != nil {
 				return builtAgent{}, err
 			}
@@ -722,7 +728,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Skills.Enabled {
 		declared = append(declared, lifecyclehandlers.NameSkillActivation)
 	}
-	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: chain, DeclaredHandlers: declared, ToolSet: toolSet, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, Plugins: runtimePlugins, GenerationID: generationID})
+	h, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: chain, DeclaredHandlers: declared, ToolSet: toolSet, StopGate: planPolicy, Compactor: compactor, Limits: loop.Limits{MaxIterations: cfg.Loop.MaxIterations, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, Plugins: runtimePlugins, GenerationID: generationID})
 	if err != nil {
 		return builtAgent{}, err
 	}

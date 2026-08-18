@@ -85,7 +85,7 @@ offline into canonical threads, messages, runs, and events before deployment.
 See [config.example.yaml](./config.example.yaml). Main sections are:
 
 - `models`: OpenAI-compatible or Anthropic endpoints and thinking options.
-- `sandbox`: per-thread local, Docker, or remote/Kubernetes-backed isolation.
+- `sandbox`: per-thread local, Docker, existing AIO/provisioner, or Remote API isolation.
 - `permissions` and `hooks`: fail-closed tool policy and command governance.
 - `plan`: deployment-owned Plan Mode guidance.
 - `summarization`: long-context compaction and overflow recovery.
@@ -95,6 +95,22 @@ See [config.example.yaml](./config.example.yaml). Main sections are:
   and ACP v1 subprocess agents.
 - `memory`, `title`, and `guardrails`: optional governed runtime capabilities.
 - `runtime`: PostgreSQL, Redis, event retention, and SSE heartbeat.
+
+The Go Harness can also connect directly to the existing AIO/provisioner runtime
+used by the local Nous/DeerFlow deployment:
+
+```yaml
+sandbox:
+  enabled: true
+  provider: aio
+  provisioner_url: http://provisioner:8002
+  exec_timeout: 30s
+```
+
+The `aio` provider calls the provisioner once per thread (`POST /api/sandboxes`)
+and then uses that isolated sandbox URL for `/api/execute`, `/api/read_file`,
+`/api/write_file`, and `/api/list_dir`. A static shared AIO URL is intentionally
+not accepted because it would mix thread workspaces.
 
 Repository-provided Skill capabilities live in `../skills/public`; custom
 Skills use the sibling `../skills/custom` catalog or the configured runtime
@@ -148,27 +164,52 @@ permissions.
 
 ### Remote sandbox API
 
-Set `sandbox.provider: remote` and `sandbox.remote_url` to use an HTTP sandbox
-service, including one backed by Kubernetes. The versioned contract is:
+`agentd` always talks to the independently deployed `sandboxd` in production.
+Local and cloud deployments run the same hardened Docker backend or an
+independently operated open-source sandbox runtime. Deployment location changes
+the controller URL, not the Harness contract; every backend fails closed:
 
 ```text
-POST   /v1/sandboxes/{thread_key}/acquire
-DELETE /v1/sandboxes/{thread_key}
-POST   /v1/sandboxes/{id}/exec
-POST   /v1/sandboxes/{id}/fs/read
-POST   /v1/sandboxes/{id}/fs/write
-POST   /v1/sandboxes/{id}/fs/list
-POST   /v1/sandboxes/{id}/fs/stat
+POST   /v2/sandboxes/acquire
+POST   /v2/sandboxes/{id}/heartbeat
+GET    /v2/sandboxes/{id}
+DELETE /v2/sandboxes/{id}?lease_id=...
+POST   /v2/sandboxes/{id}/exec
+POST   /v2/sandboxes/{id}/fs/read
+POST   /v2/sandboxes/{id}/fs/write
+POST   /v2/sandboxes/{id}/fs/list
+POST   /v2/sandboxes/{id}/fs/stat
+GET    /v2/capabilities
 ```
 
 `fs/list` receives a positive `limit` for bounded reads. Remote sandbox
 implementations must honor it and may return at most `limit` entries to the
 caller; the Go adapter requests one additional entry to detect truncation.
 
-Acquire returns `id` and `root`. File bodies use `path` and base64 data; exec
-uses `line`, `work_dir`, `timeout_ms`, and `env`. Responses are size-bounded,
-virtual paths are checked against the acquired root, and authentication headers
-can be supplied through `sandbox.remote_headers`.
+Acquire receives trusted `tenant_id` and `thread_id`, and returns `id`,
+`lease_id`, `root`, expiration and enforcement facts. Every lease operation is
+authenticated and every Exec/FS body carries the effective `sandbox_mode`
+selected by Harness policy. `danger-full-access` is full access inside the
+workload only. The controller never receives model-provider credentials.
+
+Set `deployment.environment: production` to enforce the remote-only rule at
+configuration validation. Development may explicitly use an in-process local
+provider for tests, but there is no runtime fallback from remote to local.
+
+For local Compose development, the repository starts `sandboxd` with the
+hardened Docker backend on the private Compose network. Set a high-entropy
+`SANDBOX_CONTROLLER_TOKEN` before starting Compose. Only `sandboxd` receives
+the Docker socket; `agent-go` and sandbox workloads never receive it. When
+Docker uses a nonstandard socket or the daemon sees a different host path, set
+`DOCKER_HOST_SOCKET` and `SANDBOX_HOST_BASE_DIR` explicitly. For example:
+
+```bash
+SANDBOX_CONTROLLER_TOKEN="$(openssl rand -hex 32)" docker compose up -d --build
+```
+
+The generated token in that example exists only in the started containers. A
+persistent deployment should inject it through its secret manager rather than
+commit it to YAML or an environment file.
 
 ## Persistence
 

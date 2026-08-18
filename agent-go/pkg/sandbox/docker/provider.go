@@ -23,17 +23,37 @@ import (
 )
 
 type Options struct {
-	Image          string
-	BaseDir        string
-	VirtualRoot    string
-	Shell          string
-	ExecTimeout    time.Duration
-	MaxOutputBytes int
+	Image   string
+	BaseDir string
+	// HostBaseDir is the same bind mount as BaseDir, expressed in the Docker
+	// daemon's filesystem namespace. It is only needed when sandboxd itself
+	// runs in a container against the host daemon.
+	HostBaseDir     string
+	VirtualRoot     string
+	Shell           string
+	ExecTimeout     time.Duration
+	MaxOutputBytes  int
+	Memory          string
+	CPUs            string
+	PIDsLimit       int
+	User            string
+	ContainerPrefix string
 }
 type Provider struct {
 	opts    Options
 	mu      sync.Mutex
 	handles map[string]*handle
+}
+
+func (p *Provider) Enforcement() map[string]bool {
+	return map[string]bool{"isolated": true, "network_none": true, "non_root": true, "read_only_root": true, "resource_limits": true}
+}
+
+func (p *Provider) Verify(ctx context.Context) error {
+	if _, err := exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}").Output(); err != nil {
+		return fmt.Errorf("docker sandbox: daemon verification failed: %w", err)
+	}
+	return nil
 }
 
 func NewProvider(opts Options) *Provider {
@@ -58,6 +78,21 @@ func NewProvider(opts Options) *Provider {
 	if opts.MaxOutputBytes <= 0 {
 		opts.MaxOutputBytes = 256 << 10
 	}
+	if opts.Memory == "" {
+		opts.Memory = "512m"
+	}
+	if opts.CPUs == "" {
+		opts.CPUs = "1"
+	}
+	if opts.PIDsLimit <= 0 {
+		opts.PIDsLimit = 128
+	}
+	if opts.User == "" {
+		opts.User = "65532:65532"
+	}
+	if opts.ContainerPrefix == "" {
+		opts.ContainerPrefix = "nous-sandbox-"
+	}
 	return &Provider{opts: opts, handles: map[string]*handle{}}
 }
 func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, error) {
@@ -74,16 +109,45 @@ func (p *Provider) Acquire(ctx context.Context, key string) (sandbox.Handle, err
 	}
 	safe := sanitize(key)
 	root := filepath.Join(p.opts.BaseDir, safe)
+	hostRoot := root
+	if p.opts.HostBaseDir != "" {
+		hostRoot = filepath.Join(filepath.Clean(p.opts.HostBaseDir), safe)
+	}
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, err
+	}
+	parts := strings.SplitN(p.opts.User, ":", 2)
+	uid, uidErr := strconv.Atoi(parts[0])
+	gid := uid
+	if len(parts) == 2 {
+		gid, uidErr = strconv.Atoi(parts[1])
+	}
+	if uidErr != nil {
+		return nil, fmt.Errorf("docker sandbox: invalid user %q", p.opts.User)
+	}
+	// The controller container runs as root and must hand the bind mount to
+	// the non-root workload user. Host-side development processes (notably
+	// macOS) cannot chown their temp directories; Docker will still enforce
+	// the configured container user in that case.
+	if os.Geteuid() == 0 {
+		if err := os.Chown(root, uid, gid); err != nil {
+			return nil, fmt.Errorf("docker sandbox: chown workspace: %w", err)
+		}
 	}
 	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil, fmt.Errorf("docker sandbox: resolve root: %w", err)
 	}
-	name := "nous-agent-" + safe
+	name := p.opts.ContainerPrefix + safe
 	_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
-	cmd := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m", "-v", root+":"+p.opts.VirtualRoot+":rw", p.opts.Image, "sleep", "infinity")
+	cmd := exec.CommandContext(ctx, "docker", "run", "-d", "--name", name,
+		"--label", "io.nous-agent.sandbox=true", "--label", "io.nous-agent.managed-by=sandboxd",
+		"--network", "none", "--read-only", "--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges", "--user", p.opts.User,
+		"--memory", p.opts.Memory, "--cpus", p.opts.CPUs,
+		"--pids-limit", strconv.Itoa(p.opts.PIDsLimit), "--ulimit", "nofile=1024:1024",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--tmpfs", "/run:rw,noexec,nosuid,nodev,size=8m",
+		"-v", hostRoot+":"+p.opts.VirtualRoot+":rw", p.opts.Image, "sleep", "infinity")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("docker sandbox: start: %w: %s", err, out)

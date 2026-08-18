@@ -1,0 +1,15 @@
+root = "."
+tmp_dir = "tmp-sandboxd"
+
+[build]
+cmd = "go build -tags=docker -o ./tmp-sandboxd/sandboxd ./cmd/sandboxd"
+bin = "./tmp-sandboxd/sandboxd"
+include_ext = ["go"]
+exclude_dir = ["tmp", "tmp-sandboxd", ".git", ".nous-agent"]
+delay = 500
+stop_on_error = true
+send_interrupt = true
+kill_delay = "2s"
+
+[log]
+time = true
