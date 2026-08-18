@@ -75,6 +75,9 @@ func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]str
 				continue
 			}
 		}
+		if name == "exit_plan_mode" && !runBool(st, "is_plan_mode", false) {
+			continue
+		}
 		if swarmEnabled && isLeadRun(st) && !isCoordinatorTool(definition) {
 			continue
 		}
@@ -172,7 +175,8 @@ func runString(st *lifecycle.State, key string) string {
 }
 
 func isCoordinatorTool(definition tool.Definition) bool {
-	if definition.Group == "subagent" || definition.Group == "swarm" || definition.Group == "interaction" {
+	switch definition.Group {
+	case "subagent", "swarm", "interaction", "planning":
 		return true
 	}
 	switch definition.Name {

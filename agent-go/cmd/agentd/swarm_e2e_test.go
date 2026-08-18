@@ -55,19 +55,31 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 		var err error
 		switch providerCalls.Add(1) {
 		case 1:
-			err = writeToolCallStream(w, "provider-1", "team-create", "team_create", map[string]any{
+			err = writeToolCallStream(w, "provider-plan-todos", "plan-todos", "write_todos", map[string]any{
+				"todos": []map[string]any{{"content": "Coordinate the research team", "status": "pending"}},
+			}, 10, 2)
+		case 2:
+			err = writeToolCallStream(w, "provider-plan-review", "plan-review", "exit_plan_mode", map[string]any{
+				"plan": "# Swarm execution plan\n\nCreate the team, delegate the research task, then synthesize the result.",
+			}, 12, 2)
+		case 3:
+			err = writeToolCallStream(w, "provider-team", "team-create", "team_create", map[string]any{
 				"name": "e2e-team", "description": "end-to-end team",
 			}, 12, 2)
-		case 2:
-			err = writeToolCallStream(w, "provider-2", "task-1", "task", map[string]any{
+		case 4:
+			err = writeToolCallStream(w, "provider-task", "task-1", "task", map[string]any{
 				"description":   "Research evidence",
 				"prompt":        "Return the verified evidence",
 				"subagent_type": "explore",
 				"name":          "researcher",
 			}, 18, 3)
-		case 3:
+		case 5:
 			err = writeTextStream(w, "provider-child", "verified evidence", 7, 4)
-		case 4:
+		case 6:
+			err = writeToolCallStream(w, "provider-complete-todos", "complete-todos", "write_todos", map[string]any{
+				"todos": []map[string]any{{"content": "Coordinate the research team", "status": "completed"}},
+			}, 10, 2)
+		case 7:
 			err = writeTextStream(w, "provider-final", "final synthesis", 20, 5)
 		default:
 			http.Error(w, "unexpected provider call", http.StatusInternalServerError)
@@ -124,7 +136,7 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 		"application/json",
 		strings.NewReader(`{
 			"input":{"messages":[{"type":"human","content":"coordinate the work"}]},
-			"context":{"subagent_enabled":true,"swarm_enabled":true},
+			"context":{"mode":"ultra","swarm_enabled":true},
 			"on_disconnect":"continue"
 		}`),
 	)
@@ -140,6 +152,7 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 	customPayloads := map[string][]map[string]any{}
 	var finalText strings.Builder
 	var runErrors []string
+	planApproved := false
 	scanner := bufio.NewScanner(response.Body)
 	currentEvent := ""
 	for scanner.Scan() {
@@ -158,6 +171,10 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 				if typ, _ := payload["type"].(string); typ != "" {
 					customTypes[typ]++
 					customPayloads[typ] = append(customPayloads[typ], payload)
+					if typ == "question_requested" {
+						approvePlanReview(t, server.URL, payload)
+						planApproved = true
+					}
 				}
 			case "messages":
 				var payload []map[string]any
@@ -177,10 +194,13 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if providerCalls.Load() != 4 {
+	if providerCalls.Load() != 7 {
 		t.Fatalf("provider calls = %d (%v), custom events=%v, task failures=%v, errors=%v, final=%q", providerCalls.Load(), requestKinds, customTypes, customPayloads["task_failed"], runErrors, finalText.String())
 	}
-	for _, typ := range []string{"task_started", "task_running", "task_completed", "token_usage"} {
+	if !planApproved {
+		t.Fatal("plan review was never requested or approved")
+	}
+	for _, typ := range []string{"question_requested", "question_resolved", "task_started", "task_running", "task_completed", "token_usage"} {
 		if customTypes[typ] == 0 {
 			t.Fatalf("missing %s event; custom events=%v", typ, customTypes)
 		}
@@ -224,6 +244,29 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 	}
 	if leadTokens <= 0 || subagentTokens <= 0 {
 		t.Fatalf("usage attribution = lead:%d subagent:%d", leadTokens, subagentTokens)
+	}
+}
+
+func approvePlanReview(t *testing.T, serverURL string, payload map[string]any) {
+	t.Helper()
+	questionID, _ := payload["id"].(string)
+	runID, _ := payload["run_id"].(string)
+	threadID, _ := payload["thread_id"].(string)
+	if questionID == "" || runID == "" || threadID == "" {
+		t.Fatalf("invalid plan review payload: %#v", payload)
+	}
+	response, err := http.Post(
+		fmt.Sprintf("%s/api/v1/threads/%s/runs/%s/questions/%s/answer", serverURL, threadID, runID, questionID),
+		"application/json",
+		strings.NewReader(`{"selected":["Approve"]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("plan approval status = %s body=%s", response.Status, body)
 	}
 }
 

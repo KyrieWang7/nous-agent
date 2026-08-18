@@ -113,6 +113,8 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 		testTool("task", "subagent", false),
 		testTool("team_create", "swarm", false),
 		testTool("team_delete", "swarm", false),
+		testTool("write_todos", "planning", false),
+		testTool("exit_plan_mode", "planning", false),
 	} {
 		if err := registry.Register(definition); err != nil {
 			t.Fatal(err)
@@ -130,9 +132,9 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 		teamID string
 		want   []string
 	}{
-		{name: "before team creation", want: []string{"team_create"}},
-		{name: "after team creation", teamID: "team-1", want: []string{"task", "team_delete"}},
-		{name: "after team deletion", teamID: "", want: []string{"team_create"}},
+		{name: "before team creation", want: []string{"team_create", "write_todos"}},
+		{name: "after team creation", teamID: "team-1", want: []string{"task", "team_delete", "write_todos"}},
+		{name: "after team deletion", teamID: "", want: []string{"team_create", "write_todos"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -142,6 +144,28 @@ func TestRuntimeToolSetExposesOnlyValidSwarmLifecycleAction(t *testing.T) {
 			}, tt.want)
 		})
 	}
+}
+
+func TestRuntimeToolSetAllowsSwarmPlanReviewBeforeExecution(t *testing.T) {
+	registry := tool.NewRegistry()
+	for _, definition := range []tool.Definition{
+		testTool("team_create", "swarm", false),
+		testTool("write_todos", "planning", false),
+		testTool("exit_plan_mode", "planning", false),
+	} {
+		if err := registry.Register(definition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := permission.NewPolicy(permission.Config{Preset: permission.PresetDangerFullAccess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := runtimeToolSet{registry: registry, policyCapability: "policy.tools"}
+	assertTools(t, policyContext(t, policy), resolver, map[string]any{
+		valueSwarmEnabled: true,
+		"is_plan_mode":    true,
+	}, []string{"exit_plan_mode", "write_todos"})
 }
 
 func TestRestrictedToolSetGivesSwarmTeammatesWorkToolsWithoutNestedOrchestration(t *testing.T) {
