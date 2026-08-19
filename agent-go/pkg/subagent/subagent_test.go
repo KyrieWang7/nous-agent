@@ -120,6 +120,137 @@ func TestDispatchUsesIndependentHistoryAndRestrictsTools(t *testing.T) {
 	}
 }
 
+func TestDispatchReleasesPreparedRunnerOnceAfterSuccess(t *testing.T) {
+	var releases atomic.Int32
+	manager := NewManagerWithPreparedFactory(func(_ Definition, _ []string) (PreparedRunner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done"))})
+		if err != nil {
+			return PreparedRunner{}, err
+		}
+		return PreparedRunner{
+			Runner: h.Runner(),
+			Release: func() error {
+				releases.Add(1)
+				return h.Close()
+			},
+		}, nil
+	}, nil, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := testRunContext(context.Background(), runtime.RunContext{RunID: "run", ThreadID: "thread"})
+
+	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "task-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != message.SubagentCompleted {
+		t.Fatalf("Dispatch() status = %q", result.Status)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release calls = %d, want 1", got)
+	}
+}
+
+func TestDispatchReleasesPreparedRunnerWhenStartHookDenies(t *testing.T) {
+	var releases atomic.Int32
+	manager := NewManagerWithPreparedFactory(func(_ Definition, _ []string) (PreparedRunner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("must not run"))})
+		if err != nil {
+			return PreparedRunner{}, err
+		}
+		return PreparedRunner{Runner: h.Runner(), Release: func() error {
+			releases.Add(1)
+			return h.Close()
+		}}, nil
+	}, nil, 0)
+	runner, err := hooks.NewRunner([]hooks.Hook{&hooks.FuncHook{
+		HookName: "policy",
+		OnEvents: []hooks.Event{hooks.EventSubagentStart},
+		Fn: func(context.Context, hooks.Payload) (hooks.Outcome, error) {
+			return hooks.Outcome{Deny: true, Message: "delegation disabled"}, nil
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetHookRunner(runner)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := testRunContext(context.Background(), runtime.RunContext{RunID: "run", ThreadID: "thread"})
+
+	_, err = manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "task-1"})
+	if err == nil || !strings.Contains(err.Error(), "delegation disabled") {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release calls = %d, want 1", got)
+	}
+}
+
+func TestDispatchReportsPreparedRunnerReleaseAsCoordinationError(t *testing.T) {
+	manager := NewManagerWithPreparedFactory(func(_ Definition, _ []string) (PreparedRunner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done"))})
+		if err != nil {
+			return PreparedRunner{}, err
+		}
+		return PreparedRunner{Runner: h.Runner(), Release: func() error {
+			_ = h.Close()
+			return errors.New("close failed")
+		}}, nil
+	}, nil, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := testRunContext(context.Background(), runtime.RunContext{RunID: "run", ThreadID: "thread"})
+
+	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "task-1"})
+	if err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if result.Status != message.SubagentCompleted {
+		t.Fatalf("Dispatch() status = %q, want completed", result.Status)
+	}
+	if !strings.Contains(result.CoordinationError, "close failed") {
+		t.Fatalf("Dispatch() coordination error = %q", result.CoordinationError)
+	}
+}
+
+func TestDispatchReleasesPreparedRunnerBeforePersistingEarlyTerminalFailure(t *testing.T) {
+	store := &flakyTaskStore{failAt: map[int]error{1: errors.New("running write failed")}}
+	manager := NewManagerWithPreparedFactory(func(_ Definition, _ []string) (PreparedRunner, error) {
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("must not run"))})
+		if err != nil {
+			return PreparedRunner{}, err
+		}
+		return PreparedRunner{Runner: h.Runner(), Release: func() error {
+			_ = h.Close()
+			return errors.New("close failed")
+		}}, nil
+	}, store, 0)
+	if err := manager.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := testRunContext(context.Background(), runtime.RunContext{RunID: "run", ThreadID: "thread"})
+
+	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "work", ToolCallID: "task-1"})
+	if err == nil {
+		t.Fatal("Dispatch() returned nil error")
+	}
+	for _, want := range []string{"running write failed", "close failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Dispatch() error = %v, want %q", err, want)
+		}
+	}
+	if !strings.Contains(result.CoordinationError, "close failed") {
+		t.Fatalf("Dispatch() coordination error = %q", result.CoordinationError)
+	}
+	if len(store.puts) < 2 || !strings.Contains(store.puts[1].CoordinationError, "close failed") {
+		t.Fatalf("stored terminal results = %#v", store.puts)
+	}
+}
+
 func TestDispatchRejectsRunContextWithoutBudget(t *testing.T) {
 	m := NewManager(nil, nil, 0)
 	if err := m.Register(Definition{Name: "worker", Description: "worker"}); err != nil {
@@ -394,14 +525,18 @@ func (panickingModel) Stream(context.Context, model.Request) (model.StreamReader
 }
 
 func TestDispatchAppliesTrustedTimeoutPolicy(t *testing.T) {
-	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+	var releases atomic.Int32
+	factory := func(_ Definition, _ []string) (PreparedRunner, error) {
 		h, err := harness.New(harness.Options{Model: blockingModel{}})
 		if err != nil {
-			return nil, err
+			return PreparedRunner{}, err
 		}
-		return h.Runner(), nil
+		return PreparedRunner{Runner: h.Runner(), Release: func() error {
+			releases.Add(1)
+			return h.Close()
+		}}, nil
 	}
-	manager := NewManager(factory, nil, 0)
+	manager := NewManagerWithPreparedFactory(factory, nil, 0)
 	manager.SetTimeoutResolver(func(parent runtime.RunContext, _ DispatchRequest) time.Duration {
 		if parent.ThreadID != "thread" {
 			t.Fatalf("parent = %#v", parent)
@@ -415,6 +550,9 @@ func TestDispatchAppliesTrustedTimeoutPolicy(t *testing.T) {
 	result, err := manager.Dispatch(ctx, DispatchRequest{SubagentType: "worker", Prompt: "wait"})
 	if err == nil || result.Status != message.SubagentTimedOut {
 		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release calls = %d, want 1", got)
 	}
 }
 
@@ -652,16 +790,20 @@ func workerContext() context.Context {
 }
 
 func TestChildPanicStillFinalizesAndPersistsTheTask(t *testing.T) {
-	factory := func(_ Definition, _ []string) (*loop.Runner, error) {
+	var releases atomic.Int32
+	factory := func(_ Definition, _ []string) (PreparedRunner, error) {
 		h, err := harness.New(harness.Options{Model: panickingModel{}})
 		if err != nil {
-			return nil, err
+			return PreparedRunner{}, err
 		}
-		return h.Runner(), nil
+		return PreparedRunner{Runner: h.Runner(), Release: func() error {
+			releases.Add(1)
+			return h.Close()
+		}}, nil
 	}
 	store := NewMemoryTaskStore()
 	lifecycle := &recordingLifecycle{}
-	manager := NewManager(factory, store, time.Hour)
+	manager := NewManagerWithPreparedFactory(factory, store, time.Hour)
 	manager.SetLifecycle(lifecycle)
 	registerWorker(t, manager)
 
@@ -670,6 +812,9 @@ func TestChildPanicStillFinalizesAndPersistsTheTask(t *testing.T) {
 	})
 	if err == nil || result.Status != message.SubagentFailed || !strings.Contains(result.Error, "panicked") {
 		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("release calls = %d, want 1", got)
 	}
 	if len(lifecycle.finished) != 1 || lifecycle.finished[0].Status != message.SubagentFailed {
 		t.Fatalf("lifecycle results = %#v", lifecycle.finished)

@@ -638,7 +638,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		MaxConcurrent: cfg.Subagents.MaxConcurrent,
 	}
 	childPrompt := prompt.Production(promptOptions, prompt.RuntimeOptions{}) + delegatedTaskPrompt
-	manager := subagent.NewManager(func(def subagent.Definition, allowed []string) (*loop.Runner, error) {
+	manager := subagent.NewManagerWithPreparedFactory(func(def subagent.Definition, allowed []string) (subagent.PreparedRunner, error) {
 		childLifecycle := baseLifecycle()
 		childDeclared := baseLifecycleNames(cfg, hookHandler != nil, swarmManager != nil)
 		if cfg.Skills.Enabled {
@@ -649,9 +649,9 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		childDeclared = append(childDeclared, lifecycle.TerminalName)
 		child, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: childLifecycle, DeclaredHandlers: childDeclared, ToolSet: newRestrictedToolSet(toolSet, allowed), Publisher: subagentProgressPublisher{}, Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, GenerationID: generationID})
 		if err != nil {
-			return nil, err
+			return subagent.PreparedRunner{}, err
 		}
-		return child.Runner(), nil
+		return subagent.PreparedRunner{Runner: child.Runner(), Release: child.Close}, nil
 	}, taskStore, cfg.Subagents.TaskTTL, cfg.Subagents.MaxConcurrent)
 	manager.SetHookRunner(hookRunner)
 	if swarmManager != nil {

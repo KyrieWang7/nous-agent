@@ -31,6 +31,15 @@ type Definition struct {
 }
 type RunnerFactory func(Definition, []string) (*loop.Runner, error)
 
+// PreparedRunner owns a child runner and any runtime resources assembled with
+// it. Manager releases it after the child stops using the runner.
+type PreparedRunner struct {
+	Runner  *loop.Runner
+	Release func() error
+}
+
+type PreparedRunnerFactory func(Definition, []string) (PreparedRunner, error)
+
 // ContextRunnerFactory is the context-aware variant used when a child must
 // inherit trusted parent run options (for example model_name or reasoning
 // settings). RunnerFactory remains supported for fixed-runner embedders.
@@ -77,18 +86,19 @@ type TaskStore interface {
 	Get(context.Context, string) (Result, error)
 }
 type Manager struct {
-	mu             sync.RWMutex
-	defs           map[string]Definition
-	factory        RunnerFactory
-	contextFactory ContextRunnerFactory
-	store          TaskStore
-	ttl            time.Duration
-	sem            chan struct{}
-	lifecycle      DispatchLifecycle
-	timeout        TimeoutResolver
-	hooks          *hooks.Runner
-	stateMu        sync.Mutex
-	stateWaits     map[*runtime.RunStateMachine]subagentStateWait
+	mu              sync.RWMutex
+	defs            map[string]Definition
+	factory         RunnerFactory
+	preparedFactory PreparedRunnerFactory
+	contextFactory  ContextRunnerFactory
+	store           TaskStore
+	ttl             time.Duration
+	sem             chan struct{}
+	lifecycle       DispatchLifecycle
+	timeout         TimeoutResolver
+	hooks           *hooks.Runner
+	stateMu         sync.Mutex
+	stateWaits      map[*runtime.RunStateMachine]subagentStateWait
 }
 
 type subagentStateWait struct {
@@ -110,6 +120,14 @@ func (m *Manager) SetTimeoutResolver(resolve TimeoutResolver) { m.timeout = reso
 
 func NewManager(factory RunnerFactory, store TaskStore, ttl time.Duration, maxConcurrent ...int) *Manager {
 	return newManager(factory, nil, store, ttl, maxConcurrent...)
+}
+
+// NewManagerWithPreparedFactory constructs a manager that owns and releases
+// each prepared child runner after its dispatch completes.
+func NewManagerWithPreparedFactory(factory PreparedRunnerFactory, store TaskStore, ttl time.Duration, maxConcurrent ...int) *Manager {
+	manager := newManager(nil, nil, store, ttl, maxConcurrent...)
+	manager.preparedFactory = factory
+	return manager
 }
 
 // NewManagerWithContextFactory constructs a manager whose factory receives the
@@ -168,7 +186,7 @@ func (m *Manager) Dispatch(ctx context.Context, req DispatchRequest) (Result, er
 	return result, err
 }
 
-func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID string) (Result, error) {
+func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID string) (result Result, err error) {
 	select {
 	case m.sem <- struct{}{}:
 		defer func() { <-m.sem }()
@@ -230,17 +248,40 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	if err != nil {
 		return Result{}, err
 	}
-	if m.factory == nil && m.contextFactory == nil {
+	if m.factory == nil && m.preparedFactory == nil && m.contextFactory == nil {
 		return Result{}, errors.New("subagent: runner factory is nil")
 	}
 	var runner *loop.Runner
-	if m.contextFactory != nil {
+	var releaseRunner func() error
+	if m.preparedFactory != nil {
+		prepared, prepareErr := m.preparedFactory(def, allowed)
+		err = prepareErr
+		runner = prepared.Runner
+		releaseRunner = prepared.Release
+	} else if m.contextFactory != nil {
 		runner, err = m.contextFactory(ctx, def, allowed, req)
 	} else {
 		runner, err = m.factory(def, allowed)
 	}
 	if err != nil {
 		return Result{}, err
+	}
+	if releaseRunner != nil {
+		release := releaseRunner
+		released := false
+		releaseRunner = func() error {
+			if released {
+				return nil
+			}
+			released = true
+			if releaseErr := release(); releaseErr != nil {
+				return fmt.Errorf("subagent: releasing prepared runner: %w", releaseErr)
+			}
+			return nil
+		}
+		defer func() {
+			err = errors.Join(err, releaseRunner())
+		}()
 	}
 	restoreState, err := m.beginSubagentWait(parent.StateMachine)
 	if err != nil {
@@ -280,7 +321,7 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 		return Result{}, fmt.Errorf("subagent: starting child run state: %w", err)
 	}
 	persistCtx := context.WithoutCancel(ctx)
-	result := Result{TaskID: taskID, SubagentType: def.Name, Status: "running", StartedAt: time.Now().UTC()}
+	result = Result{TaskID: taskID, SubagentType: def.Name, Status: "running", StartedAt: time.Now().UTC()}
 	description := taskDescription(req, def.Description)
 	publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
 		"task_id":       result.TaskID,
@@ -293,6 +334,7 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 		result.Error = runErr.Error()
 		completed := time.Now().UTC()
 		result.CompletedAt = &completed
+		runErr = releaseChildRunner(releaseRunner, &result, runErr)
 		runErr = m.finishLifecycle(persistCtx, parent, childContext, req, &result, runErr)
 		runErr = m.persistTerminal(persistCtx, &result, runErr)
 		m.runEndHook(persistCtx, parent, result)
@@ -327,6 +369,7 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 			result.Output = runResult.Output
 		}
 	}
+	runErr = releaseChildRunner(releaseRunner, &result, runErr)
 	if parent.Journal != nil {
 		if childJournal.Totals().LLMCalls == 0 && runResult != nil && runResult.Usage.TotalTokens() > 0 {
 			entry := runtime.Entry{Bucket: runtime.BucketLead, Source: def.Name, CallID: req.ToolCallID, Usage: runResult.Usage}
@@ -476,6 +519,21 @@ func joinErrorText(existing string, next error) string {
 	}
 	return errors.Join(errors.New(strings.TrimSpace(existing)), errors.New(nextText)).Error()
 }
+
+func releaseChildRunner(release func() error, result *Result, cause error) error {
+	if release == nil {
+		return cause
+	}
+	releaseErr := release()
+	if releaseErr == nil {
+		return cause
+	}
+	if result != nil {
+		result.CoordinationError = joinErrorText(result.CoordinationError, releaseErr)
+	}
+	return errors.Join(cause, releaseErr)
+}
+
 func (m *Manager) DispatchAsync(ctx context.Context, req DispatchRequest) (string, error) {
 	if strings.TrimSpace(req.SubagentType) == "" {
 		return "", errors.New("subagent: subagent_type is required")
