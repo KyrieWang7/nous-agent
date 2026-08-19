@@ -38,6 +38,7 @@ func decodeWireEvent(e runtime.Event) (wireEvent, error) {
 func clientVisibleRuntimeEvent(e runtime.Event) bool {
 	switch e.Type {
 	case runtime.EventTranscriptAppend, runtime.EventTranscriptReplace,
+		runtime.EventModelInputCommitted, runtime.EventModelOutputCommitted,
 		runtime.EventRunStateChanged, runtime.EventToolStart, runtime.EventToolResult,
 		runtime.EventApprovalRequested, runtime.EventApprovalResolved, runtime.EventBudgetChanged, runtime.EventPlanModeChanged,
 		runtime.EventCompactionStart, runtime.EventCompactionComplete:

@@ -39,6 +39,16 @@ type Client struct {
 	thinkingExtraBody map[string]any
 }
 
+// Close releases pooled transport connections owned by this generation. An
+// in-flight run keeps the generation leased, so Close is only called after the
+// final user of a retired assembly has returned.
+func (c *Client) Close() error {
+	if c != nil && c.http != nil {
+		c.http.CloseIdleConnections()
+	}
+	return nil
+}
+
 // New 按配置构造客户端。
 func New(cfg model.ProviderConfig) (model.Model, error) {
 	if cfg.Model == "" {

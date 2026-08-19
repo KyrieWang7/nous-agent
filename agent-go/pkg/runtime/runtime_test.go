@@ -38,6 +38,8 @@ func TestEvent_CategoryAssignment(t *testing.T) {
 	}{
 		{runtime.EventContentDelta, runtime.CategoryTrace},
 		{runtime.EventToolStart, runtime.CategoryAudit},
+		{runtime.EventModelInputCommitted, runtime.CategoryAudit},
+		{runtime.EventModelOutputCommitted, runtime.CategoryAudit},
 		{runtime.EventUsage, runtime.CategoryUsage},
 		{runtime.EventRunEnd, runtime.CategoryAudit},
 		{runtime.EventError, runtime.CategoryAudit},

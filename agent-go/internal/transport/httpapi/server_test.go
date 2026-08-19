@@ -660,6 +660,7 @@ func TestRuntimeDeltaProjectsToMessagesEvent(t *testing.T) {
 func TestCanonicalTranscriptEventsStayOutOfWireProjection(t *testing.T) {
 	for _, typ := range []runtime.EventType{
 		runtime.EventTranscriptAppend, runtime.EventTranscriptReplace,
+		runtime.EventModelInputCommitted, runtime.EventModelOutputCommitted,
 		runtime.EventRunStateChanged, runtime.EventToolStart, runtime.EventToolResult,
 		runtime.EventApprovalRequested, runtime.EventApprovalResolved, runtime.EventBudgetChanged, runtime.EventPlanModeChanged,
 		runtime.EventCompactionStart, runtime.EventCompactionComplete,

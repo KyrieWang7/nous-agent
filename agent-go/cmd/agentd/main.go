@@ -241,6 +241,16 @@ func (b builtAgent) Close() {
 func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.Pool, approvalManagers ...*runtime.ApprovalManager) (builtAgent, error) {
 	capabilities := capability.NewRegistry()
 	generationID := fmt.Sprintf("agentd-%d", time.Now().UTC().UnixNano())
+	var closers []func() error
+	assembled := false
+	defer func() {
+		if assembled {
+			return
+		}
+		for i := len(closers) - 1; i >= 0; i-- {
+			_ = closers[i]()
+		}
+	}()
 	mc, err := cfg.SelectedModel()
 	if err != nil {
 		return builtAgent{}, err
@@ -250,6 +260,9 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		configured, modelErr := buildModel(modelConfig)
 		if modelErr != nil {
 			return builtAgent{}, modelErr
+		}
+		if closer, ok := configured.(interface{ Close() error }); ok {
+			closers = append(closers, closer.Close)
 		}
 		namedModels[modelConfig.Name] = configured
 		if err := registerRuntimeValue(capabilities, capability.Definition{
@@ -304,16 +317,6 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	}
 
 	registry := tool.NewRegistry()
-	var closers []func() error
-	assembled := false
-	defer func() {
-		if assembled {
-			return
-		}
-		for i := len(closers) - 1; i >= 0; i-- {
-			_ = closers[i]()
-		}
-	}()
 	var sandboxProvider sandbox.Provider
 	if cfg.Sandbox.Enabled {
 		switch cfg.Sandbox.Provider {

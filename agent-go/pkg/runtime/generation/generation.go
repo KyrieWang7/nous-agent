@@ -53,9 +53,9 @@ func (g *Generation) Capabilities() capability.Snapshot {
 	return g.capabilities
 }
 
-// Lease keeps a generation live until Release. The manager never mutates a
-// generation, so this is primarily an ownership contract for future resource
-// cleanup and reload integration.
+// Lease keeps a generation live until Release. Production reload keeps the
+// complete assembly (models, plugins and external clients) behind the same
+// ownership rule and closes a retired assembly after its final run releases.
 type Lease struct {
 	manager *Manager
 	gen     *Generation

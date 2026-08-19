@@ -9,34 +9,41 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 )
 
 // EventType 是事件类型。与设计文档 §12.4 的清单一一对应。
 type EventType string
 
 const (
-	EventRunStart           EventType = "run_start"
-	EventRunStateChanged    EventType = "run_state_changed"
-	EventBudgetChanged      EventType = "budget_changed"
-	EventPlanModeChanged    EventType = "plan_mode_changed"
-	EventStateValues        EventType = "state_values"
-	EventMessage            EventType = "message"
-	EventCustom             EventType = "custom"
-	EventMessageStart       EventType = "message_start"
-	EventContentDelta       EventType = "content_delta"
-	EventMessageReplace     EventType = "message_replace"
-	EventReasoningDelta     EventType = "reasoning_delta"
-	EventToolStart          EventType = "tool_start"
-	EventToolResult         EventType = "tool_result"
-	EventApprovalRequested  EventType = "approval_requested"
-	EventApprovalResolved   EventType = "approval_resolved"
-	EventQuestionRequested  EventType = "question_requested"
-	EventQuestionResolved   EventType = "question_resolved"
-	EventCompactionStart    EventType = "compaction_started"
-	EventCompactionComplete EventType = "compaction_completed"
-	EventSkillActivated     EventType = "skill_activated"
-	EventSubagentStart      EventType = "subagent_start"
-	EventSubagentResult     EventType = "subagent_result"
+	EventRunStart        EventType = "run_start"
+	EventRunStateChanged EventType = "run_state_changed"
+	EventBudgetChanged   EventType = "budget_changed"
+	EventPlanModeChanged EventType = "plan_mode_changed"
+	EventStateValues     EventType = "state_values"
+	EventMessage         EventType = "message"
+	EventCustom          EventType = "custom"
+	EventMessageStart    EventType = "message_start"
+	// Model input/output commits are the durable session ledger around one
+	// sampler call. They are never projected to clients. The input commit is a
+	// write-ahead barrier; the output commit happens before any requested tool
+	// can execute.
+	EventModelInputCommitted  EventType = "model_input_committed"
+	EventModelOutputCommitted EventType = "model_output_committed"
+	EventContentDelta         EventType = "content_delta"
+	EventMessageReplace       EventType = "message_replace"
+	EventReasoningDelta       EventType = "reasoning_delta"
+	EventToolStart            EventType = "tool_start"
+	EventToolResult           EventType = "tool_result"
+	EventApprovalRequested    EventType = "approval_requested"
+	EventApprovalResolved     EventType = "approval_resolved"
+	EventQuestionRequested    EventType = "question_requested"
+	EventQuestionResolved     EventType = "question_resolved"
+	EventCompactionStart      EventType = "compaction_started"
+	EventCompactionComplete   EventType = "compaction_completed"
+	EventSkillActivated       EventType = "skill_activated"
+	EventSubagentStart        EventType = "subagent_start"
+	EventSubagentResult       EventType = "subagent_result"
 	// EventSubagentProgress carries a child model's in-flight AI message. It is
 	// projected to the frontend's task_running custom event, never to the
 	// parent's messages stream.
@@ -74,7 +81,7 @@ const (
 // categoryOf 返回事件类型的默认分类。
 func categoryOf(t EventType) Category {
 	switch t {
-	case EventMessageReplace, EventGuardrailBlock, EventTranscriptAppend, EventTranscriptReplace, EventToolStart, EventToolResult, EventSubagentStart, EventSubagentResult,
+	case EventMessageReplace, EventGuardrailBlock, EventModelInputCommitted, EventModelOutputCommitted, EventTranscriptAppend, EventTranscriptReplace, EventToolStart, EventToolResult, EventSubagentStart, EventSubagentResult,
 		EventApprovalRequested, EventApprovalResolved, EventQuestionRequested, EventQuestionResolved, EventCompactionStart, EventCompactionComplete,
 		EventRunEnd, EventError, EventRunStart, EventRunStateChanged, EventBudgetChanged, EventPlanModeChanged, EventStateValues, EventMessage:
 		return CategoryAudit
@@ -194,6 +201,43 @@ type ToolResult struct {
 	Name       string `json:"name"`
 	Content    string `json:"content"`
 	IsError    bool   `json:"is_error,omitempty"`
+}
+
+// ModelInputCommitted records the exact request visible to the lead or child
+// model after lifecycle policy has run. ExecutionRunID distinguishes nested
+// sessions which share the root run's durable event partition.
+type ModelInputCommitted struct {
+	ExecutionRunID    string             `json:"execution_run_id"`
+	ParentRunID       string             `json:"parent_run_id,omitempty"`
+	SubagentTaskID    string             `json:"subagent_task_id,omitempty"`
+	GenerationID      string             `json:"generation_id,omitempty"`
+	Iteration         int                `json:"iteration"`
+	System            string             `json:"system,omitempty"`
+	Messages          []message.Message  `json:"messages"`
+	Tools             []model.ToolSchema `json:"tools,omitempty"`
+	MaxTokens         int                `json:"max_tokens,omitempty"`
+	Temperature       *float64           `json:"temperature,omitempty"`
+	Thinking          bool               `json:"thinking,omitempty"`
+	ExtraBody         map[string]any     `json:"extra_body,omitempty"`
+	EnablePromptCache bool               `json:"enable_prompt_cache,omitempty"`
+}
+
+// ModelOutputCommitted records the normalized provider result before budget,
+// governance, publication or tool execution. The next input commit captures
+// the exact post-governance history visible to the model. A tool_start without
+// a later tool_result remains an unknown side-effect boundary and must not be
+// replayed automatically.
+type ModelOutputCommitted struct {
+	ExecutionRunID string          `json:"execution_run_id"`
+	ParentRunID    string          `json:"parent_run_id,omitempty"`
+	SubagentTaskID string          `json:"subagent_task_id,omitempty"`
+	GenerationID   string          `json:"generation_id,omitempty"`
+	Iteration      int             `json:"iteration"`
+	Message        message.Message `json:"message"`
+	StopReason     string          `json:"stop_reason,omitempty"`
+	CallID         string          `json:"call_id,omitempty"`
+	ModelName      string          `json:"model_name,omitempty"`
+	Usage          model.Usage     `json:"usage"`
 }
 
 // TranscriptAppend is the canonical transcript delta for a completed run.

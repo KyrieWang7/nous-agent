@@ -27,6 +27,14 @@ type Client struct {
 	info                     model.Info
 }
 
+// Close releases pooled transport connections owned by this generation.
+func (c *Client) Close() error {
+	if c != nil && c.http != nil {
+		c.http.CloseIdleConnections()
+	}
+	return nil
+}
+
 func New(cfg model.ProviderConfig) (model.Model, error) {
 	if cfg.Model == "" {
 		return nil, errors.New("anthropic: model is required")

@@ -352,7 +352,7 @@ RunEvent (append-only)
 
 ```text
 run_started / run_completed / run_failed / run_cancelled
-user_message / model_started / model_delta / model_completed
+user_message / model_input_committed / model_delta / model_output_committed
 tool_started / tool_completed / tool_failed
 approval_requested / approval_resolved
 question_requested / question_resolved
@@ -477,6 +477,11 @@ Memory 是 capability，不是隐式全局变量。每次读取和写入都必�
 - RunStateMachine 与 BudgetLedger 都先持久化候选版本，再提交内存状态；EventStore 失败时 phase/usage 保持原值。
 - HTTP transport 创建 root ledger；subagent dispatcher 要求父状态机，并为每个 child run 创建独立状态机和 child ledger。
 - Kernel 为每批工具调用安装 transaction observer；审批、工具等待和 subagent 等待都不能在缺少状态机时静默跳过。
+- Kernel 在每次 Sampler 调用前同步写入 `model_input_committed`，记录 lifecycle 处理后的
+  实际 system/messages/tools/options；写入失败时不调用模型。模型返回并规范化 ToolCall ID 后，
+  在预算提交、AfterModel 治理、对外发布或执行工具前同步写入 `model_output_committed`；下一次
+  input commit 记录治理后真正再次投递给模型的状态。两类事件覆盖 lead 与 child
+  session，使用 execution run id + iteration 幂等，不投影到 HTTP/SSE。
 - Kernel 是 `tool_start` / `tool_result` 的唯一发布者；两类事件使用稳定 CallID、幂等键和 audit 分类，不再由 lifecycle 复制发布。
 - audit/usage canonical event 先同步写入 EventStore，再进入 live Bus；持久化失败返回执行路径。逐 token trace 仍允许异步和丢弃。
 - BudgetLedger 在提交用量前同步写入版本化 checkpoint；checkpoint 失败会拒绝本次 charge，不改变已用额度，也不泄漏 reservation。
@@ -490,8 +495,10 @@ Memory 是 capability，不是隐式全局变量。每次读取和写入都必�
 接口只回答协作问题，并校验 thread/run/question 归属，不能转换成权限授予。安全审批决定
 必须来自既有可信控制面。BudgetLedger 的 root checkpoint 已写入 canonical
 `budget_changed` 事件并可恢复 max/used/version。进程重启后不恢复旧 goroutine，而是
-从事件恢复 RunState/BudgetState 并将 orphan run 幂等确认为 `interrupted`；这是一项
-明确的副作用安全策略，不宣称同一 run 已 continuation。
+从事件恢复 RunState/BudgetState 并将 orphan run 幂等确认为 `interrupted`。每次模型调用
+已有完整 input/output commit，可精确定位崩溃前最后一个模型边界；若存在没有 terminal
+`tool_result` 的 `tool_start`，仍按未知副作用处理，不自动重放。这是一项明确的副作用安全
+策略，不宣称同一 run 已具备 provider-independent exactly-once continuation。
 
 ### Phase 4: Product capabilities
 
@@ -520,6 +527,9 @@ Runtime Plugin 在 generation 冻结前按依赖顺序启动。生产 command to
 强类型，`ScopeThread` 和 `ScopeRun` 会强制检查可信身份。生产 `harness.Agent` 已从
 immutable snapshot 解析 sandbox，不再直接持有生产 sandbox provider；reloadable agent
 按 run 固定完整 built generation，引用释放前不会关闭旧 generation 的 MCP/plugin 资源。
+配置、扩展配置、Skill 与 Plugin manifest 参与 generation fingerprint；新 run 原子切换到
+完整的新 assembly，旧 generation 进入 retired，最后一个 active run 释放引用后关闭模型、
+MCP、Plugin 和其他注册资源。监听地址及数据库/Redis 连接属于进程资源，变更时明确要求重启。
 
 现有 model router、tool registry、memory/skill lifecycle handler 继续作为强类型执行
 适配器，来源统一登记在 capability generation。Skill registry、tool policy 与子 Agent
@@ -542,6 +552,8 @@ Phase 5 必须满足：
 - orphan reconciliation 写入 canonical `run_state_changed`、`run_end` 与 completion；
 - BudgetLedger 每次 commit 写入带版本的 `budget_changed`，可从事件恢复 max/used；
 - retry 是新 run，不复用旧 run id，不自动重放未确认的工具事务。
+- 每次模型请求必须先有 durable `model_input_committed`，每次成功返回的模型响应必须在预算、
+  治理和工具执行前有 durable `model_output_committed`；提交失败时执行路径 fail-closed。
 
 当前实现还包括：
 
@@ -600,7 +612,7 @@ Phase 5 必须满足：
 
 ### 9.1 当前验收证据
 
-截至 2026-08-17，Phase 0-5 使用以下自动化证据验收：
+截至 2026-08-19，Phase 0-5 使用以下自动化证据验收：
 
 1. `go test ./...`、`go test -race ./...`、`go vet ./...`、
    `go test -tags=docker ./pkg/migrations`、`go test -tags=docker ./cmd/agentd`
@@ -611,11 +623,14 @@ Phase 5 必须满足：
 3. Memory/PostgreSQL terminal CAS、审批相反决策竞争、cancel-after-complete、orphan
    reconciliation、worker/completion persistence failure 分支均有测试；旧 run 恢复为
    `interrupted`，不重放未知副作用。
-4. `TestCapabilityViewCanOnlyRestrictParent` 与
+4. `TestLoopCommitsModelLedgerBeforeSamplerAndToolSideEffects` 验证 input commit 先于模型、
+   output commit 先于 `tool_start` 和工具 handler；`TestLoopFailsClosedWhenModelLedgerCommitFails`
+   验证任一提交失败都不会越过对应副作用边界。两类内部事件由 SSE 投影显式过滤。
+5. `TestCapabilityViewCanOnlyRestrictParent` 与
    `TestDispatchCannotWidenCapabilitiesToolsOrBudget` 覆盖父子 capability、工具和预算
    不可扩大；budget checkpoint restore 后仍拒绝超额消费。
-5. generation manager 与 reloadable agent 测试证明切换后 active run 继续持有旧 lease，
+6. generation manager 与 reloadable agent 测试证明切换后 active run 继续持有旧 lease，
    直到引用释放才关闭旧 generation 资源。
-6. `go run ./internal/tools/layercheck` 对模块内、标准库和第三方依赖闭包执行边界规则；
+7. `go run ./internal/tools/layercheck` 对模块内、标准库和第三方依赖闭包执行边界规则；
    Kernel 禁止依赖 transport、配置、PostgreSQL/Redis、model/tool/sandbox 具体实现。
    当前 `pkg/loop` 的非标准依赖闭包仅包含 message/model/tool/runtime/lifecycle 契约包。

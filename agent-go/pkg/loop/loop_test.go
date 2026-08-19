@@ -181,6 +181,124 @@ func TestLoop_ToolExecutionPublishesRuntimeTransactions(t *testing.T) {
 	}
 }
 
+func TestLoopCommitsModelLedgerBeforeSamplerAndToolSideEffects(t *testing.T) {
+	registry := tool.NewRegistry()
+	var order []string
+	definition := echoTool("echo")
+	definition.Handler = func(context.Context, tool.Call) (*tool.Result, error) {
+		order = append(order, "tool")
+		return &tool.Result{Content: "ok"}, nil
+	}
+	if err := registry.Register(definition); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := lifecycle.NewDispatcher(nil, lifecycle.DispatcherOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := 0
+	sampler := samplerFunc(func(context.Context, *lifecycle.State) (*model.Response, bool, error) {
+		order = append(order, fmt.Sprintf("sample-%d", turn))
+		turn++
+		if turn == 1 {
+			return &model.Response{
+				Message:    message.Message{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}},
+				StopReason: model.StopReasonToolCalls, CallID: "model-1", ModelName: "test",
+			}, false, nil
+		}
+		return &model.Response{Message: message.Message{Role: message.RoleAssistant, Content: "done"}, StopReason: model.StopReasonStop, CallID: "model-2", ModelName: "test"}, false, nil
+	})
+	runner, err := loop.NewRunner(loop.Config{
+		Sampler: sampler, Registry: registry, Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}),
+		Lifecycle: dispatcher, Limits: loop.Limits{MaxIterations: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []runtime.Event
+	publish := func(_ context.Context, event runtime.Event) (int64, error) {
+		order = append(order, string(event.Type))
+		event.Seq = int64(len(events) + 1)
+		events = append(events, event)
+		return event.Seq, nil
+	}
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID: "run-1", ThreadID: "thread-1", GenerationID: "generation-1", Publish: publish,
+	})
+	history := message.NewHistory()
+	if _, err := runner.Run(ctx, loop.Request{RunID: "run-1", ThreadID: "thread-1", History: history, Prompt: "do it"}); err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{
+		"model_input_committed", "sample-0", "model_output_committed", "tool_start", "tool", "tool_result",
+		"model_input_committed", "sample-1", "model_output_committed",
+	}
+	if !slices.Equal(order, wantOrder) {
+		t.Fatalf("execution order = %v, want %v", order, wantOrder)
+	}
+	if len(events) != 6 {
+		t.Fatalf("events = %v", events)
+	}
+	var input runtime.ModelInputCommitted
+	if err := json.Unmarshal(events[0].Data, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.ExecutionRunID != "run-1" || input.GenerationID != "generation-1" || input.Iteration != 0 || len(input.Messages) != 1 || input.Messages[0].Content != "do it" {
+		t.Fatalf("model input commit = %#v", input)
+	}
+	if events[0].Category != runtime.CategoryAudit || events[0].IdempotencyKey != "run:run-1:model-input:0" {
+		t.Fatalf("model input event = %#v", events[0])
+	}
+}
+
+func TestLoopFailsClosedWhenModelLedgerCommitFails(t *testing.T) {
+	for _, failureType := range []runtime.EventType{runtime.EventModelInputCommitted, runtime.EventModelOutputCommitted} {
+		t.Run(string(failureType), func(t *testing.T) {
+			registry := tool.NewRegistry()
+			var samples, tools int
+			definition := echoTool("echo")
+			definition.Handler = func(context.Context, tool.Call) (*tool.Result, error) {
+				tools++
+				return &tool.Result{Content: "unexpected"}, nil
+			}
+			if err := registry.Register(definition); err != nil {
+				t.Fatal(err)
+			}
+			dispatcher, err := lifecycle.NewDispatcher(nil, lifecycle.DispatcherOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sampler := samplerFunc(func(context.Context, *lifecycle.State) (*model.Response, bool, error) {
+				samples++
+				return &model.Response{Message: message.Message{Role: message.RoleAssistant, ToolCalls: []message.ToolCall{{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}}}, StopReason: model.StopReasonToolCalls}, false, nil
+			})
+			runner, err := loop.NewRunner(loop.Config{Sampler: sampler, Registry: registry, Executor: tool.NewExecutor(registry, tool.ExecutorOptions{}), Lifecycle: dispatcher, Limits: loop.Limits{MaxIterations: 2}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+				RunID: "run-1", ThreadID: "thread-1",
+				Publish: func(_ context.Context, event runtime.Event) (int64, error) {
+					if event.Type == failureType {
+						return 0, errors.New("store unavailable")
+					}
+					return 1, nil
+				},
+			})
+			_, runErr := runner.Run(ctx, loop.Request{RunID: "run-1", ThreadID: "thread-1", History: message.NewHistory(), Prompt: "do it"})
+			if runErr == nil || !strings.Contains(runErr.Error(), "store unavailable") {
+				t.Fatalf("Run() error = %v", runErr)
+			}
+			if failureType == runtime.EventModelInputCommitted && samples != 0 {
+				t.Fatalf("model sampled %d times after input commit failure", samples)
+			}
+			if tools != 0 {
+				t.Fatalf("tool executed %d times after ledger failure", tools)
+			}
+		})
+	}
+}
+
 func TestLoop_NormalizesToolCallIDBeforeTranscriptAndTransaction(t *testing.T) {
 	registry := tool.NewRegistry()
 	var handlerID string

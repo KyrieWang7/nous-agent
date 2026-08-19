@@ -273,6 +273,12 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		if err := tracker.Check(iteration); err != nil {
 			return res, err
 		}
+		// The exact model-visible request is a durable write-ahead record. If
+		// persistence fails, do not call the model: a response without its input
+		// ledger cannot be replayed or audited deterministically.
+		if err := commitModelInput(ctx, st); err != nil {
+			return res, err
+		}
 
 		// 7 采样
 		resp, streamed, err := r.cfg.Sampler.Sample(ctx, st)
@@ -288,6 +294,12 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		res.Streamed = res.Streamed || streamed
 		res.Response = resp
 		res.StopReason = resp.StopReason
+		// Record every successful provider response immediately after normalizing
+		// its tool-call identity. Later budget or governance failures must not leave
+		// an input commit without the corresponding output fact.
+		if err := commitModelOutput(ctx, st); err != nil {
+			return res, err
+		}
 		res.Usage = res.Usage.Add(resp.Usage)
 		r.observeLeadUsage(ctx, resp)
 		if err := r.chargeModelBudget(ctx, resp); err != nil {
@@ -353,6 +365,56 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		// 12 回合结束
 		return res, nil
 	}
+}
+
+func commitModelInput(ctx context.Context, st *lifecycle.State) error {
+	if st == nil || st.ModelInput == nil {
+		return errors.New("loop: model input commit requires a request")
+	}
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Publish == nil {
+		return nil
+	}
+	request := st.ModelInput
+	event, err := runtime.NewEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventModelInputCommitted, runtime.ModelInputCommitted{
+		ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID, SubagentTaskID: run.SubagentTaskID,
+		GenerationID: run.GenerationID, Iteration: st.Iteration, System: request.System,
+		Messages: message.CloneAll(request.Messages), Tools: append([]model.ToolSchema(nil), request.Tools...),
+		MaxTokens: request.MaxTokens, Temperature: request.Temperature, Thinking: request.Thinking,
+		ExtraBody: request.ExtraBody, EnablePromptCache: request.EnablePromptCache,
+	})
+	if err != nil {
+		return fmt.Errorf("loop: encoding model input commit: %w", err)
+	}
+	event.IdempotencyKey = fmt.Sprintf("run:%s:model-input:%d", run.RunID, st.Iteration)
+	if _, err := run.Publish(context.WithoutCancel(ctx), event); err != nil {
+		return fmt.Errorf("loop: persisting model input commit: %w", err)
+	}
+	return nil
+}
+
+func commitModelOutput(ctx context.Context, st *lifecycle.State) error {
+	if st == nil || st.ModelOutput == nil {
+		return errors.New("loop: model output commit requires a response")
+	}
+	run, ok := runtime.RunContextFrom(ctx)
+	if !ok || run.Publish == nil {
+		return nil
+	}
+	response := st.ModelOutput
+	event, err := runtime.NewEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventModelOutputCommitted, runtime.ModelOutputCommitted{
+		ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID, SubagentTaskID: run.SubagentTaskID,
+		GenerationID: run.GenerationID, Iteration: st.Iteration, Message: message.Clone(response.Message),
+		StopReason: response.StopReason, CallID: response.CallID, ModelName: response.ModelName, Usage: response.Usage,
+	})
+	if err != nil {
+		return fmt.Errorf("loop: encoding model output commit: %w", err)
+	}
+	event.IdempotencyKey = fmt.Sprintf("run:%s:model-output:%d", run.RunID, st.Iteration)
+	if _, err := run.Publish(context.WithoutCancel(ctx), event); err != nil {
+		return fmt.Errorf("loop: persisting model output commit: %w", err)
+	}
+	return nil
 }
 
 func prepareRunContext(ctx context.Context, req Request) (context.Context, error) {
