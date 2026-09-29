@@ -21,8 +21,11 @@ const summaryHeading = "## Summary"
 
 // Config 配置压缩器。字段名与 config.yaml 的 summarization 段对齐。
 type Config struct {
-	// TriggerTokens 是触发压缩的转录 token 数。<= 0 时禁用压缩。
+	// TriggerTokens 是显式输入 token 阈值。<= 0 且未开启 AutoBudget 时禁用主动压缩。
 	TriggerTokens int
+	// AutoBudget selects the routed request budget; explicit TriggerTokens wins.
+	AutoBudget     bool
+	HeadroomTokens int
 
 	// KeepMessages 是保留在摘要之后的尾部消息条数。<= 0 时用 10。
 	KeepMessages int
@@ -97,16 +100,33 @@ func (c *Compactor) MaybeCompact(ctx context.Context, h *message.History) (bool,
 	if c.cfg.TriggerTokens <= 0 || h == nil {
 		return false, nil
 	}
+	return c.compact(ctx, h, false, c.cfg.TriggerTokens)
+}
 
+// ForceCompact handles provider-confirmed overflow even when token estimates
+// are below the proactive threshold. It may reduce the retained tail, but never
+// splits a tool transaction or commits a summary that fails to shrink history.
+func (c *Compactor) ForceCompact(ctx context.Context, h *message.History) (bool, error) {
+	if h == nil {
+		return false, nil
+	}
+	return c.compact(ctx, h, true, 0)
+}
+
+func (c *Compactor) compact(ctx context.Context, h *message.History, force bool, threshold int) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if h.TokenCount() < c.cfg.TriggerTokens {
+	if !force && h.TokenCount() < threshold {
 		return false, nil
 	}
 
 	snapshot := h.All()
-	cut := FindCutPoint(snapshot, c.cfg.KeepMessages)
+	keep := c.cfg.KeepMessages
+	if force {
+		keep = min(keep, max(1, len(snapshot)/2))
+	}
+	cut := FindCutPoint(snapshot, keep)
 	if cut <= 0 {
 		// 没有安全的切点：整个转录就是一个大事务，或保留窗口已覆盖全部。
 		// 压不了不是错误，下一轮 token 更多时切点可能就出现了。
@@ -124,6 +144,9 @@ func (c *Compactor) MaybeCompact(ctx context.Context, h *message.History) (bool,
 	out := make([]message.Message, 0, 1+len(snapshot)-cut)
 	out = append(out, message.Message{Role: message.RoleSystem, Content: summary})
 	out = append(out, snapshot[cut:]...)
+	if message.EstimateMessagesTokens(out) >= message.EstimateMessagesTokens(snapshot) {
+		return false, nil
+	}
 	h.Replace(out)
 
 	return true, nil

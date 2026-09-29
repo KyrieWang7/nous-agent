@@ -19,6 +19,7 @@ models:
     temperature: 0.7
     context_length: 128000
     timeout: 120
+    stream_idle_timeout: 120
     supports_thinking: true
     # Optional integer micro-currency rates per one million tokens.
     # pricing:
@@ -40,6 +41,7 @@ models:
     temperature: 0.7
     context_length: 128000
     timeout: 120
+    stream_idle_timeout: 120
     supports_thinking: true
 
   - name: gpt-4o
@@ -51,6 +53,7 @@ models:
     temperature: 0.7
     context_length: 128000
     timeout: 120
+    stream_idle_timeout: 120
     supports_vision: true
 
   - name: deepseek-v4-pro
@@ -63,11 +66,28 @@ models:
     temperature: 0.7
     context_length: 128000
     timeout: 120
+    stream_idle_timeout: 120
     supports_thinking: true
     when_thinking_enabled:
       extra_body:
         thinking:
           type: enabled
+
+  # Optional upstream Messages-only protocol; existing models above stay unchanged.
+  # - name: deepseek-messages
+  #   display_name: DeepSeek Messages
+  #   provider: deepseek
+  #   model: deepseek-v4-pro
+  #   base_url: https://api.deepseek.com/anthropic
+  #   api_key: $DEEPSEEK_API_KEY
+  #   context_length: 1000000
+  #   max_tokens: 256000
+  #   timeout: 60                 # Nonstreaming/Files request deadline, seconds.
+  #   stream_idle_timeout: 300    # Reset by response activity; no total stream deadline.
+  #   supports_thinking: true
+  #   supports_reasoning_effort: true
+  #   supports_vision: true
+  #   use_files: true             # Optional; default false keeps images inline.
 
 sandbox:
   enabled: true
@@ -181,7 +201,8 @@ swarm:
 
 summarization:
   enabled: true
-  trigger_tokens: 80000
+  trigger_tokens: 0 # Auto: 75% of (routed model context - effective output - headroom).
+  headroom_tokens: 0 # Optional extra reserve, suitable for the configured model size.
   keep_messages: 10
   max_summary_tokens: 1024
   max_input_messages: 200

@@ -15,11 +15,13 @@ import (
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/internal/streamhttp"
 )
 
 const Name = "anthropic"
 
 type Client struct {
+	idle                     time.Duration
 	http                     *http.Client
 	baseURL, apiKey, modelID string
 	maxTokens                int
@@ -56,6 +58,7 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 		ctxLen = 200000
 	}
 	return &Client{
+		idle:        time.Duration(cfg.StreamIdleTimeout) * time.Second,
 		http:        &http.Client{Timeout: timeout},
 		baseURL:     base,
 		apiKey:      cfg.APIKey,
@@ -100,7 +103,11 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 	return newStream(resp.Body, c.info.Name), nil
 }
 func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
-	payload := map[string]any{"model": c.modelID, "max_tokens": c.maxTokens, "messages": wireMessages(req.Messages), "stream": stream}
+	output := c.maxTokens
+	if req.MaxTokens > 0 {
+		output = req.MaxTokens
+	}
+	payload := map[string]any{"model": c.modelID, "max_tokens": output, "messages": wireMessages(req.Messages), "stream": stream}
 	temperature := req.Temperature
 	if temperature == nil {
 		temperature = c.temperature
@@ -123,7 +130,7 @@ func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*htt
 		payload["tools"] = tools
 	}
 	if req.Thinking {
-		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": max(c.maxTokens/2, 1024)}
+		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": max(output/2, 1024)}
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -138,7 +145,12 @@ func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*htt
 	if c.apiKey != "" {
 		request.Header.Set("x-api-key", c.apiKey)
 	}
-	resp, err := c.http.Do(request)
+	var resp *http.Response
+	if stream {
+		resp, err = streamhttp.Do(c.http, request, c.idle)
+	} else {
+		resp, err = c.http.Do(request)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", model.ErrProviderUnavailable, err)
 	}
@@ -271,6 +283,9 @@ func newStream(body io.ReadCloser, name string) *stream {
 	return &stream{body: body, scanner: scanner, name: name, calls: map[int]*message.ToolCall{}}
 }
 func (s *stream) Next() (model.StreamEvent, bool) {
+	if s.done {
+		return model.StreamEvent{}, false
+	}
 	for s.scanner.Scan() {
 		line := strings.TrimSpace(s.scanner.Text())
 		data, ok := strings.CutPrefix(line, "data:")
@@ -334,12 +349,18 @@ func (s *stream) Next() (model.StreamEvent, bool) {
 			return model.StreamEvent{Type: model.StreamDone}, true
 		}
 	}
-	if err := s.scanner.Err(); err != nil {
-		s.err = err
-		return model.StreamEvent{Type: model.StreamError, Err: err}, true
-	}
+	// A clean wire EOF is still a failed response without message_stop.
 	s.done = true
-	return model.StreamEvent{}, false
+	err := s.scanner.Err()
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		s.err = err
+	} else {
+		s.err = fmt.Errorf("%w: anthropic stream ended before message_stop: %w", model.ErrProviderUnavailable, err)
+	}
+	return model.StreamEvent{Type: model.StreamError, Err: s.err}, true
 }
 func (s *stream) Result() (*model.Response, error) {
 	for !s.done {

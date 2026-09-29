@@ -68,7 +68,8 @@ type StopGate interface {
 	Evaluate(ctx context.Context, stopReason string, st *lifecycle.State) (string, error)
 }
 
-// ToolExecutor 执行一批工具调用。
+// ToolExecutor executes a batch and must drain all started calls before Run
+// returns. The loop settles missing results only after that quiescent boundary.
 type ToolExecutor interface {
 	Run(ctx context.Context, calls []tool.Call, ic tool.Interceptor) ([]tool.Outcome, error)
 	EndTurnRequested() bool
@@ -163,7 +164,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 //
 // 失败语义见设计文档 §3.2。要点：模型与治理 handler 的错误终止回合；
 // 工具自身的错误转成 error 结果回灌，不终止回合。
-func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
+func (r *Runner) Run(ctx context.Context, req Request) (_ *Result, runErr error) {
 	if req.History == nil {
 		return nil, errors.New("loop: request requires a history")
 	}
@@ -203,9 +204,13 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 
 	tracker := r.cfg.Limits.NewTracker()
 	res := &Result{}
+	var pending *toolStepRecovery
 
 	// AfterAgent 必须跑到，即便回合失败：它承载遥测、记忆入队、标题生成这类收尾。
 	defer func() {
+		if err := pending.settle(ctx, st.History); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 		_ = r.cfg.Lifecycle.Execute(context.WithoutCancel(ctx), lifecycle.StageAfterAgent, st)
 		r.syncSpend(ctx, tracker)
 		res.Compacted = st.Compacted
@@ -224,6 +229,13 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 	stopReinjections := 0
 
 	for iteration := 0; ; iteration++ {
+		// Includes governance Continue and partially executed batches. Clear the
+		// owner before settlement so a failed append is not retried by defer.
+		previous := pending
+		pending = nil
+		if err := previous.settle(ctx, st.History); err != nil {
+			return res, err
+		}
 		st.Iteration = iteration
 		res.Iterations = iteration + 1
 
@@ -248,10 +260,25 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 			return res, err
 		}
 
+		st.ModelHistory = message.CloneAll(st.ModelInput.Messages)
+		st.RebuildModelHistory = func() []message.Message {
+			messages := st.History.All()
+			if r.cfg.Trimmer != nil {
+				messages = r.cfg.Trimmer.Trim(messages)
+			}
+			return messages
+		}
+
 		// 6 采样前切面
+		beforeModelWatermark := st.History.Watermark()
 		if err := r.cfg.Lifecycle.Execute(ctx, lifecycle.StageBeforeModel, st); err != nil {
 			return res, err
 		}
+		// Only genuine canonical appends belong to the projection. Searching
+		// the full history by value confuses trimmed-out messages with transient
+		// reinsertions and loses duplicate occurrences.
+		st.ModelHistory = append(st.ModelHistory, st.History.Since(beforeModelWatermark)...)
+
 		switch st.Take() {
 		case lifecycle.DirectiveStop:
 			if st.ModelOutput != nil {
@@ -276,8 +303,21 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		// The exact model-visible request is a durable write-ahead record. If
 		// persistence fails, do not call the model: a response without its input
 		// ledger cannot be replayed or audited deterministically.
-		if err := commitModelInput(ctx, st); err != nil {
-			return res, err
+		st.ModelAttempt = 0
+		st.BeforeModelAttempt = func(attemptCtx context.Context, info model.Info) error {
+			r.syncSpend(attemptCtx, tracker)
+			if err := tracker.Check(iteration); err != nil {
+				return err
+			}
+			st.ModelName = info.Name
+			st.EffectiveOutputTokens = info.MaxOutputTokens
+			st.ModelAttempt++
+			return commitModelInput(attemptCtx, st)
+		}
+		if sampler, ok := r.cfg.Sampler.(interface{ ManagesModelAttempts() bool }); !ok || !sampler.ManagesModelAttempts() {
+			if err := st.BeforeModelAttempt(ctx, model.Info{}); err != nil {
+				return res, err
+			}
 		}
 
 		// 7 采样
@@ -307,6 +347,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 		}
 
 		// 8 落存回复
+		pending = newToolStepRecovery(ctx, st.History)
 		st.History.Append(resp.Message)
 
 		// 9 采样后切面（逆序：Safety → LoopDetection → Guardrail → Schema）
@@ -335,7 +376,7 @@ func (r *Runner) Run(ctx context.Context, req Request) (*Result, error) {
 			if err := tracker.Check(iteration); err != nil {
 				return res, err
 			}
-			stop, err := r.runTools(ctx, st, calls)
+			stop, err := r.runTools(ctx, st, calls, pending)
 			if err != nil {
 				return res, err
 			}
@@ -378,7 +419,7 @@ func commitModelInput(ctx context.Context, st *lifecycle.State) error {
 	request := st.ModelInput
 	event, err := runtime.NewEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventModelInputCommitted, runtime.ModelInputCommitted{
 		ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID, SubagentTaskID: run.SubagentTaskID,
-		GenerationID: run.GenerationID, Iteration: st.Iteration, System: request.System,
+		GenerationID: run.GenerationID, Iteration: st.Iteration, Attempt: st.ModelAttempt, ModelName: st.ModelName, EffectiveOutputTokens: st.EffectiveOutputTokens, System: request.System,
 		Messages: message.CloneAll(request.Messages), Tools: append([]model.ToolSchema(nil), request.Tools...),
 		MaxTokens: request.MaxTokens, Temperature: request.Temperature, Thinking: request.Thinking,
 		ExtraBody: request.ExtraBody, EnablePromptCache: request.EnablePromptCache,
@@ -387,6 +428,9 @@ func commitModelInput(ctx context.Context, st *lifecycle.State) error {
 		return fmt.Errorf("loop: encoding model input commit: %w", err)
 	}
 	event.IdempotencyKey = fmt.Sprintf("run:%s:model-input:%d", run.RunID, st.Iteration)
+	if st.ModelAttempt > 1 {
+		event.IdempotencyKey += fmt.Sprintf(":attempt:%d", st.ModelAttempt)
+	}
 	if _, err := run.Publish(context.WithoutCancel(ctx), event); err != nil {
 		return fmt.Errorf("loop: persisting model input commit: %w", err)
 	}
@@ -547,6 +591,9 @@ func (r *Runner) seed(st *lifecycle.State, req Request) error {
 }
 
 func (r *Runner) compact(ctx context.Context, st *lifecycle.State) error {
+	if sampler, ok := r.cfg.Sampler.(interface{ ManagesCompaction() bool }); ok && sampler.ManagesCompaction() {
+		return nil
+	}
 	if r.cfg.Compactor == nil {
 		return nil
 	}
@@ -648,7 +695,7 @@ func (r *Runner) resolveToolSet(ctx context.Context, st *lifecycle.State) (allow
 }
 
 // runTools 执行本轮的工具调用，返回是否应结束回合。
-func (r *Runner) runTools(ctx context.Context, st *lifecycle.State, calls []tool.Call) (bool, error) {
+func (r *Runner) runTools(ctx context.Context, st *lifecycle.State, calls []tool.Call, recovery *toolStepRecovery) (bool, error) {
 	for _, call := range calls {
 		if !r.toolAvailable(st, call.Name) {
 			return false, fmt.Errorf("loop: tool %q is not available in the current capability view", call.Name)
@@ -677,34 +724,18 @@ func (r *Runner) runTools(ctx context.Context, st *lifecycle.State, calls []tool
 			}
 		}()
 	}
-	execCtx := tool.WithTransactionObserver(ctx, newRuntimeToolTransactionObserver(run))
+	recovery.dispatched = true
+	_, recovery.trackedDispatch = r.cfg.Executor.(*tool.Executor)
+	execCtx := tool.WithTransactionObserver(ctx, &runtimeToolTransactionObserver{run: run, recovery: recovery})
 	outcomes, err := r.cfg.Executor.Run(execCtx, calls, r.cfg.Lifecycle.ToolInterceptor(st))
 
-	// 即使出错也先把已执行的结果写进转录：它们对应的 tool_calls 否则会悬空，
-	// 让下一次模型请求非法。
+	// Keep returned outcomes for custom executors. Native committed results were
+	// already observed; step settlement appends every result in assistant order.
 	for _, o := range outcomes {
 		if o.Result == nil {
 			continue
 		}
-		toolMessage := message.Message{
-			Role:             message.RoleTool,
-			ToolCallID:       o.Call.ID,
-			Name:             o.Call.Name,
-			Content:          o.Result.Content,
-			ContentBlocks:    o.Result.ContentBlocks,
-			IsError:          o.Result.IsError,
-			AdditionalKwargs: cloneAdditionalKwargs(o.Result.AdditionalKwargs),
-		}
-		// Framework execution failures have an authoritative structured status.
-		// Tool results themselves must provide their own task status metadata.
-		if toolMessage.Name == "task" {
-			if _, ok := toolMessage.AdditionalKwargs[message.SubagentStatusKey]; !ok && o.ExecErr != nil {
-				toolMessage.Content = "Task failed. Error: " + o.ExecErr.Error()
-				toolMessage.IsError = true
-				toolMessage.AdditionalKwargs = message.MakeSubagentAdditionalKwargs(message.SubagentFailed, o.ExecErr.Error())
-			}
-		}
-		st.History.Append(toolMessage)
+		recovery.recordResult(toolOutcomeMessage(o), false)
 	}
 
 	if err != nil {

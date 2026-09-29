@@ -55,7 +55,7 @@ func (e *Executor) EndTurnRequested() bool {
 //     不中断本批，也不杀回合。
 //   - ctx 取消与拦截器返回的 error 会中断本批并返回该 error —— 前者是外部意志，
 //     后者是治理失败，都不该被吞掉。
-//   - 并发段内任一调用被取消时，级联取消同段其余调用，不等它们跑完。
+//   - 并发段内任一调用被取消时，级联取消同段其余调用，等待已启动调用退出后返回。
 func (e *Executor) Run(ctx context.Context, calls []Call, ic Interceptor) ([]Outcome, error) {
 	e.endTurn.Store(false)
 
@@ -127,7 +127,7 @@ func (e *Executor) runSerial(ctx context.Context, seg Segment, ic Interceptor, o
 
 func (e *Executor) runConcurrent(ctx context.Context, seg Segment, ic Interceptor, out []Outcome) (int, error) {
 	// 段内任一调用被取消或治理失败时，级联取消同段其余调用。
-	// 不这样做的话，一个已经注定失败的批次仍会等最慢的调用跑完。
+	// 停止等待队列并通知已启动调用退出；wg.Wait 保证结果恢复不会与活跃调用竞争。
 	groupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -217,6 +217,7 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 		}
 	}
 	deny := func(reason string) (Outcome, bool, error) {
+		reason = reasonOr(reason, "tool call denied")
 		if tx != nil {
 			if txErr := tx.Deny(reason); txErr != nil {
 				return Outcome{}, false, txErr
@@ -227,7 +228,7 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 	cancel := func(execErr error) (Outcome, bool, error) {
 		if tx != nil {
 			if txErr := tx.Cancel(execErr); txErr != nil {
-				return Outcome{}, false, txErr
+				return Outcome{}, false, errors.Join(execErr, txErr)
 			}
 		}
 		return Outcome{}, false, execErr
@@ -237,7 +238,7 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 		decision, decErr := ic.BeforeTool(ctx, c)
 		if decErr != nil {
 			if tx != nil {
-				_ = tx.Cancel(decErr)
+				decErr = errors.Join(decErr, tx.Cancel(decErr))
 			}
 			return Outcome{}, false, decErr
 		}
@@ -262,7 +263,7 @@ func (e *Executor) invoke(ctx context.Context, c Call, ic Interceptor) (outcome 
 		rewritten, afterErr := ic.AfterTool(ctx, c, res, execErr)
 		if afterErr != nil {
 			if tx != nil {
-				_ = tx.Finish(res, afterErr)
+				afterErr = errors.Join(afterErr, tx.Finish(res, afterErr))
 			}
 			return Outcome{}, false, afterErr
 		}

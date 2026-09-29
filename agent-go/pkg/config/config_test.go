@@ -399,3 +399,32 @@ func isolateTuyooEnv(t *testing.T) {
 	t.Setenv("TUYOO_BASE_URL", "")
 	t.Setenv("TUYOO_API_KEY", "")
 }
+
+func TestLoadDeepSeekMessagesOptions(t *testing.T) {
+	isolateTuyooEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := `models:
+  - name: ds
+    provider: deepseek
+    model: deepseek-v4-pro
+    stream_idle_timeout: 300
+    timeout: 60
+    use_files: true
+summarization:
+  headroom_tokens: 8192
+`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Models[0].UseFiles || cfg.Models[0].StreamIdleTimeout != 300 || cfg.Summarization.HeadroomTokens != 8192 {
+		t.Fatalf("config=%+v", cfg.Models[0])
+	}
+	cfg.Models[0].Provider = "openai-compatible"
+	if err := cfg.Validate([]string{"openai-compatible"}); err == nil {
+		t.Fatal("accepted use_files for incompatible provider")
+	}
+}

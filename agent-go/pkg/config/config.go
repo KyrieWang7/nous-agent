@@ -62,6 +62,8 @@ type ModelConfig struct {
 	Temperature             *float64             `yaml:"temperature"`
 	ContextLength           int                  `yaml:"context_length"`
 	Timeout                 int                  `yaml:"timeout"`
+	StreamIdleTimeout       int                  `yaml:"stream_idle_timeout"`
+	UseFiles                bool                 `yaml:"use_files"`
 	SupportsThinking        bool                 `yaml:"supports_thinking"`
 	SupportsReasoningEffort bool                 `yaml:"supports_reasoning_effort"`
 	SupportsVision          bool                 `yaml:"supports_vision"`
@@ -198,6 +200,7 @@ type SwarmConfig struct {
 type SummarizationConfig struct {
 	Enabled          bool `yaml:"enabled"`
 	TriggerTokens    int  `yaml:"trigger_tokens"`
+	HeadroomTokens   int  `yaml:"headroom_tokens"`
 	KeepMessages     int  `yaml:"keep_messages"`
 	MaxSummaryTokens int  `yaml:"max_summary_tokens"`
 	MaxInputMessages int  `yaml:"max_input_messages"`
@@ -259,7 +262,7 @@ func Load(path string) (Config, error) {
 	if err := applyEnv(&cfg); err != nil {
 		return Config{}, err
 	}
-	if err := cfg.Validate([]string{"openai-compatible", "anthropic"}); err != nil {
+	if err := cfg.Validate([]string{"openai-compatible", "anthropic", "deepseek"}); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -336,6 +339,9 @@ func (c *Config) Validate(providers []string) error {
 	if len(c.Models) == 0 {
 		return errors.New("config: at least one model is required")
 	}
+	if c.Summarization.HeadroomTokens < 0 {
+		return errors.New("config: summarization.headroom_tokens cannot be negative")
+	}
 	seen := map[string]struct{}{}
 	for _, m := range c.Models {
 		if m.Name == "" || m.Model == "" || m.Provider == "" {
@@ -347,6 +353,15 @@ func (c *Config) Validate(providers []string) error {
 		seen[m.Name] = struct{}{}
 		if !slices.Contains(providers, m.Provider) {
 			return fmt.Errorf("config: unknown provider %q for model %q; available: %v", m.Provider, m.Name, providers)
+		}
+		if m.Timeout < 0 || m.StreamIdleTimeout < 0 {
+			return fmt.Errorf("config: model %q timeouts cannot be negative", m.Name)
+		}
+		if m.UseFiles && m.Provider != "deepseek" {
+			return fmt.Errorf("config: use_files requires the deepseek provider")
+		}
+		if m.Provider == "deepseek" && (len(m.ExtraBody) > 0 || m.WhenThinkingEnabled != nil) {
+			return fmt.Errorf("config: deepseek uses Messages options; extra_body and when_thinking_enabled require openai-compatible")
 		}
 		if m.Pricing.InputPerMillionMicros < 0 || m.Pricing.OutputPerMillionMicros < 0 || m.Pricing.CachedInputPerMillionMicros < 0 {
 			return fmt.Errorf("config: model %q pricing cannot be negative", m.Name)

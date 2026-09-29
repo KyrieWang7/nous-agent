@@ -18,6 +18,7 @@ import (
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/internal/streamhttp"
 )
 
 // Name 是本 provider 在注册表中的名字。
@@ -27,6 +28,7 @@ const defaultBaseURL = "https://api.openai.com/v1"
 
 // Client 是 OpenAI 兼容模型。
 type Client struct {
+	idle    time.Duration
 	http    *http.Client
 	baseURL string
 	apiKey  string
@@ -71,6 +73,7 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 	}
 
 	return &Client{
+		idle:    time.Duration(cfg.StreamIdleTimeout) * time.Second,
 		http:    &http.Client{Timeout: timeout},
 		baseURL: base,
 		apiKey:  cfg.APIKey,
@@ -101,7 +104,7 @@ func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Respon
 		return nil, err
 	}
 
-	resp, err := c.post(ctx, body)
+	resp, err := c.post(ctx, body, false)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +132,7 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 		return nil, err
 	}
 
-	resp, err := c.post(ctx, body)
+	resp, err := c.post(ctx, body, true)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +145,7 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 	return newSSEReader(resp.Body, c.info.Name), nil
 }
 
-func (c *Client) post(ctx context.Context, body []byte) (*http.Response, error) {
+func (c *Client) post(ctx context.Context, body []byte, stream bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("openai: building request: %w", err)
@@ -152,7 +155,12 @@ func (c *Client) post(ctx context.Context, body []byte) (*http.Response, error) 
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
-	resp, err := c.http.Do(req)
+	var resp *http.Response
+	if stream {
+		resp, err = streamhttp.Do(c.http, req, c.idle)
+	} else {
+		resp, err = c.http.Do(req)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -459,4 +467,25 @@ func mapFinishReason(reason string) string {
 	default:
 		return reason
 	}
+}
+
+func (c *Client) RequestInfo(req model.Request) model.Info {
+	info := c.info
+	// Use exactly the same merging rules as the request encoder.
+	raw, err := c.buildBody(req, false)
+	if err != nil {
+		return info
+	}
+	var p map[string]json.RawMessage
+	if json.Unmarshal(raw, &p) != nil {
+		return info
+	}
+	info.MaxOutputTokens = 0
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		var n int
+		if json.Unmarshal(p[key], &n) == nil && n > info.MaxOutputTokens {
+			info.MaxOutputTokens = n
+		}
+	}
+	return info
 }

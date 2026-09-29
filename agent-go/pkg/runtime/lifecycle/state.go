@@ -5,6 +5,7 @@
 package lifecycle
 
 import (
+	"context"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
@@ -68,8 +69,18 @@ type State struct {
 	// History 是回合的唯一状态。CloneForTool 出来的副本共享同一个指针。
 	History *message.History
 
-	ModelInput  *model.Request
-	ModelOutput *model.Response
+	// ModelHistory is the trimmed canonical projection before transient handlers.
+	ModelHistory []message.Message
+	// RebuildModelHistory reapplies pure trimming without rerunning lifecycle effects.
+	RebuildModelHistory func() []message.Message
+	// BeforeModelAttempt commits the final routed input before each provider call.
+	BeforeModelAttempt func(context.Context, model.Info) error
+	ModelAttempt       int
+	ModelName          string
+
+	EffectiveOutputTokens int
+	ModelInput            *model.Request
+	ModelOutput           *model.Response
 
 	// ToolCall / ToolResult / ToolExecErr 只在 BeforeTool / AfterTool 阶段有值。
 	ToolCall    *tool.Call
@@ -80,7 +91,8 @@ type State struct {
 
 	// Compacted 表示本回合发生过压缩。持久化层据此走整体重写路径
 	// 而不是追加路径（设计文档 §13.2）。判据是这个标志，不是"消息数变少了"。
-	Compacted bool
+	Compacted         bool
+	CompactionAttempt int
 
 	// ToolSet 是本轮的工具名白名单，由内核每轮重算。
 	//

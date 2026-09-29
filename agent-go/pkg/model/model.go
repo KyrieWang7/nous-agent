@@ -121,5 +121,21 @@ type ProviderConfig struct {
 	// ThinkingExtraBody is merged only for requests whose Thinking flag is true.
 	// It is interpreted by OpenAI-compatible providers; native providers ignore it.
 	ThinkingExtraBody map[string]any
-	Timeout           int // 秒
+	Timeout           int  // 秒
+	StreamIdleTimeout int  // seconds; defaults to 120, independent of total request timeout
+	UseFiles          bool // DeepSeek Messages: upload images to Files instead of inline bytes
+}
+
+// RequestInfo resolves the output reservation used by a concrete provider.
+// This optional extension lets the router account for provider default/extra
+// body precedence without importing providers into the routing layer.
+func RequestInfo(m Model, req Request) Info {
+	if p, ok := m.(interface{ RequestInfo(Request) Info }); ok {
+		return p.RequestInfo(req)
+	}
+	info := m.Info()
+	if req.MaxTokens > 0 {
+		info.MaxOutputTokens = req.MaxTokens
+	}
+	return info
 }

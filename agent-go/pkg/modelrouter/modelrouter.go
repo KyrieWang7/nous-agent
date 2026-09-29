@@ -46,6 +46,12 @@ type Compactor interface {
 	MaybeCompact(ctx context.Context, h *message.History) (bool, error)
 }
 
+// OverflowCompactor distinguishes a provider-confirmed overflow from ordinary
+// proactive pressure. Legacy custom compactors can still implement Compactor.
+type OverflowCompactor interface {
+	ForceCompact(ctx context.Context, h *message.History) (bool, error)
+}
+
 // Config 配置路由器。
 type Config struct {
 	// Models 是每一层的模型。至少要有 TierStandard。
@@ -303,6 +309,30 @@ func (r *Router) sampleWithRecovery(
 			return nil, false, err
 		}
 
+		if c, ok := r.cfg.Compactor.(requestCompactor); ok && st.History != nil {
+			before := st.History.All()
+			info := model.RequestInfo(m, *st.ModelInput)
+			needed, err := c.ShouldCompactRequest(*st.ModelInput, info)
+			if err != nil {
+				return nil, false, err
+			}
+			changed := false
+			if needed {
+				changed, err = compactHistory(ctx, st, func() (bool, error) { return c.MaybeCompactRequest(ctx, st.History, *st.ModelInput, info) })
+			}
+			if err != nil {
+				return nil, false, err
+			}
+			if changed {
+				st.Compacted = true
+				r.rebuildInput(st, before)
+			}
+		}
+		if st.BeforeModelAttempt != nil {
+			if err := st.BeforeModelAttempt(ctx, model.RequestInfo(m, *st.ModelInput)); err != nil {
+				return nil, false, err
+			}
+		}
 		resp, streamed, err := r.sampleOnce(ctx, m, st)
 		if err == nil {
 			return resp, streamed, nil
@@ -326,7 +356,12 @@ func (r *Router) sampleWithRecovery(
 			if r.cfg.Compactor == nil || st.History == nil {
 				return nil, false, err
 			}
-			compacted, cerr := r.cfg.Compactor.MaybeCompact(ctx, st.History)
+			compact := r.cfg.Compactor.MaybeCompact
+			if recovery, ok := r.cfg.Compactor.(OverflowCompactor); ok {
+				compact = recovery.ForceCompact
+			}
+			before := st.History.All()
+			compacted, cerr := compactHistory(ctx, st, func() (bool, error) { return compact(ctx, st.History) })
 			if cerr != nil {
 				return nil, false, cerr
 			}
@@ -335,7 +370,7 @@ func (r *Router) sampleWithRecovery(
 				return nil, false, err
 			}
 			st.Compacted = true
-			r.rebuildInput(st)
+			r.rebuildInput(st, before)
 			r.logger.WarnContext(ctx, "context overflow, recompacted and retrying",
 				"attempt", contextRetries)
 
@@ -343,18 +378,6 @@ func (r *Router) sampleWithRecovery(
 			return nil, false, err
 		}
 	}
-}
-
-// rebuildInput 在压缩后刷新投递给模型的消息。
-//
-// 不刷新的话重发的还是那份超限的消息，压缩等于白做。
-func (r *Router) rebuildInput(st *lifecycle.State) {
-	if st.ModelInput == nil || st.History == nil {
-		return
-	}
-	req := *st.ModelInput
-	req.Messages = st.History.All()
-	st.ModelInput = &req
 }
 
 // sampleOnce 做一次真实调用。第二个返回值表示是否已有内容流出。

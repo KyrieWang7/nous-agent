@@ -96,6 +96,63 @@ See [config.example.yaml](./config.example.yaml). Main sections are:
 - `memory`, `title`, and `guardrails`: optional governed runtime capabilities.
 - `runtime`: PostgreSQL, Redis, event retention, and SSE heartbeat.
 
+With summarization enabled, `trigger_tokens: 0` selects 75% of the **actual
+routed model's** input budget (`ContextLength - effective output reservation -
+headroom_tokens`). System text, tool schemas and transient messages count toward
+pressure. Request output overrides and OpenAI-compatible `extra_body` precedence
+are included. `headroom_tokens` defaults to 0; a positive `trigger_tokens` remains
+an explicit override. Shared compactors do not store mutable per-run thresholds.
+Provider-confirmed context overflow bypasses the proactive threshold and can
+reduce the retained tail at tool-transaction boundaries. Recovery retries only
+after the summary reduces estimated history tokens, within the existing retry
+limit. Disabling summarization also disables overflow compaction.
+
+OpenAI-compatible streams must end with `[DONE]` or a `finish_reason` followed
+by clean EOF; Anthropic streams must reach `message_stop`. Premature EOF or a
+read failure cannot become a successful partial response. Read errors terminate
+once, and already-streamed text or reasoning prevents automatic fallback.
+
+Accepted assistant tool calls are settled before a step advances or the run
+returns, including failures in governance, capability checks, budgets, and tool
+execution. Committed results are retained in assistant order. Missing results
+use `TOOL_NOT_STARTED` when the native executor did not start the call, or
+`TOOL_OUTCOME_UNKNOWN` when execution may have occurred without a committed
+result. Unknown outcomes include guidance to verify possible side effects before
+retrying. Recovery records never execute the tool. Their code appears in the
+`tool_result.recovery_code` audit field and the transcript message's
+`additional_kwargs.tool_recovery_code` field. Recovery writes use a bounded
+30-second cleanup context; failures preserve both the original and recovery
+errors, and an uncommitted synthetic result never enters history.
+
+Each real router attempt writes `model_input_committed` before calling the
+provider, with its model name, attempt number, effective output reservation,
+generation and complete active tool schemas. Retries/fallbacks have distinct
+idempotency keys. Compaction rebuilds the trimmed canonical input while preserving
+transient inbox/context/image messages, without rerunning lifecycle side effects.
+The per-attempt tool snapshot is the Go replay contract for dynamic tool changes.
+
+`stream_idle_timeout` (seconds) is separate from `timeout`: continuously active
+streams can exceed the ordinary HTTP deadline. OpenAI-compatible and Anthropic
+default to 120 seconds of inactivity; DeepSeek Messages defaults to 300. Cancellation
+still stops the stream, and closing a reader releases its watchdog. `timeout`
+continues to bound nonstreaming requests and DeepSeek Files operations.
+
+The optional `provider: deepseek` uses the Messages endpoint
+`https://api.deepseek.com/anthropic/v1/messages`. It supports text, thinking,
+tools, inline images, and credential-scoped Files image caching (`use_files: true`).
+It retains thinking signatures only while the model and canonical content match,
+validates stream termination, and discards incomplete tool JSON on token exhaustion.
+Files receive a seven-day expiry; a missing/expired ID triggers one reupload. Source
+image bytes remain in the transcript, so file IDs can be rebuilt after restart.
+The client also exposes upload/list/retrieve/delete Files operations; it does not
+automatically delete other account files. Existing `openai-compatible` model
+configurations keep their current endpoint and protocol. See the commented model
+entry in `config.example.yaml` to opt in. Native Messages uses `thinking_enabled`
+and `reasoning_effort` (`low`, `high`, `max`), not OpenAI `extra_body` configuration.
+
+See [the upstream synchronization record](../docs/upstream-sync-2026-09-29.md)
+for the audited DeepSeek Harness baseline, applied changes, and architecture-specific boundaries.
+
 The Go Harness can also connect directly to the existing AIO/provisioner runtime
 used by the local Nous/DeerFlow deployment:
 

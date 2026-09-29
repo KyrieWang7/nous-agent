@@ -2,7 +2,9 @@ package openai
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -110,9 +112,20 @@ func (r *sseReader) Next() (model.StreamEvent, bool) {
 // readMore 读下一行并把它转成待发事件。返回 false 表示流结束。
 func (r *sseReader) readMore() bool {
 	if !r.scanner.Scan() {
-		if err := r.scanner.Err(); err != nil {
-			r.err = fmt.Errorf("openai: reading stream: %w", err)
+		err := r.scanner.Err()
+		if err == nil && r.stopReason == "" {
+			err = io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				r.err = err
+			} else {
+				r.err = fmt.Errorf("%w: openai stream ended before completion: %w", model.ErrProviderUnavailable, err)
+			}
 			r.pending = append(r.pending, model.StreamEvent{Type: model.StreamError, Err: r.err})
+		} else {
+			// Some compatible endpoints end at finish_reason without [DONE].
+			r.pending = append(r.pending, model.StreamEvent{Type: model.StreamDone})
 		}
 		r.done = true
 		return len(r.pending) > 0

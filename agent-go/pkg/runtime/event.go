@@ -201,25 +201,31 @@ type ToolResult struct {
 	Name       string `json:"name"`
 	Content    string `json:"content"`
 	IsError    bool   `json:"is_error,omitempty"`
+	// RecoveryCode is TOOL_NOT_STARTED or TOOL_OUTCOME_UNKNOWN for synthetic
+	// results that settle an accepted assistant call without executing it.
+	RecoveryCode string `json:"recovery_code,omitempty"`
 }
 
 // ModelInputCommitted records the exact request visible to the lead or child
 // model after lifecycle policy has run. ExecutionRunID distinguishes nested
 // sessions which share the root run's durable event partition.
 type ModelInputCommitted struct {
-	ExecutionRunID    string             `json:"execution_run_id"`
-	ParentRunID       string             `json:"parent_run_id,omitempty"`
-	SubagentTaskID    string             `json:"subagent_task_id,omitempty"`
-	GenerationID      string             `json:"generation_id,omitempty"`
-	Iteration         int                `json:"iteration"`
-	System            string             `json:"system,omitempty"`
-	Messages          []message.Message  `json:"messages"`
-	Tools             []model.ToolSchema `json:"tools,omitempty"`
-	MaxTokens         int                `json:"max_tokens,omitempty"`
-	Temperature       *float64           `json:"temperature,omitempty"`
-	Thinking          bool               `json:"thinking,omitempty"`
-	ExtraBody         map[string]any     `json:"extra_body,omitempty"`
-	EnablePromptCache bool               `json:"enable_prompt_cache,omitempty"`
+	EffectiveOutputTokens int                `json:"effective_output_tokens,omitempty"`
+	Attempt               int                `json:"attempt,omitempty"`
+	ModelName             string             `json:"model_name,omitempty"`
+	ExecutionRunID        string             `json:"execution_run_id"`
+	ParentRunID           string             `json:"parent_run_id,omitempty"`
+	SubagentTaskID        string             `json:"subagent_task_id,omitempty"`
+	GenerationID          string             `json:"generation_id,omitempty"`
+	Iteration             int                `json:"iteration"`
+	System                string             `json:"system,omitempty"`
+	Messages              []message.Message  `json:"messages"`
+	Tools                 []model.ToolSchema `json:"tools,omitempty"`
+	MaxTokens             int                `json:"max_tokens,omitempty"`
+	Temperature           *float64           `json:"temperature,omitempty"`
+	Thinking              bool               `json:"thinking,omitempty"`
+	ExtraBody             map[string]any     `json:"extra_body,omitempty"`
+	EnablePromptCache     bool               `json:"enable_prompt_cache,omitempty"`
 }
 
 // ModelOutputCommitted records the normalized provider result before budget,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
@@ -13,11 +14,8 @@ import (
 // the runtime transaction ledger. The tool package only sees its neutral hook
 // interface, so custom executors remain free of runtime implementation types.
 type runtimeToolTransactionObserver struct {
-	run runtime.RunContext
-}
-
-func newRuntimeToolTransactionObserver(run runtime.RunContext) tool.TransactionObserver {
-	return &runtimeToolTransactionObserver{run: run}
+	run      runtime.RunContext
+	recovery *toolStepRecovery
 }
 
 func (o *runtimeToolTransactionObserver) Start(ctx context.Context, call tool.Call) (tool.Transaction, error) {
@@ -36,6 +34,9 @@ func (o *runtimeToolTransactionObserver) Start(ctx context.Context, call tool.Ca
 	h := &runtimeToolTransaction{observer: o, tx: tx, call: call, txID: txID, ctx: ctx}
 	if err := o.publish(ctx, runtime.EventToolStart, runtime.ToolStart{ToolCallID: callID, Name: call.Name, Args: call.Args}, txID+":start"); err != nil {
 		return nil, err
+	}
+	if o.recovery != nil {
+		o.recovery.recordStart(callID)
 	}
 	return h, nil
 }
@@ -96,21 +97,19 @@ func (t *runtimeToolTransaction) Cancel(err error) error {
 }
 
 func (t *runtimeToolTransaction) publishResult(result *tool.Result, execErr error) error {
-	content := ""
-	isError := execErr != nil
-	if result != nil {
-		content = result.Content
-		isError = isError || result.IsError
+	m := toolOutcomeMessage(tool.Outcome{Call: t.call, Result: result, ExecErr: execErr})
+	if err := t.observer.publishMessage(t.ctx, m); err != nil {
+		return err
 	}
-	if content == "" && execErr != nil {
-		content = execErr.Error()
+	if t.observer.recovery != nil {
+		t.observer.recovery.recordResult(m, true)
 	}
-	return t.observer.publish(t.ctx, runtime.EventToolResult, runtime.ToolResult{
-		ToolCallID: t.call.ID,
-		Name:       t.call.Name,
-		Content:    content,
-		IsError:    isError,
-	}, t.txID+":result")
+	return nil
+}
+
+func (o *runtimeToolTransactionObserver) publishMessage(ctx context.Context, m message.Message) error {
+	code, _ := m.AdditionalKwargs["tool_recovery_code"].(string)
+	return o.publish(ctx, runtime.EventToolResult, runtime.ToolResult{ToolCallID: m.ToolCallID, Name: m.Name, Content: m.Content, IsError: m.IsError, RecoveryCode: code}, o.run.RunID+":tool:"+m.ToolCallID+":result")
 }
 
 func (o *runtimeToolTransactionObserver) publish(ctx context.Context, typ runtime.EventType, payload any, key string) error {

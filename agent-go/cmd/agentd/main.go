@@ -27,6 +27,7 @@ import (
 	mem "github.com/KyrieWang7/nous-agent/agent-go/pkg/memory"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/anthropic"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/deepseek"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model/provider/openai"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/modelrouter"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
@@ -287,13 +288,19 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Summarization.Enabled {
 		trigger := cfg.Summarization.TriggerTokens
 		if trigger <= 0 {
-			trigger = mc.ContextLength * 3 / 4
-		}
-		if trigger <= 0 {
-			trigger = 96_000
+			// Output and input share the context window. Use provider-resolved
+			// defaults as well as explicit configuration (not the raw YAML size).
+			info := m.Info()
+			messageBudget := info.ContextLength - max(0, info.MaxOutputTokens)
+			if messageBudget <= 0 {
+				return builtAgent{}, fmt.Errorf("agentd: model %q reserves %d output tokens of its %d-token context, leaving no message budget", mc.Name, info.MaxOutputTokens, info.ContextLength)
+			}
+			// The router computes the threshold again for the actual request/model.
 		}
 		compactor, err = compaction.New(compaction.Config{
 			TriggerTokens:    trigger,
+			AutoBudget:       trigger <= 0,
+			HeadroomTokens:   cfg.Summarization.HeadroomTokens,
 			KeepMessages:     cfg.Summarization.KeepMessages,
 			MaxSummaryTokens: cfg.Summarization.MaxSummaryTokens,
 			MaxInputMessages: cfg.Summarization.MaxInputMessages,
@@ -792,7 +799,7 @@ func subagentTimeout(cfg config.Config, parent runtime.RunContext, req subagent.
 }
 
 func buildModel(mc config.ModelConfig) (model.Model, error) {
-	providerConfig := model.ProviderConfig{Name: mc.Name, Model: mc.Model, BaseURL: mc.BaseURL, APIKey: mc.APIKey, MaxTokens: mc.MaxTokens, Temperature: mc.Temperature, ContextLength: mc.ContextLength, SupportsThinking: mc.SupportsThinking, SupportsReasoningEffort: mc.SupportsReasoningEffort, SupportsVision: mc.SupportsVision, ExtraBody: mc.ExtraBody, Timeout: mc.Timeout}
+	providerConfig := model.ProviderConfig{Name: mc.Name, Model: mc.Model, BaseURL: mc.BaseURL, APIKey: mc.APIKey, MaxTokens: mc.MaxTokens, Temperature: mc.Temperature, ContextLength: mc.ContextLength, SupportsThinking: mc.SupportsThinking, SupportsReasoningEffort: mc.SupportsReasoningEffort, SupportsVision: mc.SupportsVision, ExtraBody: mc.ExtraBody, Timeout: mc.Timeout, StreamIdleTimeout: mc.StreamIdleTimeout, UseFiles: mc.UseFiles}
 	if mc.WhenThinkingEnabled != nil {
 		providerConfig.ThinkingExtraBody = mc.WhenThinkingEnabled.ExtraBody
 	}
@@ -801,6 +808,8 @@ func buildModel(mc config.ModelConfig) (model.Model, error) {
 		return openai.New(providerConfig)
 	case anthropic.Name:
 		return anthropic.New(providerConfig)
+	case deepseek.Name:
+		return deepseek.New(providerConfig)
 	default:
 		return nil, fmt.Errorf("agentd: unsupported model provider %q for model %q", mc.Provider, mc.Name)
 	}

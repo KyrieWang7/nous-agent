@@ -64,3 +64,7 @@ func (r *accountingReader) Result() (*model.Response, error) {
 	}
 	return resp, err
 }
+
+func (m *accountingModel) RequestInfo(req model.Request) model.Info {
+	return model.RequestInfo(m.inner, req)
+}
