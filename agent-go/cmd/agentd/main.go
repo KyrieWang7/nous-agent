@@ -890,6 +890,14 @@ func publishModelStreamEvent(ctx context.Context, st *lifecycle.State, ev model.
 			return
 		}
 		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventReasoningDelta, runtime.ReasoningDelta{Delta: ev.Delta, MessageID: messageID})
+	case model.StreamToolCallDelta:
+		if ev.ArgumentsDelta == "" && ev.ToolCallID == "" && ev.ToolCallName == "" {
+			return
+		}
+		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventToolCallDelta, runtime.ToolCallDelta{
+			MessageID: messageID, ToolCallIndex: ev.ToolCallIndex, ToolCallID: ev.ToolCallID,
+			ToolCallName: ev.ToolCallName, ArgumentsDelta: ev.ArgumentsDelta,
+		})
 	case model.StreamDone:
 		event = runtime.MustEvent(eventRunID, run.ThreadID, runtime.EventMessageStop, map[string]any{"message_id": messageID})
 	default:

@@ -84,7 +84,7 @@ export function groupMessages<T>(
       }
     } else if (message.type === "ai") {
       const msgId = message.id ?? crypto.randomUUID();
-      if (hasReasoning(message) || hasToolCalls(message)) {
+      if (hasReasoning(message) || hasToolCalls(message) || hasToolPreparations(message)) {
         if (hasPresentFiles(message)) {
           groups.push({
             id: msgId,
@@ -109,7 +109,7 @@ export function groupMessages<T>(
           activeProcessingGroup.messages.push(message);
         }
       }
-      if (hasContent(message) && !hasToolCalls(message)) {
+      if (hasContent(message) && !hasToolCalls(message) && !hasToolPreparations(message)) {
         groups.push({
           id: msgId + ":content",
           type: "assistant",
@@ -221,6 +221,10 @@ export function hasToolCalls(message: Message) {
   return (
     message.type === "ai" && message.tool_calls && message.tool_calls.length > 0
   );
+}
+
+export function hasToolPreparations(message: Message) {
+  return message.type === "ai" && !!message.tool_call_preparations?.length;
 }
 
 export function hasPresentFiles(message: Message) {

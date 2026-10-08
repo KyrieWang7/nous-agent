@@ -163,7 +163,7 @@ func WriteFile() tool.Definition {
 	return tool.Definition{
 		Name:        "write_file",
 		Group:       GroupFileWrite,
-		Description: "Create or overwrite a file in the workspace.",
+		Description: "Create or overwrite a file in the workspace. Provide path before content in the arguments.",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -208,7 +208,7 @@ func StrReplace() tool.Definition {
 		Name:  "str_replace",
 		Group: GroupFileWrite,
 		Description: "Replace an exact string in a file. The target string must occur exactly once; " +
-			"include surrounding context to make it unique.",
+			"include surrounding context to make it unique. Provide path before old_str and new_str in the arguments.",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {

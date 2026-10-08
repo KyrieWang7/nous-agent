@@ -52,3 +52,21 @@ test("starts a new processing group after the next human turn", () => {
   );
   assert.equal(processing.length, 2);
 });
+
+test("unfinished task and artifact calls remain ordinary preparation activity", () => {
+  for (const name of ["task", "present_files"]) {
+    const message = {
+      id: `preparing-${name}`,
+      type: "ai",
+      content: "",
+      tool_call_preparations: [
+        { index: 0, name, args: {}, argumentLength: 1 },
+      ],
+    };
+
+    assert.deepEqual(groupMessages([message], (group) => group.type), [
+      "assistant:processing",
+    ]);
+    assert.equal(message.tool_calls, undefined);
+  }
+});

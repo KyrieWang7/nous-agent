@@ -56,6 +56,7 @@ const (
 	EventTranscriptReplace EventType = "transcript_replace"
 	EventUsage             EventType = "usage"
 	EventMessageStop       EventType = "message_stop"
+	EventToolCallDelta     EventType = "tool_call_delta"
 	EventRunEnd            EventType = "run_end"
 	EventError             EventType = "error"
 )
@@ -174,6 +175,17 @@ type ContentDelta struct {
 type ReasoningDelta struct {
 	Delta     string `json:"delta"`
 	MessageID string `json:"message_id,omitempty"`
+}
+
+// ToolCallDelta is a provider tool-call fragment. It is trace-only and may be
+// replayed to the UI, but must never be treated as an executable tool call
+// until the model response has completed and passed normal validation.
+type ToolCallDelta struct {
+	MessageID      string `json:"message_id,omitempty"`
+	ToolCallIndex  int    `json:"tool_call_index"`
+	ToolCallID     string `json:"tool_call_id,omitempty"`
+	ToolCallName   string `json:"tool_call_name,omitempty"`
+	ArgumentsDelta string `json:"arguments_delta,omitempty"`
 }
 
 type PlanModeChanged struct {

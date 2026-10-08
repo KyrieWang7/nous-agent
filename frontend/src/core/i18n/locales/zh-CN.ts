@@ -199,6 +199,9 @@ export const zhCN: Translations = {
 
   // Tool calls
   toolCalls: {
+    preparing: (name: string) => `正在准备 ${name}`,
+    notExecuted: (name: string) => `${name} 未执行`,
+    argumentProgress: (length: number) => `已接收 ${length.toLocaleString()} 个参数字符`,
     moreSteps: (count: number) => `查看其他 ${count} 个步骤`,
     lessSteps: "隐藏步骤",
     executeCommand: "执行命令",
@@ -217,6 +220,20 @@ export const zhCN: Translations = {
     clickToViewContent: "点击查看文件内容",
     writeTodos: "更新 To-do 列表",
     skillInstallTooltip: "安装技能并使其可在 Nous 中使用",
+  },
+
+  inspector: {
+    title: "运行事件",
+    run: "运行",
+    eventType: "事件类型",
+    sequence: "序号",
+    time: "时间",
+    allTypes: "全部类型",
+    empty: "暂无事件",
+    noRuns: "尚无运行记录",
+    loadMore: "加载更多",
+    refresh: "刷新",
+    failed: "无法加载运行事件",
   },
 
   subtasks: {

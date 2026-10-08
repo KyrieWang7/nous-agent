@@ -189,6 +189,7 @@ function ToolCall({
   name,
   args,
   result,
+  preparationLength,
   isLast = false,
   isLoading = false,
 }: {
@@ -197,6 +198,7 @@ function ToolCall({
   name: string;
   args: Record<string, unknown>;
   result?: string | Record<string, unknown>;
+  preparationLength?: number;
   isLast?: boolean;
   isLoading?: boolean;
 }) {
@@ -204,6 +206,24 @@ function ToolCall({
   const { setOpen, autoOpen, autoSelect, selectedArtifact, select } =
     useArtifacts();
   const showTimer = isLoading && isLast;
+
+  if (preparationLength !== undefined) {
+    const detail = [args.description, args.path, args.query, args.url].find(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+    return (
+      <ChainOfThoughtStep
+        label={isLoading ? t.toolCalls.preparing(name) : t.toolCalls.notExecuted(name)}
+        icon={WrenchIcon}
+        isLoading={showTimer}
+      >
+        {detail && <div className="max-w-full break-all text-sm">{detail.slice(0, 160)}</div>}
+        <div className="text-muted-foreground text-xs tabular-nums">
+          {t.toolCalls.argumentProgress(preparationLength)}
+        </div>
+      </ChainOfThoughtStep>
+    );
+  }
 
   if (name === "web_search") {
     let label: React.ReactNode = t.toolCalls.searchForRelatedInfo;
@@ -375,14 +395,11 @@ function ToolCall({
   } else if (name === "bash") {
     const description: string | undefined = (args as { description: string })
       ?.description;
-    if (!description) {
-      return t.toolCalls.executeCommand;
-    }
     const command: string | undefined = (args as { command: string })?.command;
     return (
       <ChainOfThoughtStep
         key={id}
-        label={description}
+        label={description ?? t.toolCalls.executeCommand}
         icon={SquareTerminalIcon}
         isLoading={showTimer}
       >
@@ -442,6 +459,7 @@ interface CoTToolCallStep extends GenericCoTStep<"toolCall"> {
   name: string;
   args: Record<string, unknown>;
   result?: string;
+  preparationLength?: number;
 }
 
 type CoTStep = CoTReasoningStep | CoTToolCallStep;
@@ -459,6 +477,17 @@ function convertToSteps(messages: Message[]): CoTStep[] {
           reasoning: extractReasoningContentFromMessage(message),
         };
         steps.push(step);
+      }
+      for (const call of message.tool_call_preparations ?? []) {
+        if (!call.name) continue;
+        steps.push({
+          id: call.id ?? `${message.id}:preparing:${call.index}`,
+          messageId: message.id,
+          type: "toolCall",
+          name: call.name,
+          args: call.args,
+          preparationLength: call.argumentLength,
+        });
       }
       for (const tool_call of message.tool_calls ?? []) {
         if (!tool_call.name || tool_call.name === "task") {

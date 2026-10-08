@@ -35,6 +35,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { browserDraftStorage, readDraft, writeDraft } from "@/core/threads/drafts";
 import type { ChatStatus, FileUIPart } from "ai";
 import {
   ArrowUpIcon,
@@ -87,7 +88,7 @@ export type AttachmentsContext = {
 export type TextInputContext = {
   value: string;
   setInput: (v: string) => void;
-  clear: () => void;
+  clear: (expectedValue?: string) => void;
 };
 
 export type PromptInputControllerProps = {
@@ -136,6 +137,7 @@ const useOptionalProviderAttachments = () =>
 
 export type PromptInputProviderProps = PropsWithChildren<{
   initialInput?: string;
+  draftKey?: string;
 }>;
 
 /**
@@ -144,11 +146,34 @@ export type PromptInputProviderProps = PropsWithChildren<{
  */
 export function PromptInputProvider({
   initialInput: initialTextInput = "",
+  draftKey,
   children,
 }: PromptInputProviderProps) {
   // ----- textInput state
-  const [textInput, setTextInput] = useState(initialTextInput);
-  const clearInput = useCallback(() => setTextInput(""), []);
+  const [draft, setDraft] = useState(() => ({
+    key: draftKey,
+    text: draftKey ? readDraft(browserDraftStorage(), draftKey, initialTextInput) : initialTextInput,
+  }));
+  if (draft.key !== draftKey) {
+    setDraft({
+      key: draftKey,
+      text: draftKey ? readDraft(browserDraftStorage(), draftKey, initialTextInput) : initialTextInput,
+    });
+  }
+  const textInput = draft.text;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const setTextInput = useCallback((text: string) => {
+    if (draftKey) writeDraft(browserDraftStorage(), draftKey, text);
+    setDraft((previous) => previous.key === draftKey ? { key: draftKey, text } : previous);
+  }, [draftKey]);
+  const clearInput = useCallback((expectedValue?: string) => {
+    const current = draftRef.current;
+    const text = current.key === draftKey ? current.text
+      : draftKey ? readDraft(browserDraftStorage(), draftKey) : "";
+    if (expectedValue !== undefined && text !== expectedValue) return;
+    setTextInput("");
+  }, [draftKey, setTextInput]);
 
   // ----- attachments state (global when wrapped)
   const [attachmentFiles, setAttachmentFiles] = useState<
@@ -246,7 +271,7 @@ export function PromptInputProvider({
       attachments,
       __registerFileInput,
     }),
-    [textInput, clearInput, attachments, __registerFileInput],
+    [textInput, setTextInput, clearInput, attachments, __registerFileInput],
   );
 
   return (
@@ -751,9 +776,9 @@ export const PromptInput = ({
           if (result instanceof Promise) {
             result
               .then(() => {
-                clear();
+                files.forEach((file) => remove(file.id));
                 if (usingProvider) {
-                  controller.textInput.clear();
+                  controller.textInput.clear(text);
                 }
               })
               .catch(() => {
@@ -761,9 +786,9 @@ export const PromptInput = ({
               });
           } else {
             // Sync function completed without throwing, clear attachments
-            clear();
+            files.forEach((file) => remove(file.id));
             if (usingProvider) {
-              controller.textInput.clear();
+              controller.textInput.clear(text);
             }
           }
         } catch {

@@ -203,6 +203,9 @@ export const enUS: Translations = {
 
   // Tool calls
   toolCalls: {
+    preparing: (name: string) => `Preparing ${name}`,
+    notExecuted: (name: string) => `${name} was not executed`,
+    argumentProgress: (length: number) => `${length.toLocaleString()} argument characters received`,
     moreSteps: (count: number) => `${count} more step${count === 1 ? "" : "s"}`,
     lessSteps: "Less steps",
     executeCommand: "Execute command",
@@ -225,6 +228,20 @@ export const enUS: Translations = {
   },
 
   // Subtasks
+  inspector: {
+    title: "Run events",
+    run: "Run",
+    eventType: "Event type",
+    sequence: "Sequence",
+    time: "Time",
+    allTypes: "All types",
+    empty: "No events",
+    noRuns: "No runs yet",
+    loadMore: "Load more",
+    refresh: "Refresh",
+    failed: "Could not load run events",
+  },
+
   subtasks: {
     subtask: "Subtask",
     executing: (count: number) =>

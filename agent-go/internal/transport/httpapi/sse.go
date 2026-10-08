@@ -71,6 +71,24 @@ func projectRuntimeEvent(e runtime.Event) (wireEvent, error) {
 			chunk["additional_kwargs"] = map[string]any{"reasoning_content": payload["delta"]}
 		}
 		return makeWireEvent("messages", []any{chunk, meta}), nil
+	case runtime.EventToolCallDelta:
+		var delta runtime.ToolCallDelta
+		if err := json.Unmarshal(e.Data, &delta); err != nil {
+			return wireEvent{}, err
+		}
+		id := delta.MessageID
+		if id == "" {
+			id = e.RunID
+		}
+		chunk := map[string]any{
+			"id": id, "type": "AIMessageChunk", "content": "",
+			"additional_kwargs": map[string]any{}, "response_metadata": map[string]any{},
+			"tool_call_chunks": []map[string]any{{
+				"index": delta.ToolCallIndex, "id": delta.ToolCallID,
+				"name": delta.ToolCallName, "args": delta.ArgumentsDelta, "type": "tool_call_chunk",
+			}},
+		}
+		return makeWireEvent("messages", []any{chunk, meta}), nil
 	case runtime.EventError:
 		return makeWireEvent("error", payload), nil
 	case runtime.EventRunEnd:

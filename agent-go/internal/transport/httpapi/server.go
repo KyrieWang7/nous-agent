@@ -189,9 +189,71 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/threads/{tid}/runs", s.listRuns)
 	s.mux.HandleFunc("GET /api/v1/threads/{tid}/runs/{rid}", s.getRun)
 	s.mux.HandleFunc("GET /api/v1/threads/{tid}/runs/{rid}/events", s.reconnectRun)
+	s.mux.HandleFunc("GET /api/v1/threads/{tid}/runs/{rid}/events/raw", s.rawEvents)
 	s.mux.HandleFunc("POST /api/v1/threads/{tid}/runs/{rid}/cancel", s.cancelRun)
 	s.mux.HandleFunc("GET /api/v1/threads/{tid}/runs/{rid}/questions/{qid}", s.getQuestion)
 	s.mux.HandleFunc("POST /api/v1/threads/{tid}/runs/{rid}/questions/{qid}/answer", s.answerQuestion)
+}
+
+// rawEvents exposes the durable runtime events for diagnostics. It is
+// deliberately separate from SSE: callers get canonical JSON, a cursor, and
+// no live subscription or projection filtering.
+func (s *Server) rawEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	tid, rid := r.PathValue("tid"), r.PathValue("rid")
+	run, err := s.store.GetRun(r.Context(), rid)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if run.ThreadID != tid {
+		writeError(w, http.StatusNotFound, errors.New("run not found"))
+		return
+	}
+	after := queryInt64(r, "after", 0)
+	if after < 0 {
+		after = 0
+	}
+	limit := queryInt(r, "limit", 200, 1, 1000)
+	events, err := s.events.Get(r.Context(), rid, after, limit+1)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
+	}
+	if events == nil {
+		events = []runtime.Event{}
+	}
+	next := after
+	if len(events) > 0 {
+		next = events[len(events)-1].Seq
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events, "next_after": next, "has_more": hasMore})
+}
+
+func queryInt(r *http.Request, key string, fallback, min, max int) int {
+	value, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil {
+		return fallback
+	}
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func queryInt64(r *http.Request, key string, fallback int64) int64 {
+	value, err := strconv.ParseInt(r.URL.Query().Get(key), 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func (s *Server) getQuestion(w http.ResponseWriter, r *http.Request) {

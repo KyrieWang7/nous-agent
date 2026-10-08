@@ -153,6 +153,15 @@ and `reasoning_effort` (`low`, `high`, `max`), not OpenAI `extra_body` configura
 See [the upstream synchronization record](../docs/upstream-sync-2026-09-29.md)
 for the audited DeepSeek Harness baseline, applied changes, and architecture-specific boundaries.
 
+The [2026-10-08 update](../docs/upstream-sync-2026-10-08.md) adds tool preparation
+streaming and raw event inspection. `tool_call_delta` is a trace event carrying
+provider argument fragments; it cannot authorize or execute a tool. The SSE
+projection emits indexed `tool_call_chunks`, while finalized model messages
+remain authoritative. `GET /api/v1/threads/{tid}/runs/{rid}/events/raw` returns
+canonical events with `after`/`limit` pagination and `next_after`/`has_more` fields.
+The raw endpoint validates run ownership, disables caching, and includes model
+commit and transcript data hidden from ordinary SSE.
+
 The Go Harness can also connect directly to the existing AIO/provisioner runtime
 used by the local Nous/DeerFlow deployment:
 

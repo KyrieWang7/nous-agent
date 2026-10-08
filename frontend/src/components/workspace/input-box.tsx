@@ -116,7 +116,7 @@ export function InputBox({
   initialValue?: string;
   onContextChange?: (context: AgentRunIntent) => void;
   tokenUsage?: TokenUsage | null;
-  onSubmit?: (message: PromptInputMessage) => void;
+  onSubmit?: (message: PromptInputMessage) => void | Promise<void>;
   onStop?: () => void;
 }) {
   const { t } = useI18n();
@@ -268,10 +268,10 @@ export function InputBox({
       if (selectedSkills.length > 0) {
         const skillNames = selectedSkills.map((s) => s.name).join(", ");
         finalText = `[请使用以下技能完成此任务: ${skillNames}]\n\n${finalText}`;
-        setSelectedSkills([]);
       }
 
-      onSubmit?.({ ...message, text: finalText });
+      await onSubmit?.({ ...message, text: finalText });
+      setSelectedSkills([]);
     },
     [onSubmit, onStop, status, selectedSkills],
   );

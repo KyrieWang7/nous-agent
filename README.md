@@ -54,6 +54,7 @@ Agent Loop 的核心语义不通过 middleware 扩展机制隐式改变；业务
 - 模型、工具、沙箱、记忆、技能、MCP 和子 Agent 统一作为可注册、可替换的 capability。
 - OpenAI-compatible 与 Anthropic 模型路由，支持按 run 选择模型与 thinking 配置。
 - SSE 流式响应、事件回放、取消、断线重连和 PostgreSQL/Redis 持久化。
+- 工具调用准备过程展示、按 run 分页查看原始事件，以及按会话保存浏览器文本草稿。
 - 每次模型调用前持久化实际 model-visible input，模型输出在工具执行前持久化；提交失败
   fail-closed，崩溃后可定位最后一个确定的模型/工具事务边界。
 - 沙箱文件系统、权限控制、Hooks、MCP、Skills、Todo、摘要压缩和 Guardrails。
@@ -63,6 +64,8 @@ Agent Loop 的核心语义不通过 middleware 扩展机制隐式改变；业务
 - Go 原生 PDF、DOCX、PPTX、XLSX 转 Markdown；旧 Office 格式由 Gateway 镜像内的 LibreOffice 归一化。
 
 前端事件投影使用 `metadata`、`values`、`messages`、`custom`、`error`、`end`。运行时内部保留更细的 `content_delta`、`reasoning_delta`、工具、任务、用量和审计事件。
+
+工具参数增量只用于展示准备过程，最终模型消息才提供完整调用；运行事件检查器位于已有会话的标题栏。最新 DeepSeek Harness 适配和限制见 [2026-10-08 同步记录](docs/upstream-sync-2026-10-08.md)。
 
 Harness 会在每个新 run 前检测模型、MCP、Skill、插件与 YAML 配置变化，并以完整 generation 热切换；进行中的 run 持有旧 generation lease，结束后才回收对应模型、MCP、Plugin 与外部客户端资源。监听地址、PostgreSQL URL 和 Redis URL 属于进程级配置，修改后需要重启。
 

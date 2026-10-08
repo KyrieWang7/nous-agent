@@ -23,6 +23,7 @@ import { InputBox } from "@/components/workspace/input-box";
 import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
 import { PlanReview } from "@/components/workspace/plan-review";
+import { RunEventInspector } from "@/components/workspace/run-event-inspector";
 import { SubagentDraggablePanel } from "@/components/workspace/subagent";
 import { SwarmDraggablePanel } from "@/components/workspace/swarm/swarm-panel";
 import { ThreadTitle } from "@/components/workspace/thread-title";
@@ -34,6 +35,7 @@ import { useNotification } from "@/core/notification/hooks";
 import { useLocalSettings } from "@/core/settings";
 import { getTeamsByThread } from "@/core/swarm/api";
 import { useSubtaskContext } from "@/core/tasks/context";
+import { browserDraftStorage, readDraft, writeDraft } from "@/core/threads/drafts";
 import { useSubmitThread, useThreadStream } from "@/core/threads/hooks";
 import {
   cleanThreadTitle,
@@ -60,32 +62,28 @@ export default function ChatPage() {
   const { thread_id: threadIdFromPath } = useParams<{ thread_id: string }>();
   const searchParams = useSearchParams();
   const promptInputController = usePromptInputController();
+  const currentInputRef = useRef({
+    path: threadIdFromPath,
+    controller: promptInputController,
+  });
+  currentInputRef.current = {
+    path: threadIdFromPath,
+    controller: promptInputController,
+  };
   const inputInitialValue = useMemo(() => {
     if (threadIdFromPath !== "new" || searchParams.get("mode") !== "skill") {
       return undefined;
     }
     return t.inputBox.createSkillPrompt;
   }, [threadIdFromPath, searchParams, t.inputBox.createSkillPrompt]);
-  const lastInitialValueRef = useRef<string | undefined>(undefined);
-  const setInputRef = useRef(promptInputController.textInput.setInput);
-  setInputRef.current = promptInputController.textInput.setInput;
+  const initializedPromptRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (
-      inputInitialValue &&
-      inputInitialValue !== lastInitialValueRef.current
-    ) {
-      lastInitialValueRef.current = inputInitialValue;
-      setTimeout(() => {
-        setInputRef.current(inputInitialValue);
-        const textarea = document.querySelector("textarea");
-        if (textarea) {
-          textarea.focus();
-          textarea.selectionStart = textarea.value.length;
-          textarea.selectionEnd = textarea.value.length;
-        }
-      }, 100);
+    if (initializedPromptRef.current === inputInitialValue) return;
+    initializedPromptRef.current = inputInitialValue;
+    if (inputInitialValue && !promptInputController.textInput.value) {
+      promptInputController.textInput.setInput(inputInitialValue);
     }
-  }, [inputInitialValue]);
+  }, [inputInitialValue, promptInputController.textInput]);
   const isNewThreadFromPath = threadIdFromPath === "new";
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const isNewThread = isNewThreadFromPath && !hasSubmitted;
@@ -249,6 +247,7 @@ export default function ChatPage() {
     },
     afterSubmit() {
       if (isNewThreadFromPath && threadId) {
+        writeDraft(browserDraftStorage(), threadId, promptInputController.textInput.value);
         setHasSubmitted(true);
         window.history.replaceState(null, "", pathOfThread(threadId));
       }
@@ -256,10 +255,21 @@ export default function ChatPage() {
   });
   const handleSubmit = useCallback(
     async (message: Parameters<typeof _handleSubmit>[0]) => {
+      const submittedText = promptInputController.textInput.value;
       setIsStreaming(true);
-      await _handleSubmit(message);
+      try {
+        await _handleSubmit(message);
+        if (threadId && readDraft(browserDraftStorage(), threadId) === submittedText) {
+          writeDraft(browserDraftStorage(), threadId, "");
+        }
+        if (currentInputRef.current.path === threadId) {
+          currentInputRef.current.controller.textInput.clear(submittedText);
+        }
+      } finally {
+        setIsStreaming(false);
+      }
     },
-    [_handleSubmit],
+    [_handleSubmit, promptInputController.textInput.value, threadId],
   );
   const handleStop = useCallback(() => {
     setIsStreaming(false);
@@ -293,7 +303,11 @@ export default function ChatPage() {
                     <ThreadTitle threadId={threadId} threadTitle={title} />
                   )}
                 </div>
-                <div>
+                <div className="flex shrink-0 items-center gap-1">
+                  {!isNewThread &&
+                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                      <RunEventInspector key={threadId} threadId={threadId} />
+                    )}
                   {artifacts?.length > 0 && !artifactsOpen && (
                     <Tooltip content="Show artifacts of this conversation">
                       <Button
@@ -366,7 +380,7 @@ export default function ChatPage() {
                     {thread.error != null && (
                       <Alert
                         variant="destructive"
-                        className="mb-2 rounded-md bg-background/95"
+                        className="bg-background/95 mb-2 rounded-md"
                       >
                         <TriangleAlertIcon />
                         <AlertDescription>
@@ -389,9 +403,13 @@ export default function ChatPage() {
                         status={isStreaming ? "streaming" : "ready"}
                         context={settings.context}
                         extraHeader={
-                          isNewThread && <Welcome mode={settings.context.mode} />
+                          isNewThread && (
+                            <Welcome mode={settings.context.mode} />
+                          )
                         }
-                        disabled={env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"}
+                        disabled={
+                          env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
+                        }
                         onContextChange={(context) =>
                           setSettings("context", context)
                         }

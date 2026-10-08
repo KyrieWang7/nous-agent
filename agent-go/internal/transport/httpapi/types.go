@@ -60,15 +60,24 @@ type runCreate struct {
 }
 
 type wireMessage struct {
-	ID               string         `json:"id"`
-	Type             string         `json:"type"`
-	Content          any            `json:"content"`
-	Name             string         `json:"name,omitempty"`
-	ToolCallID       string         `json:"tool_call_id,omitempty"`
-	ToolCalls        []wireToolCall `json:"tool_calls,omitempty"`
-	AdditionalKwargs map[string]any `json:"additional_kwargs"`
-	ResponseMetadata map[string]any `json:"response_metadata"`
-	UsageMetadata    map[string]int `json:"usage_metadata,omitempty"`
+	ID               string              `json:"id"`
+	Type             string              `json:"type"`
+	Content          any                 `json:"content"`
+	Name             string              `json:"name,omitempty"`
+	ToolCallID       string              `json:"tool_call_id,omitempty"`
+	ToolCalls        []wireToolCall      `json:"tool_calls,omitempty"`
+	ToolCallChunks   []wireToolCallChunk `json:"tool_call_chunks,omitempty"`
+	AdditionalKwargs map[string]any      `json:"additional_kwargs"`
+	ResponseMetadata map[string]any      `json:"response_metadata"`
+	UsageMetadata    map[string]int      `json:"usage_metadata,omitempty"`
+}
+
+type wireToolCallChunk struct {
+	Index int    `json:"index"`
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Args  string `json:"args,omitempty"`
+	Type  string `json:"type"`
 }
 
 type wireToolCall struct {

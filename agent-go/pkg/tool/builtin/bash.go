@@ -23,6 +23,7 @@ func Bash() tool.Definition {
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
+    "description": {"type": "string", "description": "Short description of the command's purpose. Provide description before command in the arguments."},
     "command":     {"type": "string", "description": "Shell command line to run."},
     "workdir":     {"type": "string", "description": "Working directory relative to the workspace root."},
     "timeout_sec": {"type": "integer", "description": "Timeout in seconds. Defaults to the sandbox default."}
@@ -35,9 +36,10 @@ func Bash() tool.Definition {
 }
 
 type bashArgs struct {
-	Command    string `json:"command"`
-	WorkDir    string `json:"workdir"`
-	TimeoutSec int    `json:"timeout_sec"`
+	Description string `json:"description"`
+	Command     string `json:"command"`
+	WorkDir     string `json:"workdir"`
+	TimeoutSec  int    `json:"timeout_sec"`
 }
 
 func handleBash(ctx context.Context, call tool.Call) (*tool.Result, error) {

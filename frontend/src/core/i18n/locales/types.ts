@@ -150,6 +150,9 @@ export interface Translations {
 
   // Tool calls
   toolCalls: {
+    preparing: (name: string) => string;
+    notExecuted: (name: string) => string;
+    argumentProgress: (length: number) => string;
     moreSteps: (count: number) => string;
     lessSteps: string;
     executeCommand: string;
@@ -168,6 +171,20 @@ export interface Translations {
     clickToViewContent: string;
     writeTodos: string;
     skillInstallTooltip: string;
+  };
+
+  inspector: {
+    title: string;
+    run: string;
+    eventType: string;
+    sequence: string;
+    time: string;
+    allTypes: string;
+    empty: string;
+    noRuns: string;
+    loadMore: string;
+    refresh: string;
+    failed: string;
   };
 
   // Subtasks

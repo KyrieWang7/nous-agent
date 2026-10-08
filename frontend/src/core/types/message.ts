@@ -42,6 +42,15 @@ export interface ToolCall {
   type?: "tool_call";
 }
 
+/** Presentation of an unfinished provider call; never an executable ToolCall. */
+export interface ToolCallPreparation {
+  index: number;
+  id?: string;
+  name: string;
+  args: Record<string, unknown>;
+  argumentLength: number;
+}
+
 export interface InvalidToolCall {
   name?: string;
   args?: string;
@@ -69,6 +78,7 @@ export interface AIMessage extends BaseMessage {
   type: "ai";
   example?: boolean;
   tool_calls?: ToolCall[];
+  tool_call_preparations?: ToolCallPreparation[];
   invalid_tool_calls?: InvalidToolCall[];
   usage_metadata?: UsageMetadata;
 }

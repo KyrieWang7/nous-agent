@@ -610,6 +610,7 @@ function useSSEStream(
           err instanceof Error ? err.message : "An unexpected error occurred",
         );
         setState((prev) => ({ ...prev, isLoading: false, error: err }));
+        throw err;
       }
     },
     [processSSEEvent],

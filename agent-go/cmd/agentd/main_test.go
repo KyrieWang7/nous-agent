@@ -125,6 +125,7 @@ func TestChildModelStreamUsesOnlyTaskProgressChannel(t *testing.T) {
 	st.Iteration = 2
 
 	publishModelStreamEvent(ctx, st, model.StreamEvent{Type: model.StreamTextDelta, Delta: "hello"})
+	publishModelStreamEvent(ctx, st, model.StreamEvent{Type: model.StreamToolCallDelta, ToolCallID: "child-call", ToolCallName: "read_file", ArgumentsDelta: `{"path":"`})
 	if len(published) != 0 {
 		t.Fatalf("child delta leaked into the lead stream: %#v", published)
 	}
@@ -153,6 +154,30 @@ func TestChildModelStreamUsesOnlyTaskProgressChannel(t *testing.T) {
 	}
 	if payload.Message.Content != "checking files" || len(payload.Message.ToolCalls) != 1 {
 		t.Fatalf("message = %#v", payload.Message)
+	}
+}
+
+func TestModelToolCallFragmentsPublishTraceOnly(t *testing.T) {
+	var published []runtime.Event
+	ctx := runtime.WithRunContext(context.Background(), runtime.RunContext{
+		RunID: "run", ThreadID: "thread",
+		Publish: func(_ context.Context, event runtime.Event) (int64, error) {
+			published = append(published, event)
+			return int64(len(published)), nil
+		},
+	})
+	st := lifecycle.NewState(lifecycle.StateInit{RunID: "run", ThreadID: "thread"})
+	publishModelStreamEvent(ctx, st, model.StreamEvent{Type: model.StreamToolCallDelta})
+	publishModelStreamEvent(ctx, st, model.StreamEvent{Type: model.StreamToolCallDelta, ToolCallIndex: 1, ToolCallID: "call", ToolCallName: "bash"})
+	if len(published) != 1 || published[0].Type != runtime.EventToolCallDelta || published[0].Category != runtime.CategoryTrace {
+		t.Fatalf("events=%+v", published)
+	}
+	var delta runtime.ToolCallDelta
+	if err := json.Unmarshal(published[0].Data, &delta); err != nil {
+		t.Fatal(err)
+	}
+	if delta.ToolCallIndex != 1 || delta.ToolCallName != "bash" || delta.MessageID != "run:0" {
+		t.Fatalf("delta=%+v", delta)
 	}
 }
 
