@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/metadata"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -98,6 +99,15 @@ func nextSeq(ctx context.Context, tx pgx.Tx, threadID string) (int64, error) {
 	var locked string
 	if err := tx.QueryRow(ctx, `SELECT id FROM agent_thread WHERE id=$1 FOR UPDATE`, threadID).Scan(&locked); err != nil {
 		return 0, err
+	}
+	if expected := metadata.Writer(ctx); expected != "" {
+		var current string
+		if err := tx.QueryRow(ctx, `SELECT run_id FROM agent_thread_writer WHERE thread_id=$1`, threadID).Scan(&current); err != nil {
+			return 0, err
+		}
+		if current != expected {
+			return 0, metadata.ErrStaleWriter
+		}
 	}
 	var seq int64
 	err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM agent_message WHERE thread_id=$1`, threadID).Scan(&seq)

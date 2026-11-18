@@ -47,8 +47,7 @@ func New(ctx context.Context, opts Options) (*Runtime, error) {
 	}
 	gen, err := generation.New(id, registry)
 	if err != nil {
-		_ = plugins.Stop(context.WithoutCancel(ctx))
-		return nil, fmt.Errorf("assembly: creating generation: %w", err)
+		return nil, errors.Join(fmt.Errorf("assembly: creating generation: %w", err), plugins.Stop(context.WithoutCancel(ctx)))
 	}
 	return &Runtime{Generation: gen, Plugins: plugins}, nil
 }

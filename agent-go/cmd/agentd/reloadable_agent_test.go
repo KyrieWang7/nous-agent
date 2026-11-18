@@ -200,8 +200,21 @@ func writeReloadConfigWithSkills(t *testing.T, path, modelName, skillsPath strin
 }
 
 func isolateReloadEnvironment(t *testing.T) {
+	t.Setenv("NOUS_PLUGIN_STATE_PATH", filepath.Join(t.TempDir(), "plugins.json"))
 	t.Helper()
 	for _, name := range []string{"NOUS_EXTENSIONS_CONFIG_PATH", "NOUS_AGENT_ADDR", "DATABASE_URL", "REDIS_URL", "NOUS_SKILLS_PATH", "TUYOO_BASE_URL", "TUYOO_API_KEY"} {
 		t.Setenv(name, "")
+	}
+}
+
+func TestHTTPMiddlewareConfigurationRequiresRestart(t *testing.T) {
+	cfg := config.Defaults()
+	agent := &reloadableAgent{immutable: immutableRuntimeConfig{address: cfg.Server.Address, databaseURL: cfg.Runtime.DatabaseURL, redisURL: cfg.Runtime.RedisURL, http: cfg.HTTP}}
+	if err := agent.validateImmutable(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.HTTP.RateLimit.Enabled = true
+	if err := agent.validateImmutable(cfg); err == nil {
+		t.Fatal("process middleware config changed without a restart")
 	}
 }

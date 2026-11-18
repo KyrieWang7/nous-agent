@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -9,10 +10,17 @@ import (
 	"strings"
 )
 
-const modulePath = "github.com/KyrieWang7/nous-agent/agent-go"
+var modulePath = "github.com/KyrieWang7/nous-agent/agent-go"
 
 func main() {
-	if err := rejectRemovedDirectories("pkg/middleware"); err != nil {
+	moduleDir := flag.String("dir", ".", "Go module directory to check")
+	flag.Parse()
+	if err := os.Chdir(*moduleDir); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if err := rejectRemovedDirectories("pkg/middleware", "internal/transport", "internal/httpapi", "internal/store", "internal/catalog", "internal/files", "internal/convert"); err != nil {
 		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
 		os.Exit(1)
 	}
@@ -20,13 +28,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
 		os.Exit(1)
 	}
-	deps, err := loadDeps()
+	deps, direct, err := loadDeps()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "layercheck: %v\n", err)
 		os.Exit(1)
 	}
 
-	violations := check(deps)
+	violations := append(check(deps), checkRules(direct, applicationRules)...)
 	if len(violations) == 0 {
 		fmt.Printf("layercheck: %d packages, no layering violations\n", len(deps))
 		return
@@ -70,20 +78,25 @@ func rejectRemovedDirectories(paths ...string) error {
 type goListPackage struct {
 	ImportPath string   `json:"ImportPath"`
 	Deps       []string `json:"Deps"`
-	Standard   bool     `json:"Standard"`
+	Imports    []string `json:"Imports"`
+	Module     *struct {
+		Path string `json:"Path"`
+	} `json:"Module"`
+	Standard bool `json:"Standard"`
 }
 
 // loadDeps 返回本模块内每个包 → 其全部（含间接）依赖。模块内依赖使用
 // 相对路径，标准库和第三方依赖放入 external/ 命名空间，避免把标准库的
 // internal/* 误认成本模块 internal/*，同时允许规则识别具体外部依赖。
-func loadDeps() (map[string][]string, error) {
+func loadDeps() (map[string][]string, map[string][]string, error) {
 	cmd := exec.Command("go", "list", "-deps=false", "-json", "./...")
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("go list failed: %w", err)
+		return nil, nil, fmt.Errorf("go list failed: %w", err)
 	}
 
 	deps := make(map[string][]string)
+	direct := make(map[string][]string)
 	dec := json.NewDecoder(strings.NewReader(string(out)))
 	for {
 		var p goListPackage
@@ -91,12 +104,15 @@ func loadDeps() (map[string][]string, error) {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("decoding go list output: %w", err)
+			return nil, nil, fmt.Errorf("decoding go list output: %w", err)
 		}
 		if p.Standard {
 			continue
 		}
 
+		if p.Module != nil {
+			modulePath = p.Module.Path
+		}
 		local := relative(p.ImportPath)
 		if local == "" {
 			continue
@@ -111,12 +127,19 @@ func loadDeps() (map[string][]string, error) {
 			}
 		}
 		deps[local] = packageDeps
+		for _, dep := range p.Imports {
+			if rel := relative(dep); rel != "" {
+				direct[local] = append(direct[local], rel)
+			} else {
+				direct[local] = append(direct[local], "external/"+dep)
+			}
+		}
 	}
 
 	if len(deps) == 0 {
-		return nil, fmt.Errorf("go list returned no packages for %s", modulePath)
+		return nil, nil, fmt.Errorf("go list returned no packages for %s", modulePath)
 	}
-	return deps, nil
+	return deps, direct, nil
 }
 
 // relative 把完整 import path 转成相对模块根的路径。模块外的包返回空串。

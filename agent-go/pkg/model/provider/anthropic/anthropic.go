@@ -77,7 +77,14 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 }
 func (c *Client) Info() model.Info { return c.info }
 func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Response, error) {
-	resp, err := c.post(ctx, req, false)
+	raw, err := c.buildBody(req, false)
+	if err != nil {
+		return nil, err
+	}
+	return c.completeBody(ctx, raw)
+}
+func (c *Client) completeBody(ctx context.Context, raw []byte) (*model.Response, error) {
+	resp, err := c.postBody(ctx, raw, false)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +99,14 @@ func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Respon
 	return wire.toModel(c.info.Name), nil
 }
 func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamReader, error) {
-	resp, err := c.post(ctx, req, true)
+	raw, err := c.buildBody(req, true)
+	if err != nil {
+		return nil, err
+	}
+	return c.streamBody(ctx, raw)
+}
+func (c *Client) streamBody(ctx context.Context, raw []byte) (model.StreamReader, error) {
+	resp, err := c.postBody(ctx, raw, true)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +116,7 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 	}
 	return newStream(resp.Body, c.info.Name), nil
 }
-func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+func (c *Client) buildBody(req model.Request, stream bool) ([]byte, error) {
 	output := c.maxTokens
 	if req.MaxTokens > 0 {
 		output = req.MaxTokens
@@ -132,10 +146,9 @@ func (c *Client) post(ctx context.Context, req model.Request, stream bool) (*htt
 	if req.Thinking {
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": max(output/2, 1024)}
 	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
+	return json.Marshal(payload)
+}
+func (c *Client) postBody(ctx context.Context, raw []byte, stream bool) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
@@ -383,3 +396,24 @@ func (s *stream) Result() (*model.Response, error) {
 	return &s.response, nil
 }
 func (s *stream) Close() error { return s.body.Close() }
+
+func (c *Client) PrepareCall(ctx context.Context, req model.Request) (model.PreparedCall, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", nil); err != nil {
+		return nil, err
+	}
+	complete, err := c.buildBody(req, false)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := c.buildBody(req, true)
+	if err != nil {
+		return nil, err
+	}
+	return model.BoundCall{ModelInfo: model.RequestInfo(c, req),
+		CompleteFunc: func(ctx context.Context) (*model.Response, error) { return c.completeBody(ctx, complete) },
+		StreamFunc:   func(ctx context.Context) (model.StreamReader, error) { return c.streamBody(ctx, stream) },
+	}, nil
+}

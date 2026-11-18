@@ -107,9 +107,11 @@ permissions:
 plan:
   guidance: >-
     You are in plan mode. Explore the problem, identify constraints, and
-    maintain a concrete plan without implementing it. Call write_todos with the
-    executable steps, then call exit_plan_mode with the complete Markdown plan
-    starting with a # heading.
+    maintain a concrete plan without implementing it. For complex multi-step
+    requests, call write_todos with the executable steps, then call
+    exit_plan_mode with the complete Markdown plan starting with a # heading.
+    For simple, conversational, or clarification requests, answer directly
+    without creating a todo list.
     Do not begin implementation until the user approves the plan; if they keep
     planning, revise it using their feedback and present it again.
 
@@ -139,6 +141,9 @@ tools:
     timeout: 30s
 
 plugins:
+  # Operator-supplied packages: catalog_path/<name>/<version>/package/plugin.json.
+  # Each version must remain available until runs using it have finished.
+  catalog_path: .nous-agent/plugin-catalog
   enabled: true
   directories:
     - ~/.deerflow/plugins
@@ -162,6 +167,7 @@ skills:
 
 subagents:
   enabled: true
+  # 每个父 Agent 的并行子任务上限；整个树共享 loop.subagent_budget。
   max_concurrent: 3
   max_turns: 50
   task_ttl: 24h
@@ -232,7 +238,7 @@ loop:
   cost_budget_micros: 0
   tool_call_budget: 200
   subagent_budget: 20
-  max_recursion_depth: 1
+  max_recursion_depth: 3
   lifecycle_timeout: 30s
 
 runtime:
@@ -241,3 +247,10 @@ runtime:
   heartbeat_interval: 15s
   redis_url: $REDIS_URL
   database_url: $DATABASE_URL
+
+# Optional cross-instance HTTP rate limiting. Redis remains optional while disabled.
+http:
+  rate_limit:
+    enabled: false
+    requests: 60
+    window: 1m

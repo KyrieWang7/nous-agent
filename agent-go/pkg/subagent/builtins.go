@@ -2,8 +2,10 @@ package subagent
 
 const generalPurposePrompt = `You are a general-purpose subagent working on a delegated task.
 
-Complete the task autonomously using the available tools. Do not delegate to
-another agent and do not ask the user for clarification. Work with the context
+Complete the task autonomously using the available tools. When task and
+subagent_control are available, delegate focused subtasks within the inherited
+limits and wait for their results before finishing. Do not ask the user for
+clarification. Work with the context
 provided, explain blockers precisely, and return a concise summary with concrete
 findings, changed artifacts, and relevant paths.`
 
@@ -37,9 +39,9 @@ boundaries. Every claim must cite an executed command and observed evidence.
 Finish with VERDICT: PASS, FAIL, or PARTIAL and list precise remediation for every
 failure or unverified area.`
 
-// Builtins mirrors the five Python product profiles while using the tools that
-// exist in the Go harness. An empty AllowedTools list means inherit the trusted
-// parent surface; restrictedToolSet still removes nested orchestration tools.
+// Builtins defines the five native worker profiles. An empty AllowedTools list
+// inherits the trusted parent surface. Explicit read-only and command profiles
+// cannot acquire delegation tools beyond their allowlist.
 func Builtins() []Definition {
 	return []Definition{
 		{

@@ -3,11 +3,11 @@
 package config
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -15,10 +15,16 @@ import (
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/hooks"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
-	"gopkg.in/yaml.v3"
+	platformconfig "github.com/KyrieWang7/nous-agent/platform-go/config"
+	"github.com/spf13/viper"
 )
 
+type HTTPConfig struct {
+	RateLimit platformconfig.RateLimit `yaml:"rate_limit"`
+}
+
 type Config struct {
+	HTTP          HTTPConfig                `yaml:"http"`
 	Deployment    DeploymentConfig          `yaml:"deployment"`
 	Server        ServerConfig              `yaml:"server"`
 	Models        []ModelConfig             `yaml:"models"`
@@ -154,8 +160,11 @@ type ToolConfig struct {
 	Timeout    time.Duration `yaml:"timeout"`
 }
 type PluginsConfig struct {
-	Enabled     bool     `yaml:"enabled"`
-	Directories []string `yaml:"directories"`
+	CatalogPath string            `yaml:"catalog_path"`
+	Installed   map[string]string `yaml:"-"`
+	States      map[string]bool   `yaml:"states"`
+	Enabled     bool              `yaml:"enabled"`
+	Directories []string          `yaml:"directories"`
 }
 type ACPAgentConfig struct {
 	Command                string            `yaml:"command"`
@@ -224,14 +233,16 @@ type HookConfig struct {
 
 func Defaults() Config {
 	return Config{
+		HTTP:        HTTPConfig{RateLimit: platformconfig.RateLimit{Requests: 60, Window: time.Minute}},
 		Deployment:  DeploymentConfig{Environment: "development"},
 		Server:      ServerConfig{Address: ":7776"},
 		Sandbox:     SandboxConfig{Enabled: true, Provider: "local", ExecTimeout: 30 * time.Second},
 		Permissions: PermissionConfig{Preset: permission.PresetWorkspaceWrite},
 		Plan: PlanConfig{Guidance: "You are in plan mode. Think through the request, identify constraints, and prepare a concrete plan without using execution capabilities. " +
-			"Call write_todos before any work with every executable step set to pending, then call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
+			"For complex multi-step requests, call write_todos with every executable step set to pending, then call exit_plan_mode with the complete Markdown plan starting with a # heading. " +
+			"For simple, conversational, or clarification requests, answer directly without creating a todo list. " +
 			"Do not begin implementation until the user approves the plan; if they keep planning, revise it using their feedback and present it again."},
-		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, ToolCallBudget: 200, SubagentBudget: 20, MaxRecursionDepth: 1, LifecycleTimeout: 30 * time.Second},
+		Loop:          LoopConfig{MaxIterations: 100, StopReinjectionLimit: 3, Deadline: 30 * time.Minute, ToolConcurrency: 4, ToolCallBudget: 200, SubagentBudget: 20, MaxRecursionDepth: 3, LifecycleTimeout: 30 * time.Second},
 		Runtime:       RuntimeConfig{EventBufferSize: 500, EventTTL: 24 * time.Hour, HeartbeatInterval: 15 * time.Second},
 		Subagents:     SubagentConfig{Enabled: true, MaxConcurrent: 3, MaxTurns: 50, TaskTTL: 24 * time.Hour, Timeout: 15 * time.Minute},
 		Memory:        MemoryConfig{MaxFacts: 50, ConfidenceThreshold: .7, InjectionTokens: 1000},
@@ -244,22 +255,28 @@ func Defaults() Config {
 
 func Load(path string) (Config, error) {
 	cfg := Defaults()
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return Config{}, fmt.Errorf("config: reading %s: %w", path, err)
-		}
-		data = []byte(os.ExpandEnv(string(data)))
-		dec := yaml.NewDecoder(bytes.NewReader(data))
-		dec.KnownFields(true)
-		if err := dec.Decode(&cfg); err != nil {
-			return Config{}, fmt.Errorf("config: decoding %s: %w", path, err)
-		}
+	v, err := platformconfig.LoadYAML(path, &cfg, map[string]string{
+		"server.address": "NOUS_AGENT_ADDR", "runtime.database_url": "DATABASE_URL", "runtime.redis_url": "REDIS_URL", "skills.path": "NOUS_SKILLS_PATH",
+		"tuyoo.base_url": "TUYOO_BASE_URL", "tuyoo.api_key": "TUYOO_API_KEY",
+		"plugins.catalog_path":    "NOUS_PLUGIN_CATALOG_PATH",
+		"http.rate_limit.enabled": "HTTP_RATE_LIMIT_ENABLED", "http.rate_limit.requests": "HTTP_RATE_LIMIT_REQUESTS", "http.rate_limit.window": "HTTP_RATE_LIMIT_WINDOW",
+	})
+	if err != nil {
+		return Config{}, err
 	}
+
 	if err := applyExtensions(&cfg, os.Getenv("NOUS_EXTENSIONS_CONFIG_PATH")); err != nil {
 		return Config{}, err
 	}
-	if err := applyEnv(&cfg); err != nil {
+	state, stateErr := ReadPluginState(PluginStatePath())
+	if stateErr != nil {
+		return Config{}, stateErr
+	}
+	state.Apply(&cfg.Plugins)
+	if err := platformconfig.ApplyRateLimit(v, "http.rate_limit", &cfg.HTTP.RateLimit); err != nil {
+		return Config{}, err
+	}
+	if err := applyEnv(&cfg, v); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate([]string{"openai-compatible", "anthropic", "deepseek"}); err != nil {
@@ -268,22 +285,21 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
-func applyEnv(c *Config) error {
-	if v := os.Getenv("NOUS_AGENT_ADDR"); v != "" {
-		c.Server.Address = v
+func applyEnv(c *Config, v *viper.Viper) error {
+	c.Server.Address = platformconfig.Env(v, "server.address", c.Server.Address)
+	c.Runtime.DatabaseURL = platformconfig.Env(v, "runtime.database_url", c.Runtime.DatabaseURL)
+	c.Runtime.RedisURL = platformconfig.Env(v, "runtime.redis_url", c.Runtime.RedisURL)
+	c.Skills.Path = platformconfig.Env(v, "skills.path", c.Skills.Path)
+	c.Plugins.CatalogPath = platformconfig.Env(v, "plugins.catalog_path", c.Plugins.CatalogPath)
+	if c.Plugins.CatalogPath == "~" || strings.HasPrefix(c.Plugins.CatalogPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		c.Plugins.CatalogPath = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(c.Plugins.CatalogPath, "~"), "/"))
 	}
-	if v := os.Getenv("DATABASE_URL"); v != "" {
-		c.Runtime.DatabaseURL = v
-	}
-	if v := os.Getenv("REDIS_URL"); v != "" {
-		c.Runtime.RedisURL = v
-	}
-	if v := os.Getenv("NOUS_SKILLS_PATH"); v != "" {
-		c.Skills.Path = v
-	}
-
-	gatewayBaseURL := strings.TrimSpace(os.Getenv("TUYOO_BASE_URL"))
-	gatewayAPIKey := strings.TrimSpace(os.Getenv("TUYOO_API_KEY"))
+	gatewayBaseURL := platformconfig.Env(v, "tuyoo.base_url", "")
+	gatewayAPIKey := platformconfig.Env(v, "tuyoo.api_key", "")
 	if (gatewayBaseURL == "") != (gatewayAPIKey == "") {
 		return errors.New("config: TUYOO_BASE_URL and TUYOO_API_KEY must be set together")
 	}
@@ -430,8 +446,8 @@ func (c *Config) Validate(providers []string) error {
 			}
 		}
 	}
-	if c.Plugins.Enabled && len(c.Plugins.Directories) == 0 {
-		return errors.New("config: plugins.directories is required when plugins are enabled")
+	if c.Plugins.Enabled && len(c.Plugins.Directories) == 0 && c.Plugins.CatalogPath == "" {
+		return errors.New("config: plugins.directories or plugins.catalog_path is required when plugins are enabled")
 	}
 	for name, agent := range c.ACPAgents {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(agent.Command) == "" || strings.TrimSpace(agent.Description) == "" {

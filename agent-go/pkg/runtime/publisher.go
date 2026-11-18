@@ -40,7 +40,10 @@ func (p *EventPublisher) Publish(ctx context.Context, event Event) (int64, error
 		return 0, fmt.Errorf("runtime: event publisher is not initialized")
 	}
 	value, _ := p.sequences.LoadOrStore(event.RunID, &eventSequence{})
-	sequence := value.(*eventSequence)
+	sequence, ok := value.(*eventSequence)
+	if !ok {
+		return 0, fmt.Errorf("runtime: invalid event sequence owner")
+	}
 	sequence.mu.Lock()
 	defer sequence.mu.Unlock()
 	if !sequence.initialized {
@@ -76,7 +79,7 @@ func (p *EventPublisher) Publish(ctx context.Context, event Event) (int64, error
 		} else if reader, ok := p.store.(EventSequenceReader); ok {
 			last, readErr := reader.LastSeq(ctx, event.RunID)
 			if readErr != nil {
-				return 0, fmt.Errorf("persisting %s event: %w (reading durable event sequence: %v)", event.Type, err, readErr)
+				return 0, fmt.Errorf("persisting %s event: %w (reading durable event sequence: %w)", event.Type, err, readErr)
 			}
 			if last < event.Seq {
 				return 0, fmt.Errorf("persisting %s event: %w", event.Type, err)

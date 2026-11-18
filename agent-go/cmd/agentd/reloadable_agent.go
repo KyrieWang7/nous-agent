@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -19,27 +20,32 @@ import (
 type agentBuilder func(config.Config) (builtAgent, error)
 
 type agentGeneration struct {
-	built   builtAgent
-	refs    int
-	retired bool
+	built      builtAgent
+	refs       int
+	retired    bool
+	plugins    config.PluginsConfig
+	closeError error
 }
 
 // reloadableAgent swaps complete production assemblies between runs. Keeping
 // each generation intact prevents a model router from observing a tool catalog
 // or prompt assembled from a different configuration revision.
 type reloadableAgent struct {
-	mu             sync.Mutex
-	configPath     string
-	extensionsPath string
-	catalogPaths   []string
-	fingerprint    [sha256.Size]byte
-	immutable      immutableRuntimeConfig
-	current        *agentGeneration
-	build          agentBuilder
-	closed         bool
+	mu              sync.Mutex
+	pluginStatePath string
+	retired         map[*agentGeneration]struct{}
+	configPath      string
+	extensionsPath  string
+	catalogPaths    []string
+	fingerprint     [sha256.Size]byte
+	immutable       immutableRuntimeConfig
+	current         *agentGeneration
+	build           agentBuilder
+	closed          bool
 }
 
 type immutableRuntimeConfig struct {
+	http        config.HTTPConfig
 	address     string
 	databaseURL string
 	redisURL    string
@@ -54,19 +60,20 @@ func newReloadableAgent(configPath string, cfg config.Config, initial builtAgent
 	}
 	extensionsPath := strings.TrimSpace(os.Getenv("NOUS_EXTENSIONS_CONFIG_PATH"))
 	catalogPaths := runtimeCatalogPaths(cfg)
-	fingerprint, err := runtimeConfigFingerprint(configPath, extensionsPath, catalogPaths)
+	fingerprint, err := runtimeConfigFingerprint(configPath, extensionsPath, catalogPaths, config.PluginStatePath())
 	if err != nil {
 		return nil, err
 	}
 	return &reloadableAgent{
+		pluginStatePath: config.PluginStatePath(), retired: make(map[*agentGeneration]struct{}),
 		configPath:     configPath,
 		extensionsPath: extensionsPath,
 		catalogPaths:   catalogPaths,
 		fingerprint:    fingerprint,
 		immutable: immutableRuntimeConfig{
-			address: cfg.Server.Address, databaseURL: cfg.Runtime.DatabaseURL, redisURL: cfg.Runtime.RedisURL,
+			address: cfg.Server.Address, databaseURL: cfg.Runtime.DatabaseURL, redisURL: cfg.Runtime.RedisURL, http: cfg.HTTP,
 		},
-		current: &agentGeneration{built: initial},
+		current: &agentGeneration{built: initial, plugins: cfg.Plugins},
 		build:   build,
 	}, nil
 }
@@ -90,12 +97,13 @@ func (a *reloadableAgent) PrepareRun() (runmanager.PreparedRun, error) {
 	if err != nil {
 		return runmanager.PreparedRun{}, err
 	}
+	var releaseOnce sync.Once
 	return runmanager.PreparedRun{
 		Agent: generation.built.agent, AllowedTools: append([]string(nil), generation.built.tools...),
 		Pricer: generation.built.pricer, BudgetLimits: generation.built.budget,
 		AllowedCapabilities: append([]string(nil), generation.built.capabilities...),
 		MaxRecursionDepth:   generation.built.maxDepth,
-		Release:             func() { a.release(generation) },
+		Release:             func() { releaseOnce.Do(func() { a.release(generation) }) },
 	}, nil
 }
 
@@ -113,7 +121,7 @@ func (a *reloadableAgent) acquire() (*agentGeneration, error) {
 }
 
 func (a *reloadableAgent) refreshLocked() error {
-	fingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, a.catalogPaths)
+	fingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, a.catalogPaths, a.pluginStatePath)
 	if err != nil {
 		return err
 	}
@@ -129,17 +137,17 @@ func (a *reloadableAgent) refreshLocked() error {
 		return err
 	}
 	loadedCatalogPaths := runtimeCatalogPaths(cfg)
-	candidateFingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, loadedCatalogPaths)
+	candidateFingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, loadedCatalogPaths, a.pluginStatePath)
 	if err != nil {
 		return err
 	}
 	built, err := a.build(cfg)
 	if err != nil {
-		return fmt.Errorf("agentd: rebuilding runtime: %w", err)
+		return fmt.Errorf("agentd: rebuilding runtime: %w", errors.Join(err, built.dispose()))
 	}
 	// Recompute after the build so a concurrent atomic Gateway write cannot be
 	// recorded as loaded unless that exact revision was assembled.
-	loadedFingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, loadedCatalogPaths)
+	loadedFingerprint, err := runtimeConfigFingerprint(a.configPath, a.extensionsPath, loadedCatalogPaths, a.pluginStatePath)
 	if err != nil {
 		built.Close()
 		return err
@@ -148,18 +156,34 @@ func (a *reloadableAgent) refreshLocked() error {
 		built.Close()
 		return errors.New("agentd: configuration changed during reload; retry the run")
 	}
-	old := a.current
-	old.retired = true
-	a.current = &agentGeneration{built: built}
-	a.fingerprint = loadedFingerprint
-	a.catalogPaths = loadedCatalogPaths
-	if old.refs == 0 {
-		old.built.Close()
-	}
+	a.installLocked(built, cfg.Plugins, loadedFingerprint, loadedCatalogPaths)
 	return nil
 }
 
+func (a *reloadableAgent) installLocked(built builtAgent, plugins config.PluginsConfig, fp [sha256.Size]byte, paths []string) {
+	old := a.current
+	old.retired = true
+	a.retired[old] = struct{}{}
+	a.current = &agentGeneration{built: built, plugins: plugins}
+	a.fingerprint = fp
+	a.catalogPaths = paths
+	if old.refs == 0 {
+		a.disposeGenerationLocked(old)
+	}
+}
+func (a *reloadableAgent) disposeGenerationLocked(g *agentGeneration) {
+	g.closeError = g.built.dispose()
+	if g.closeError == nil {
+		delete(a.retired, g)
+	} else {
+		a.retired[g] = struct{}{}
+	}
+}
+
 func (a *reloadableAgent) validateImmutable(cfg config.Config) error {
+	if cfg.HTTP != a.immutable.http {
+		return errors.New("agentd: http.rate_limit changed; restart is required")
+	}
 	if cfg.Server.Address != a.immutable.address {
 		return errors.New("agentd: server.address changed; restart is required")
 	}
@@ -177,7 +201,7 @@ func (a *reloadableAgent) release(generation *agentGeneration) {
 	defer a.mu.Unlock()
 	generation.refs--
 	if generation.refs == 0 && generation.retired {
-		generation.built.Close()
+		a.disposeGenerationLocked(generation)
 	}
 }
 
@@ -190,7 +214,7 @@ func (a *reloadableAgent) Close() {
 	a.closed = true
 	a.current.retired = true
 	if a.current.refs == 0 {
-		a.current.built.Close()
+		a.disposeGenerationLocked(a.current)
 	}
 }
 
@@ -200,17 +224,34 @@ func runtimeCatalogPaths(cfg config.Config) []string {
 		paths = append(paths, cfg.Skills.Path)
 	}
 	paths = append(paths, cfg.Plugins.Directories...)
+	if cfg.Plugins.CatalogPath != "" {
+		paths = append(paths, cfg.Plugins.CatalogPath)
+	}
+	for i, path := range paths {
+		if path == "~" || strings.HasPrefix(path, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				paths[i] = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/"))
+			}
+		}
+	}
 	return paths
 }
 
-func runtimeConfigFingerprint(configPath, extensionsPath string, catalogPaths []string) ([sha256.Size]byte, error) {
+func runtimeConfigFingerprint(configPath, extensionsPath string, catalogPaths []string, extraPaths ...string) ([sha256.Size]byte, error) {
+	return runtimeFingerprint(configPath, extensionsPath, catalogPaths, extraPaths, nil)
+}
+func runtimeFingerprint(configPath, extensionsPath string, catalogPaths, extraPaths []string, overrides map[string][]byte) ([sha256.Size]byte, error) {
 	hash := sha256.New()
-	for _, path := range []string{configPath, extensionsPath} {
+	for _, path := range append([]string{configPath, extensionsPath}, extraPaths...) {
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
 		raw, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) && path == extensionsPath {
+		if replacement, ok := overrides[path]; ok {
+			raw = replacement
+			err = nil
+		}
+		if errors.Is(err, os.ErrNotExist) && (path == extensionsPath || slices.Contains(extraPaths, path)) {
 			_, _ = hash.Write([]byte(path + "\x00missing\x00"))
 			continue
 		}

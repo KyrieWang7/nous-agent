@@ -78,6 +78,7 @@ func New(opts Options) (*Manager, error) {
 }
 
 func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
+	ctx = metadata.WithWriter(ctx, run.RunID)
 	startedAt := time.Now()
 	state, err := runtime.NewRunStateMachine(run.RunID, run.ThreadID)
 	if err != nil {
@@ -156,6 +157,9 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 	var threadValues map[string]any
 	if runErr == nil {
 		history, err = m.store.LoadHistory(ctx, run.ThreadID)
+		if err == nil {
+			history = message.RecoverInterruptedTools(history)
+		}
 		if err != nil {
 			runErr = fmt.Errorf("loading history: %w", err)
 		}
@@ -226,9 +230,21 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 			Values: runValues, Journal: journal, StateMachine: state, Budget: budget,
 			MaxRecursionDepth: maxRecursionDepth, Approvals: m.approvals, Questions: m.questions, Publish: m.publishEvent, PersistValues: persistValues,
 		})
-		result, runErr = m.runAgent(ctx, agent, AgentRequest{
+		checkpointIndex := 0
+		checkpoint := func(checkCtx context.Context, messages []message.Message) error {
+			checkpointIndex++
+			bounded, stop := context.WithTimeout(context.WithoutCancel(checkCtx), 5*time.Second)
+			defer stop()
+			event := runtime.MustEvent(run.RunID, run.ThreadID, runtime.EventTranscriptReplace, runtime.TranscriptReplace{Messages: messages})
+			event.IdempotencyKey = fmt.Sprintf("run:%s:checkpoint:%d", run.RunID, checkpointIndex)
+			if _, err := m.publishEvent(bounded, event); err != nil {
+				return err
+			}
+			return m.store.SaveHistory(bounded, run.ThreadID, messages, true)
+		}
+		result, runErr = m.runAgent(ctx, agent, AgentRequest{Checkpoint: checkpoint, PullInputs: input.PullInputs,
 			RunID: run.RunID, ThreadID: run.ThreadID, AssistantID: run.AssistantID,
-			Prompt: input.Prompt, ContentBlocks: input.ContentBlocks, History: history,
+			Prompt: input.Prompt, ContentBlocks: input.ContentBlocks, History: history, Delegation: input.Delegation,
 			Config: input.Config, Context: mergeMaps(threadValues, input.Context),
 		})
 	}
@@ -247,7 +263,7 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 			result.Messages = []message.Message{{Role: message.RoleAssistant, Content: result.Output}}
 		}
 		toSave := result.Messages
-		if result.Compacted {
+		if result.Compacted || result.Checkpointed {
 			toSave = result.Transcript
 			if toSave == nil {
 				runErr = errors.New("compacted agent result is missing the complete transcript")
@@ -256,7 +272,7 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 		var transcriptSeq int64
 		if runErr == nil {
 			eventType, payload := runtime.EventTranscriptAppend, any(runtime.TranscriptAppend{Messages: toSave})
-			if result.Compacted {
+			if result.Compacted || result.Checkpointed {
 				eventType, payload = runtime.EventTranscriptReplace, runtime.TranscriptReplace{Messages: toSave}
 			}
 			event := runtime.MustEvent(run.RunID, run.ThreadID, eventType, payload)
@@ -267,10 +283,10 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 			}
 		}
 		if runErr == nil {
-			if err := m.store.SaveHistory(persistCtx, run.ThreadID, toSave, result.Compacted); err != nil {
+			if err := m.store.SaveHistory(persistCtx, run.ThreadID, toSave, result.Compacted || result.Checkpointed); err != nil {
 				runErr = fmt.Errorf("saving history projection: %w", err)
 			} else {
-				m.saveSnapshot(persistCtx, run, transcriptSeq, history, toSave, result.Compacted)
+				m.saveSnapshot(persistCtx, run, transcriptSeq, history, toSave, result.Compacted || result.Checkpointed)
 			}
 		}
 		if runErr == nil && len(result.Values) > 0 {
@@ -327,7 +343,7 @@ func (m *Manager) Execute(ctx context.Context, run Run, input Input) {
 
 	declaredRisk := result.RiskLevel
 	result.RiskLevel = normalizedRisk(declaredRisk, status)
-	persistedStatus := status
+	var persistedStatus string
 	terminal, terminalErr := m.store.ConfirmRunTerminal(persistCtx, run.RunID, metadata.TerminalState{Status: status, RiskLevel: result.RiskLevel})
 	if terminalErr != nil {
 		finalErr := fmt.Errorf("saving terminal run state: %w", terminalErr)
@@ -472,7 +488,7 @@ func (m *Manager) saveSnapshot(ctx context.Context, run Run, seq int64, previous
 func (m *Manager) persistPartialResult(ctx context.Context, run Run, previous []message.Message, result AgentResult) error {
 	toSave := result.Messages
 	replaced := false
-	if result.Compacted && result.Transcript != nil {
+	if (result.Compacted || result.Checkpointed) && result.Transcript != nil {
 		toSave = result.Transcript
 		replaced = true
 	}

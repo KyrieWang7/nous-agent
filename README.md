@@ -2,11 +2,12 @@
 
 Nous Agent 是一套有状态、可持久化、支持 Subagent 与 Swarm 协作的 Agent Harness 产品。当前主线以 DeepSeek Agent Harness 的 Runtime 思想为架构参考，以 Go 显式 Agent Loop 为内核：
 
+- `platform-go/`：共享 Gin、GORM/PostgreSQL、Viper、Zap、go-redis 基础设施。
 - `agent-go/`：独立的 Agent Harness Runtime，负责 Agent Loop、capability、工具、状态、事件与持久化。
 - `gateway-go/`：控制面与文件服务，负责模型目录、配置、Skills、上传、文档转换和 Swarm 查询。
 - `frontend/`：Next.js 客户端，通过稳定的 SSE 事件契约连接 Go 服务。
 
-`agent/` 与 `gateway/` 仅作为历史实现和离线迁移输入保留。Go Harness 不导入、不查询、不回退到这些实现，对外只提供版本化 Agent API。
+旧 Python `gateway/` 已删除，Gateway 统一使用 `gateway-go/`。`agent/` 作为历史实现和离线迁移参考保留；Go Harness 对外只提供版本化 Agent API。
 
 ## 默认架构
 
@@ -48,6 +49,12 @@ EventStore / Snapshot / Metadata persistence
 
 Agent Loop 的核心语义不通过 middleware 扩展机制隐式改变；业务能力通过 capability 和 plugin 装配，运行时状态通过事件和投影恢复。
 
+两个 Go 服务的应用代码按 `internal/{router,middleware,handler,service,repository,model,server}`
+分层。Agent 内核仍位于 `pkg/loop`：每次 run 创建独立 driver，由 pre-step、step、request
+与工具调度边界推进，参考 DSH 的 Agent 实现组织。HTTP middleware 只处理网络请求。
+统一技术栈说明见 [Go 平台封装](docs/delivery/2026-11-17-go-platform-stack.md)。
+详见 [分层与 Agent driver 调整](docs/delivery/2026-11-17-go-layers-and-dsh-agent-driver.md)。
+
 ## 核心能力
 
 - 自有模型循环与 capability runtime，不依赖历史 Python 运行时。
@@ -67,7 +74,7 @@ Agent Loop 的核心语义不通过 middleware 扩展机制隐式改变；业务
 
 工具参数增量只用于展示准备过程，最终模型消息才提供完整调用；运行事件检查器位于已有会话的标题栏。最新 DeepSeek Harness 适配和限制见 [2026-10-08 同步记录](docs/upstream-sync-2026-10-08.md)。
 
-Harness 会在每个新 run 前检测模型、MCP、Skill、插件与 YAML 配置变化，并以完整 generation 热切换；进行中的 run 持有旧 generation lease，结束后才回收对应模型、MCP、Plugin 与外部客户端资源。监听地址、PostgreSQL URL 和 Redis URL 属于进程级配置，修改后需要重启。
+Harness 会在每个新 run 前检测模型、MCP、Skill、插件与 YAML 配置变化，并以完整 generation 热切换；进行中的 run 持有旧 generation lease，结束后才回收对应模型、MCP、Plugin 与外部客户端资源。监听地址、PostgreSQL URL、Redis URL 和 HTTP 限流属于进程级配置，修改后需要重启。
 
 ## 快速开始
 
@@ -161,10 +168,10 @@ pnpm typecheck
 nous-agent/
 ├── agent-go/       # 主 Agent Harness
 ├── gateway-go/     # 主 Gateway
+├── platform-go/    # 共享 Go 基础设施
 ├── frontend/       # Next.js UI
 ├── skills/         # Harness 与 Gateway 共享的 capability 资源
 ├── agent/          # 历史实现，仅作离线迁移参考
-├── gateway/        # 历史实现，仅作离线迁移参考
 ├── docker-compose.yml
 └── Makefile
 ```

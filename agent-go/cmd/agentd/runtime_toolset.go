@@ -61,6 +61,11 @@ func (r runtimeToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]str
 				continue
 			}
 		}
+		if name == "task" {
+			if run, ok := runtime.RunContextFrom(ctx); ok && run.MaxRecursionDepth > 0 && run.AgentDepth >= run.MaxRecursionDepth {
+				continue
+			}
+		}
 		switch name {
 		case "task", "swarm_batch":
 			if swarmEnabled && isLeadRun(st) && !hasSwarmTeam {
@@ -94,8 +99,8 @@ func planningToolAllowed(definition tool.Definition) bool {
 }
 
 // restrictedToolSet applies one subagent profile after runtime feature and
-// permission filtering. Children cannot recursively dispatch tasks or mutate
-// team lifecycle, but Swarm teammates may still communicate.
+// permission filtering. Children may delegate within their inherited profile,
+// depth and budget ceilings; team lifecycle remains owned by the lead.
 type restrictedToolSet struct {
 	base    runtimeToolSet
 	allowed map[string]struct{}
@@ -125,7 +130,7 @@ func (r restrictedToolSet) Resolve(ctx context.Context, st *lifecycle.State) ([]
 			continue
 		}
 		switch name {
-		case "task", "swarm_batch", "ask_clarification", "present_files", "team_create", "team_delete":
+		case "swarm_batch", "ask_clarification", "present_files", "team_create", "team_delete":
 			continue
 		}
 		out = append(out, name)

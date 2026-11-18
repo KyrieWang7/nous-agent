@@ -120,7 +120,6 @@ func New(opts Options) (*Harness, error) {
 		generationID = fmt.Sprintf("harness-%d", time.Now().UTC().UnixNano())
 	}
 	plugins := append([]runtimeplugin.Plugin(nil), opts.Plugins...)
-	plugins = append(plugins, newToolCatalogPlugin(registry, opts.Plugins))
 	runtimeAssembly, err := assembly.New(context.Background(), assembly.Options{
 		GenerationID: generationID,
 		Capabilities: capabilities,
@@ -133,12 +132,10 @@ func New(opts Options) (*Harness, error) {
 
 	handlers, err := lifecycle.Compose(opts.LifecycleHandlers, opts.Extensions)
 	if err != nil {
-		_ = runtimeAssembly.Close(context.Background())
-		return nil, fmt.Errorf("harness: composing lifecycle handlers: %w", err)
+		return nil, errors.Join(fmt.Errorf("harness: composing lifecycle handlers: %w", err), runtimeAssembly.Close(context.Background()))
 	}
 	if err := lifecycle.VerifyPresent(handlers, opts.DeclaredHandlers); err != nil {
-		_ = runtimeAssembly.Close(context.Background())
-		return nil, fmt.Errorf("harness: %w", err)
+		return nil, errors.Join(fmt.Errorf("harness: %w", err), runtimeAssembly.Close(context.Background()))
 	}
 
 	dispatcher, err := lifecycle.NewDispatcher(handlers, lifecycle.DispatcherOptions{
@@ -178,53 +175,11 @@ func New(opts Options) (*Harness, error) {
 		StopGate:  opts.StopGate,
 	})
 	if err != nil {
-		_ = runtimeAssembly.Close(context.Background())
-		return nil, fmt.Errorf("harness: %w", err)
+		return nil, errors.Join(fmt.Errorf("harness: %w", err), runtimeAssembly.Close(context.Background()))
 	}
 
 	return &Harness{runner: runner, lifecycle: dispatcher, runtime: runtimeAssembly}, nil
 }
-
-type toolCatalogPlugin struct {
-	registry     *tool.Registry
-	dependencies []string
-}
-
-func newToolCatalogPlugin(registry *tool.Registry, plugins []runtimeplugin.Plugin) *toolCatalogPlugin {
-	dependencies := make([]string, 0, len(plugins))
-	for _, plugin := range plugins {
-		if plugin != nil {
-			dependencies = append(dependencies, plugin.Name())
-		}
-	}
-	return &toolCatalogPlugin{registry: registry, dependencies: dependencies}
-}
-
-func (*toolCatalogPlugin) Name() string { return "harness.tool-catalog" }
-func (p *toolCatalogPlugin) Dependencies() []string {
-	return append([]string(nil), p.dependencies...)
-}
-func (p *toolCatalogPlugin) Start(_ context.Context, host runtimeplugin.Host) error {
-	for _, name := range p.registry.Names() {
-		capabilityName := "tool." + name
-		if host.Capabilities.Has(capabilityName) {
-			continue
-		}
-		definition, err := p.registry.Get(name)
-		if err != nil {
-			return err
-		}
-		toolDefinition := definition
-		if err := host.Capabilities.Register(capability.Entry{
-			Definition: capability.Definition{Name: capabilityName, Kind: capability.KindTool, Description: toolDefinition.Description, Scope: capability.ScopeRun},
-			Resolver:   func(context.Context, capability.ResolveRequest) (any, error) { return toolDefinition, nil },
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-func (*toolCatalogPlugin) Stop(context.Context) error { return nil }
 
 // Runner 返回内核。
 func (h *Harness) Runner() *loop.Runner { return h.runner }
@@ -253,8 +208,8 @@ func (h *Harness) ResolveCapability(ctx context.Context, kind capability.Kind, n
 	return h.runtime.Generation.Capabilities().Resolve(ctx, name, kind, req)
 }
 
-// Close releases runtime plugin resources. Existing runner behavior is
-// unchanged; callers that do not use plugins can continue to omit Close.
+// Close releases owned plugin effects after the caller has drained active runs.
+// Close must be paired with New when plugins own external resources.
 func (h *Harness) Close() error {
 	if h == nil || h.runtime == nil {
 		return nil

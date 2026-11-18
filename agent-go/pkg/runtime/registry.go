@@ -63,7 +63,8 @@ type RunRecord struct {
 
 // RegistryBackend 是 run 注册表的存储与广播后端。
 //
-// 生产实现以 Redis 为权威（Hash 存元数据 + Pub/Sub 广播取消）。
+// agentd uses PostgreSQL as authority and durable cross-instance cancel intent.
+// Redis remains an optional adapter for embedders.
 // nous-agent 的 src/core/task_registry.py 是进程内 dict，多实例下取消会失效、
 // 状态会不一致，本设计不采纳（设计文档 §12.3）。
 type RegistryBackend interface {
@@ -312,7 +313,7 @@ func (r *Registry) Close() {
 
 // MemoryRegistryBackend 是进程内后端。
 //
-// 只适用于单实例部署与测试。多实例部署必须换 Redis 后端，
+// 只适用于单实例部署与测试。多实例部署必须使用持久化共享后端，
 // 否则发给实例 A 的取消命令永远到不了持有该 run 的实例 B。
 type MemoryRegistryBackend struct {
 	mu      sync.Mutex

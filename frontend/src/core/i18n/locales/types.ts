@@ -1,6 +1,153 @@
 import type { LucideIcon } from "lucide-react";
 
 export interface Translations {
+  workbenchPanel: {
+    title: string;
+    searchFiles: string;
+    emptyDirectory: string;
+    noMatches: string;
+    searchLimit: string;
+    backToFiles: string;
+    ready: string;
+    waiting: string;
+    files: string;
+    filesHint: string;
+    noFile: string;
+    selectFile: string;
+    fileError: string;
+    swarm: string;
+    swarmHint: string;
+    connecting: string;
+    disconnected: string;
+    closed: string;
+    all: string;
+    noMessages: string;
+    resize: string;
+  };
+
+  pluginSettings: {
+    installed: string;
+    discover: string;
+    install: string;
+    switchVersion: string;
+    uninstall: string;
+    confirmRemove: string;
+    noCatalog: string;
+    title: string;
+    description: string;
+    host: string;
+    hostHint: string;
+    empty: string;
+    reload: string;
+    applying: string;
+    loaded: string;
+    disabled: string;
+    draining: string;
+    waiting: string;
+    closeFailed: string;
+    toggle: string;
+    retained: string;
+    loadFailed: string;
+  };
+
+  questionReply: {
+    options: string;
+    answer: string;
+    skip: string;
+    submit: string;
+  };
+  sessionInbox: {
+    fork: string;
+    edit: string;
+    save: string;
+    steer: string;
+    changed: string;
+    title: string;
+    nextTurn: string;
+    nextStep: string;
+    hint: string;
+    unconfirmed: string;
+    recover: string;
+    withdraw: string;
+    attachment: string;
+    loadError: string;
+    statuses: {
+      pending: string;
+      claimed: string;
+      admitted: string;
+      cancelled: string;
+      rejected: string;
+    };
+  };
+
+  subagentWorkspace: {
+    noTerminal: string;
+    waitEnded: string;
+    mainSend: string;
+    mainStop: string;
+    mainBusy: string;
+    planMode: string;
+
+    title: string;
+    plan: string;
+    main: string;
+    empty: string;
+    emptyHint: string;
+    select: string;
+    selectHint: string;
+    refresh: string;
+    close: string;
+    open: string;
+    cancel: string;
+    canceling: string;
+    wait: string;
+    waiting: string;
+    waitTimeout: string;
+    send: string;
+    continue: string;
+    sending: string;
+    activeHint: string;
+    idleHint: string;
+    busyHint: string;
+    nestedHint: string;
+    placeholder: string;
+    inbox: string;
+    pending: string;
+    consumed: string;
+    provider: string;
+    fork: string;
+    spawn: string;
+    stopReason: string;
+    partial: string;
+    coordination: string;
+    history: string;
+    user: string;
+    assistant: string;
+    tool: string;
+    request: string;
+    noHistory: string;
+    loadError: string;
+    retry: string;
+    conflict: string;
+    notFound: string;
+    noPlan: string;
+    noPlanHint: string;
+    reviewPlan: string;
+    tasks: string;
+    planHistory: string;
+    stoppingMain: string;
+    resize: string;
+    tokens: string;
+    statuses: {
+      pending: string;
+      running: string;
+      completed: string;
+      failed: string;
+      cancelled: string;
+      timed_out: string;
+      interrupted: string;
+    };
+  };
   // Locale meta
   locale: {
     localName: string;
@@ -76,13 +223,13 @@ export interface Translations {
     }[];
     suggestionsCreate: (
       | {
-        suggestion: string;
-        prompt: string;
-        icon: LucideIcon;
-      }
+          suggestion: string;
+          prompt: string;
+          icon: LucideIcon;
+        }
       | {
-        type: "separator";
-      }
+          type: "separator";
+        }
     )[];
   };
 

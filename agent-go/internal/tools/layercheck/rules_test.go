@@ -53,14 +53,14 @@ func TestCheck_AllowsLegalDependencies(t *testing.T) {
 	t.Parallel()
 
 	deps := map[string][]string{
-		"pkg/message":                nil,
-		"pkg/model":                  {"pkg/message"},
-		"pkg/tool":                   {"pkg/message", "pkg/model"},
-		"pkg/runtime/lifecycle":      {"pkg/message", "pkg/model", "pkg/tool"},
-		"pkg/loop":                   {"pkg/message", "pkg/model", "pkg/tool", "pkg/runtime/lifecycle"},
-		"pkg/harness":                {"pkg/loop", "pkg/runtime/lifecycle", "pkg/tool", "pkg/model", "pkg/message"},
-		"pkg/model/provider/faux":    {"pkg/message", "pkg/model"},
-		"internal/transport/httpapi": {"pkg/runtime/runmanager", "pkg/message"},
+		"pkg/message":             nil,
+		"pkg/model":               {"pkg/message"},
+		"pkg/tool":                {"pkg/message", "pkg/model"},
+		"pkg/runtime/lifecycle":   {"pkg/message", "pkg/model", "pkg/tool"},
+		"pkg/loop":                {"pkg/message", "pkg/model", "pkg/tool", "pkg/runtime/lifecycle"},
+		"pkg/harness":             {"pkg/loop", "pkg/runtime/lifecycle", "pkg/tool", "pkg/model", "pkg/message"},
+		"pkg/model/provider/faux": {"pkg/message", "pkg/model"},
+		"internal/handler":        {"pkg/runtime/runmanager", "pkg/message"},
 	}
 
 	if got := check(deps); len(got) != 0 {
@@ -76,7 +76,9 @@ func TestCheck_KernelMustNotDependOnConfigOrWireFormat(t *testing.T) {
 		dep  string
 	}{
 		{name: "config", dep: "pkg/config"},
-		{name: "wire format", dep: "internal/transport/httpapi"},
+		{name: "Gin", dep: "external/github.com/gin-gonic/gin"},
+		{name: "shared infrastructure", dep: "external/github.com/KyrieWang7/nous-agent/platform-go/postgres"},
+		{name: "wire format", dep: "internal/handler"},
 		{name: "harness", dep: "pkg/harness"},
 		{name: "postgres adapter", dep: "pkg/runtime/postgres"},
 		{name: "redis adapter", dep: "pkg/runtime/redis"},
@@ -106,14 +108,14 @@ func TestCheckTransportAndRuntimeBoundaries(t *testing.T) {
 		from string
 		dep  string
 	}{
-		{from: "internal/transport/httpapi", dep: "pkg/loop"},
-		{from: "internal/transport/httpapi", dep: "pkg/model/provider/openai"},
-		{from: "pkg/runtime/runmanager", dep: "internal/transport/httpapi"},
+		{from: "internal/handler", dep: "pkg/loop"},
+		{from: "internal/handler", dep: "pkg/model/provider/openai"},
+		{from: "pkg/runtime/runmanager", dep: "internal/handler"},
 		{from: "pkg/runtime/runmanager", dep: "pkg/runtime/postgres"},
 		{from: "pkg/runtime/capability", dep: "pkg/loop"},
 	}
 	for _, tc := range tests {
-		if got := check(map[string][]string{tc.from: {tc.dep}}); len(got) == 0 {
+		if graph := map[string][]string{tc.from: {tc.dep}}; len(append(check(graph), checkRules(graph, applicationRules)...)) == 0 {
 			t.Errorf("check() allowed %s -> %s", tc.from, tc.dep)
 		}
 	}
@@ -122,7 +124,7 @@ func TestCheckTransportAndRuntimeBoundaries(t *testing.T) {
 func TestCheck_LibraryMustNotDependOnInternal(t *testing.T) {
 	t.Parallel()
 
-	got := check(map[string][]string{"pkg/storage": {"internal/transport/httpapi"}})
+	got := check(map[string][]string{"pkg/storage": {"internal/handler"}})
 	if len(got) == 0 {
 		t.Fatal("check() allowed pkg/* → internal/*")
 	}
@@ -199,5 +201,29 @@ func TestRelative(t *testing.T) {
 		if got := relative(tc.in); got != tc.want {
 			t.Errorf("relative(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestApplicationTiersRejectReverseAndBypassImports(t *testing.T) {
+	for _, tc := range []struct{ from, dep string }{
+		{"internal/handler", "internal/repository"},
+		{"internal/service", "external/net/http"},
+		{"internal/service", "pkg/loop"},
+		{"internal/repository/catalog", "internal/service"},
+		{"internal/router", "internal/handler"},
+		{"internal/middleware", "pkg/runtime"},
+		{"internal/model", "internal/repository"},
+	} {
+		if len(checkRules(map[string][]string{tc.from: {tc.dep}}, applicationRules)) == 0 {
+			t.Errorf("allowed %s -> %s", tc.from, tc.dep)
+		}
+	}
+	if got := checkRules(map[string][]string{
+		"internal/server":     {"internal/handler", "internal/service", "internal/router", "internal/middleware"},
+		"internal/handler":    {"internal/service", "internal/model", "internal/router"},
+		"internal/service":    {"internal/repository", "pkg/runtime/runmanager"},
+		"internal/repository": {"internal/model"},
+	}, applicationRules); len(got) != 0 {
+		t.Fatalf("legal application dependencies rejected: %v", got)
 	}
 }

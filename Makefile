@@ -12,6 +12,7 @@ HARNESS_BASE_URL ?= http://127.0.0.1:7776
 # -----------------------------------------------------------------------------
 
 install: ## Install Go and frontend dependencies
+	cd platform-go && go mod download
 	cd agent-go && go mod download
 	cd gateway-go && go mod download
 	cd frontend && pnpm install
@@ -75,6 +76,7 @@ migrate-down: ## Roll back one Go runtime migration
 # -----------------------------------------------------------------------------
 
 build: ## Build both Go services and the frontend
+	cd platform-go && go build ./...
 	cd agent-go && go build ./...
 	cd gateway-go && go build ./...
 	cd frontend && pnpm build
@@ -84,3 +86,6 @@ clean: ## Remove generated development files
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-24s\033[0m %s\n", $$1, $$2}'
+
+platform-check: ## Verify the shared Go infrastructure module
+	cd platform-go && go test -race ./... && go vet ./...

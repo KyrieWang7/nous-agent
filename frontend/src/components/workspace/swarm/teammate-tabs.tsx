@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { useI18n } from "@/core/i18n/hooks";
 import type {
   SwarmTeamMember,
   TeammateDisplayStatus,
@@ -42,6 +43,7 @@ export function TeammateTabs({
   onTabChange,
   className,
 }: TeammateTabsProps) {
+  const { t } = useI18n();
   const seenRef = useRef<Set<string>>(new Set());
   const [newNames, setNewNames] = useState<Set<string>>(new Set());
 
@@ -71,7 +73,7 @@ export function TeammateTabs({
   return (
     <div
       className={cn(
-        "flex shrink-0 gap-1 overflow-x-auto border-b border-border px-1 py-0.5",
+        "border-border flex shrink-0 gap-1 overflow-x-auto border-b px-1 py-0.5",
         className,
       )}
       role="tablist"
@@ -83,14 +85,14 @@ export function TeammateTabs({
         className={cn(
           "flex shrink-0 items-center gap-1.5 rounded-t-md px-2.5 py-2 text-sm transition-colors",
           activeTab === ALL_TAB
-            ? "border-b-2 border-primary font-medium text-foreground"
-            : "border-b-2 border-transparent text-muted-foreground hover:text-foreground",
+            ? "border-primary text-foreground border-b-2 font-medium"
+            : "text-muted-foreground hover:text-foreground border-b-2 border-transparent",
         )}
         onClick={() => {
           onTabChange(ALL_TAB);
         }}
       >
-        All
+        {t.workbenchPanel.all}
       </button>
       {visibleMembers.map((m) => (
         <button
@@ -102,15 +104,22 @@ export function TeammateTabs({
             "flex shrink-0 items-center gap-1.5 rounded-t-md px-2.5 py-2 text-sm transition-colors",
             newNames.has(m.name) && "animate-swarm-tab-in",
             activeTab === m.name
-              ? "border-b-2 border-primary font-medium text-foreground"
-              : "border-b-2 border-transparent text-muted-foreground hover:text-foreground",
+              ? "border-primary text-foreground border-b-2 font-medium"
+              : "text-muted-foreground hover:text-foreground border-b-2 border-transparent",
           )}
           onClick={() => {
             onTabChange(m.name);
           }}
         >
           <StatusIndicator status={displayStatusFor(m, statuses)} />
-          <span className={cn("max-w-[120px] truncate", m.status === "removed" && "opacity-60")}>{m.name}</span>
+          <span
+            className={cn(
+              "max-w-[120px] truncate",
+              m.status === "removed" && "opacity-60",
+            )}
+          >
+            {m.name}
+          </span>
         </button>
       ))}
     </div>

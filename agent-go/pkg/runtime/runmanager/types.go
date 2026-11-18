@@ -9,6 +9,8 @@ import (
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/delegation"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/inbox"
 )
 
 type Agent interface {
@@ -42,6 +44,9 @@ type PreparedRun struct {
 }
 
 type AgentRequest struct {
+	PullInputs    inbox.Source
+	Checkpoint    func(context.Context, []message.Message) error
+	Delegation    *delegation.Request
 	RunID         string
 	ThreadID      string
 	AssistantID   string
@@ -53,15 +58,16 @@ type AgentRequest struct {
 }
 
 type AgentResult struct {
-	Messages   []message.Message
-	Transcript []message.Message
-	Output     string
-	Iterations int
-	Usage      Usage
-	Compacted  bool
-	Streamed   bool
-	Values     map[string]any
-	RiskLevel  string
+	Checkpointed bool
+	Messages     []message.Message
+	Transcript   []message.Message
+	Output       string
+	Iterations   int
+	Usage        Usage
+	Compacted    bool
+	Streamed     bool
+	Values       map[string]any
+	RiskLevel    string
 }
 
 type Usage struct {
@@ -78,6 +84,8 @@ type Run struct {
 }
 
 type Input struct {
+	PullInputs       inbox.Source
+	Delegation       *delegation.Request
 	Prompt           string
 	ContentBlocks    []message.ContentBlock
 	Config           map[string]any

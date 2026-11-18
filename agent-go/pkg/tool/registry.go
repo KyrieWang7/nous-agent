@@ -9,37 +9,56 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 )
 
-// Registry 是工具的编译期注册表。
+// Registry 是工具定义的运行时注册表，支持作用域拥有的可撤销贡献。
 //
 // 与 model.Registry 同一套纪律：配置按名字引用，未知名字立刻失败并列出可用名字，
 // 绝不静默跳过（设计文档 §16）。
 type Registry struct {
-	mu    sync.RWMutex
-	defs  map[string]Definition
-	order []string
+	mu     sync.RWMutex
+	defs   map[string]Definition
+	order  []string
+	owners map[string]*uint64
 }
 
 // NewRegistry 返回空注册表。
 func NewRegistry() *Registry {
-	return &Registry{defs: make(map[string]Definition)}
+	return &Registry{defs: make(map[string]Definition), owners: make(map[string]*uint64)}
 }
 
 // Register 注册一个工具。校验失败或重名都返回 error。
 func (r *Registry) Register(d Definition) error {
+	_, err := r.RegisterOwned(d)
+	return err
+}
+
+// RegisterOwned returns an identity-bound disposer. A stale disposer cannot
+// remove a later registration with the same name.
+func (r *Registry) RegisterOwned(d Definition) (func(), error) {
 	if err := validate(d); err != nil {
-		return err
+		return nil, err
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.defs[d.Name]; exists {
-		return fmt.Errorf("tool: %q already registered", d.Name)
+		return nil, fmt.Errorf("tool: %q already registered", d.Name)
 	}
+	token := new(uint64)
+	r.owners[d.Name] = token
 	r.defs[d.Name] = d
 	r.order = append(r.order, d.Name)
 	slices.Sort(r.order)
-	return nil
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.owners[d.Name] != token {
+			return
+		}
+		delete(r.defs, d.Name)
+		delete(r.owners, d.Name)
+		r.order = slices.DeleteFunc(r.order, func(name string) bool { return name == d.Name })
+	}, nil
 }
 
 // RegisterAll 注册一批工具，遇到第一个错误即停。

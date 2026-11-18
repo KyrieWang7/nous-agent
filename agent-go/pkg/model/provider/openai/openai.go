@@ -104,6 +104,10 @@ func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Respon
 		return nil, err
 	}
 
+	return c.completeBody(ctx, body)
+}
+
+func (c *Client) completeBody(ctx context.Context, body []byte) (*model.Response, error) {
 	resp, err := c.post(ctx, body, false)
 	if err != nil {
 		return nil, err
@@ -132,6 +136,10 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 		return nil, err
 	}
 
+	return c.streamBody(ctx, body)
+}
+
+func (c *Client) streamBody(ctx context.Context, body []byte) (model.StreamReader, error) {
 	resp, err := c.post(ctx, body, true)
 	if err != nil {
 		return nil, err
@@ -488,4 +496,26 @@ func (c *Client) RequestInfo(req model.Request) model.Info {
 		}
 	}
 	return info
+}
+
+// PrepareCall validates and freezes both wire forms without sending the model request.
+func (c *Client) PrepareCall(ctx context.Context, req model.Request) (model.PreparedCall, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", nil); err != nil {
+		return nil, err
+	}
+	complete, err := c.buildBody(req, false)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := c.buildBody(req, true)
+	if err != nil {
+		return nil, err
+	}
+	return model.BoundCall{ModelInfo: c.RequestInfo(req),
+		CompleteFunc: func(ctx context.Context) (*model.Response, error) { return c.completeBody(ctx, complete) },
+		StreamFunc:   func(ctx context.Context) (model.StreamReader, error) { return c.streamBody(ctx, stream) },
+	}, nil
 }

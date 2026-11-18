@@ -121,7 +121,7 @@ func subagentSection(subagents []Subagent, maxConcurrent int) string {
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
 
 	var out strings.Builder
-	fmt.Fprintf(&out, "Use task for independent, non-trivial work that benefits from parallel execution. Launch at most %d task calls in one model response, wait for their terminal results, then synthesize them. Do simple or sequential work directly.\n\n<available_subagents>\n", maxConcurrent)
+	fmt.Fprintf(&out, "Use task for independent, non-trivial work that benefits from parallel execution. Launch at most %d task calls in one model response, wait for their terminal results, then synthesize them. Use provider=spawn for isolated work, or provider=fork when the task needs completed conversation history; fork excludes this in-flight turn. A non-completed stop reason means the output may be partial. Each task returns a persistent session_id; pass it to task to continue that child. For supervised background work use background=true and subagent_control to list, inspect, send messages, wait, or interrupt direct children. Wait before ending this turn; unfinished background children are canceled when the parent closes. Messages remain pending until the child admits its next model step. Do simple or sequential work directly.\n\n<available_subagents>\n", maxConcurrent)
 	for _, item := range ordered {
 		fmt.Fprintf(&out, "  <subagent name=\"%s\">%s</subagent>\n",
 			html.EscapeString(strings.TrimSpace(item.Name)),

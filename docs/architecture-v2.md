@@ -5,18 +5,18 @@
 > deterministic interruption recovery 已接入真实执行路径。重启不做同一 run
 > 的盲目 continuation；旧 run 确认为 `interrupted`，调用方以新 run 重试。
 >
-> 目标：以 DeepSeek Agent Harness 的 Runtime 思想为架构参考，以 Go 版本的显式 Agent Loop 为执行内核，构建独立、可恢复、可扩展的 Nous Agent Harness。
+> 目标：Agent 编排以 DeepSeek Agent Harness 的执行契约为基准，外层按 Go 服务分层实现；技术栈仅使用已确认的五项。
 
 ## 1. 决策摘要
 
-Nous Agent 不直接 fork 或依赖 DeepSeek Harness，也不再把 middleware chain 作为顶层架构。目标是吸收其四个核心思想：
+Nous Agent 用 Go 实现 DSH 的编排设计，核心约束是：
 
 1. Runtime 由可装配的插件和服务构成。
 2. Agent、模型、工具、沙箱、记忆和技能都是可发现、可替换的 capability。
 3. Session/run 的事实来源是可追加、可重放的事件；History 是模型上下文投影。
 4. Agent Loop 保持显式、稳定、可测试，不把核心语义隐藏在扩展机制中。
 
-实现语言继续使用 Go。Cordis 的动态插件模型不做一比一移植，改成 Go 的显式接口、依赖声明和生命周期管理。
+实现语言使用 Go；插件统一采用 `Name / Inject / Apply`、服务依赖和作用域资源所有权。HTTP、配置、日志与数据库属于外层工程能力，不能改变内核的执行顺序。后端提供持久子会话、续接、下一步消息信箱、等待与取消接口；所有续接复用 RunManager 和同一 Agent Loop。主会话由 PostgreSQL 会话锁串行化，并发写入返回 409。插件通过完整 generation 切换与作用域释放完成重载。
 
 ## 2. 目标架构
 
@@ -52,7 +52,8 @@ Kernel 不依赖 HTTP、PostgreSQL、Docker、YAML 或具体模型供应商。�
 ### 2.1 术语约束
 
 顶层架构只使用 Runtime、Kernel、Capability、Plugin、Event、Projection、Policy、
-Hooks 和 Transport。`middleware` 已从目录和公共 API 中删除，也不提供旧包 alias。
+Hooks 和 Transport。Agent 内核的 `pkg/middleware` 已删除，也不提供旧包 alias。
+产品层允许 `internal/middleware`，仅承载 CORS、请求日志等 HTTP 事务，不能参与 Agent step 编排。
 Kernel 只暴露固定的 lifecycle stage；`pkg/runtime/lifecycle` 负责执行顺序和 run state，
 `pkg/runtime/lifecycle/handlers` 保存进程装配使用的内置处理器。它不是业务扩展入口。
 新业务能力进入 capability，进程级装配进入 plugin，授权进入 policy，外部治理脚本进入
@@ -82,7 +83,14 @@ HTTP/SSE 是产品传输适配器，不是 Runtime：
 agent-go/
   cmd/agentd/                    process assembly
   cmd/agentctl/                  CLI run stream / admin commands
-  internal/transport/httpapi/    HTTP / SSE / wire projection
+  internal/router/               endpoint registration
+  internal/middleware/           HTTP CORS / request logging only
+  internal/handler/              HTTP / SSE / wire projection
+  internal/handler/sandboxapi/   separate Remote Sandbox API adapter
+  internal/service/              thread / run / question use cases
+  internal/repository/           memory / PostgreSQL / Runtime metadata adapters
+  internal/model/                application data contracts
+  internal/server/               HTTP composition / defaults / lifecycle
   internal/tools/layercheck/     dependency policy
   pkg/runtime/                   run / event / capability contracts
   pkg/runtime/metadata/          Runtime metadata persistence port
@@ -92,6 +100,43 @@ agent-go/
   pkg/runtime/redis/             Redis runtime adapters
   pkg/loop/                      explicit Agent Kernel
 ```
+
+两个 Go 服务共用 `platform-go` 模块：Gin 负责网络边界，GORM/PostgreSQL 负责连接与
+业务/Runtime Store 查询，Viper 负责配置来源与环境覆盖，Zap 承接 `slog` 日志契约，
+go-redis 提供连接及默认关闭的跨实例 HTTP 限流。原生转录序号和 Swarm 专用事务适配器
+复用同一个 PostgreSQL pool。框架不得经依赖链进入 Kernel，详见
+[统一技术栈封装](delivery/2026-11-17-go-platform-stack.md)。
+
+两个 Go 服务都采用上述产品分层。Gateway 的 catalog、文件系统和格式转换实现位于
+`internal/repository/{catalog,files,convert}`；其业务规则和 Swarm 状态轮询位于
+`internal/service`。Handler 只解码、调用 Service、映射状态码及投影 HTTP/SSE。
+`internal/model` 是应用数据契约，`pkg/model` 仍专门表示 LLM 模型接口。
+
+Agent 内部以 DSH 的 Agent driver / pre-step / step / request / tool scheduling
+职责划分组织 Go 实现：
+
+```text
+harness.Agent -> loop.Runner.Run -> per-run agentDriver.run
+                                      |
+                                      +-- preStep: context / tools / policy
+                                      +-- step
+                                           +-- prepareRequest: attempt input commit
+                                           +-- sample / output commit / transcript
+                                           +-- tool calls / ordered settlement
+                                      +-- next step or turn cleanup
+```
+
+`pkg/loop/agent.go` 持有单个 run 的 driver 状态；`step.go` 持有 step 准入、执行和工具
+结算；`request.go` 持有请求组装与模型输入/输出提交；`tool_calls.go` 适配工具调度；
+`runtime_context.go` 持有运行身份、预算及用量。共享 Runner 不持有执行中的 step 状态。
+每个 turn/step 的开始和结束均有 audit 事件。模型适配器先准备并冻结请求，再提交
+model input；首次成功提交时才将私有提案输入接纳进正式 History。每个已接纳 assistant step 在退出时结算工具结果，发生错误、取消或治理跳过也必须先
+补齐已接纳的工具调用，再进入下一步或执行 AfterAgent 收尾。执行器必须先排空已启动任务。
+
+这属于独立 Go 实现的职责与控制流对齐。Nous 仍以一个 run 表示一次执行，未宣称具备
+DSH 持续 Agent 的完整 Inbox、`followup/steer/inject`、maintenance 或 session 文件协议。
+更详细的对应关系和验证见 [分层调整](delivery/2026-11-17-go-layers-and-dsh-agent-driver.md) 与
+[DSH 编排及插件契约](delivery/2026-11-17-dsh-orchestration-and-plugins.md)。
 
 共享 Skill capability 资源位于仓库顶层 `skills/`，不归属于某个 Harness
 实现。Go Harness 与 Gateway 只通过配置路径读取该目录，不能从历史 Python
@@ -245,6 +290,14 @@ Subagent Session，复用父 run 的预算、权限、事件和持久化边界�
 终态后顺序执行，lead 再完成最终综合。Team、Member、Inbox 与广播回执保持 durable，
 批量调度只负责 fan-out/fan-in，不拥有模型循环。
 
+Subagent 的进程内执行支持 `spawn`（默认空历史）和 `fork`（只含当前 run 之前的完成历史）。
+委派在排队前复制策略与上下文；parent scope / generation 关闭时取消并排空已接纳子任务。
+子任务区分 execution stop_reason 和资源 CoordinationError，截断或拒绝不能报为任务成功。
+子会话的持久化、HTTP 契约、消息消费、取消排空与真实模型重启验收见
+[后端闭环记录](delivery/2026-11-17-backend-session-closure.md)。
+工具执行采用动态滚动池，策略和结果按模型顺序结算；批次的 EndTurn 结论不存入共享 run 状态。
+细节、上游源码和后续优先级见 [DSH 子任务与调度融合](delivery/2026-11-17-dsh-subagent-and-tool-scheduler.md)。
+
 ### 3.3 Mode Policy
 
 产品可以提供 Flash、Thinking、Pro、Ultra 等交互模式，但模式语义必须在 Harness
@@ -308,27 +361,33 @@ Preset 只是产品层组合，工具 admission 必须分别比较 sandbox mode 
 ```go
 type Plugin interface {
     Name() string
-    Dependencies() []string
-    Start(context.Context, Host) error
-    Stop(context.Context) error
+    Inject() []string
+    Apply(*plugin.Context) error
 }
 
-type Host struct {
-    Capabilities *capability.Registry
-    Tools        *tool.Registry
-    GenerationID string
-}
+// ctx.RegisterTool / ctx.RegisterCapability 自动绑定注册的撤销操作。
+// ctx.Provide 发布服务；ctx.Service 只能读取 Inject 声明的服务。
+// ctx.OnDispose 绑定资源清理；ctx.Go 启动随作用域取消、排空的任务。
 ```
 
 插件生命周期：
 
 ```text
-discover -> validate -> resolve dependencies -> start -> ready
-                                             |
-                                    stop/reload generation
+load / validate -> wait for injected services -> scoped Apply
+  -> publish services -> freeze tool catalog / capability generation -> ready
+                               |
+                   retire -> drain run leases -> dispose effects
 ```
 
-插件必须是可卸载的；不得在 `Start` 中创建无法被 Runtime 收集和关闭的 goroutine、连接池或订阅。
+依赖是服务名，不能用插件名替代。缺失服务时暂不执行 Apply；所有可激活插件执行后，
+必需插件仍无法满足依赖就回滚启动，可选插件保留 pending 状态。Apply 失败时连同失败
+插件的部分注册一起回滚，清理错误与初始化错误一起返回。关闭取消后台任务、按逆序
+清理作用域并等待排空；并发关闭共享同一结果。旧 disposer 不能删除同名的新注册。
+
+生产 command tool 经 `pkg/plugin` 发现 `plugin.json` 后，适配成同一运行时插件。
+运行时采用 generation 整体替换：新配置完整装配成功后，新 run 才切换；旧 run 继续使用
+原 generation，排空后撤销旧资源。注册只允许在 Apply 期间，避免发布后的工具目录漂移。
+这里没有加载 JavaScript Cordis 插件、Go `.so` 或照搬 DSH 的插件配置文件格式。
 
 ## 4. Session、Run 和事件
 
@@ -518,8 +577,8 @@ policy.tools
 agent.subagents / agent.<profile>
 ```
 
-Runtime Plugin 在 generation 冻结前按依赖顺序启动。生产 command tool 只在 Plugin
-`Start` 中写入 Tool Registry，随后由 `harness.tool-catalog` 将最终工具集合登记为
+Runtime Plugin 在 generation 冻结前按服务依赖激活。生产 command tool 只在 Plugin
+`Apply` 中通过作用域注册工具，随后由 Manager 的最终目录阶段将工具集合登记为
 `tool.<name>` capability；`buildAgent` 不保留绕过 Plugin 的直接注册路径。
 
 静态实例通过 `capability.Value`/`RegisterValue` 注册，需要按 run/thread 构造的实现使用
@@ -577,8 +636,9 @@ Phase 5 必须满足：
 - `pkg/runtime/metadata.Store` 是 RunManager 的执行状态持久化 port；生产 PostgreSQL
   直接使用 `pkg/runtime/postgres.MetadataStore`。HTTP Store 不再代理生产 Runtime 的
   history、thread values、terminal state 或 completion 写入。
-- Subagent 只定义 `TaskStore` port 和单进程内存实现；生产 Redis adapter 位于
-  `pkg/runtime/redis.TaskStore`，Capability 包不直接链接 Redis 驱动。
+- `pkg/runtime/delegation` 定义 TaskStore、SessionStore、InboxStore port；生产使用
+  `pkg/runtime/postgres.SubagentStore`。子会话通过 token + lease 隔离旧 worker，历史和
+  inbox ACK 同事务保存。`agentd` 不使用 Redis 作为事件、任务或运行状态的权威存储。
 - Memory 只定义强类型 `Store` port 和内存实现；生产 PostgreSQL adapter 位于
   `pkg/runtime/postgres.MemoryStore`，Memory capability 不直接链接 pgx。
 - RunManager 在 canonical transcript event 和 History projection 成功后保存完整 transcript

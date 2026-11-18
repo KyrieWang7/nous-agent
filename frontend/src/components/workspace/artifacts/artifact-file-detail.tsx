@@ -20,6 +20,7 @@ import {
   ArtifactHeader,
   ArtifactTitle,
 } from "@/components/ai-elements/artifact";
+import { Button } from "@/components/ui/button";
 import { Select, SelectItem } from "@/components/ui/select";
 import {
   SelectContent,
@@ -82,7 +83,7 @@ export function ArtifactFileDetail({
   const previewable = useMemo(() => {
     return (language === "html" && !isWriteFile) || language === "markdown";
   }, [isWriteFile, language]);
-  const { content } = useArtifactContent({
+  const { content, isLoading, error, refetch } = useArtifactContent({
     threadId,
     filepath: filepathFromProps,
     enabled: isCodeFile && !isWriteFile,
@@ -127,7 +128,7 @@ export function ArtifactFileDetail({
       <ArtifactHeader className="px-2">
         <div className="flex items-center gap-2">
           <ArtifactTitle>
-            {isWriteFile ? (
+            {isWriteFile || !(artifacts ?? []).includes(filepath) ? (
               <div className="px-2">{getFileName(filepath)}</div>
             ) : (
               <Select value={filepath} onValueChange={select}>
@@ -148,7 +149,7 @@ export function ArtifactFileDetail({
           </ArtifactTitle>
         </div>
         <div className="flex min-w-0 grow items-center justify-center">
-          {previewable && (
+          {!isLoading && !error && previewable && (
             <ToggleGroup
               className="mx-auto"
               type="single"
@@ -232,7 +233,31 @@ export function ArtifactFileDetail({
         </div>
       </ArtifactHeader>
       <ArtifactContent className="p-0">
-        {previewable &&
+        {isLoading && (
+          <p className="text-muted-foreground p-4 text-sm" role="status">
+            {t.common.loading}
+          </p>
+        )}
+        {error && (
+          <div role="alert" className="space-y-3 p-4 text-sm">
+            <p className="text-destructive break-words">
+              {t.workbenchPanel.fileError} {error.message}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                void refetch();
+              }}
+            >
+              {t.subagentWorkspace.retry}
+            </Button>
+          </div>
+        )}
+
+        {!isLoading &&
+          !error &&
+          previewable &&
           viewMode === "preview" &&
           (language === "markdown" || language === "html") && (
             <ArtifactFilePreview
@@ -242,7 +267,7 @@ export function ArtifactFileDetail({
               language={language ?? "text"}
             />
           )}
-        {isCodeFile && viewMode === "code" && (
+        {!isLoading && !error && isCodeFile && viewMode === "code" && (
           <CodeEditor
             className="size-full resize-none rounded-none border-none"
             value={displayContent ?? ""}
@@ -326,7 +351,7 @@ export function ArtifactFilePreview({
           components={{
             a: CitationLink,
             img: ({ src, ...props }) => (
-              // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+              // eslint-disable-next-line jsx-a11y/alt-text
               <img
                 {...props}
                 src={
@@ -346,6 +371,8 @@ export function ArtifactFilePreview({
   if (language === "html") {
     return (
       <iframe
+        title={getFileName(filepath)}
+        sandbox="allow-scripts"
         className="size-full"
         src={urlOfArtifact({ filepath, threadId })}
       />
@@ -353,4 +380,3 @@ export function ArtifactFilePreview({
   }
   return null;
 }
-

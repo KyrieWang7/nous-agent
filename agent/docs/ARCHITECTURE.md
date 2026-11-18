@@ -1,5 +1,8 @@
 # Architecture Overview
 
+> 历史文档：旧 Python `gateway/` 已删除。当前 Gateway 使用仓库根目录的 `gateway-go/`；下文 Python Gateway 路径和示例仅保留为历史记录。
+
+
 This document provides a comprehensive overview of the DeerFlow backend architecture.
 
 ## System Architecture

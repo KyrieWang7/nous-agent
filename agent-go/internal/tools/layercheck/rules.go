@@ -56,11 +56,14 @@ var rules = []rule{
 	{
 		from: "pkg/loop",
 		forbidden: []string{
-			"pkg/harness", "pkg/config", "internal/transport/httpapi",
+			"pkg/harness", "pkg/config", "internal/handler",
 			"pkg/runtime/postgres", "pkg/runtime/redis",
 			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
 			"pkg/sandbox/local", "pkg/sandbox/remote",
 			"external/net/http", "external/database/sql",
+			"external/github.com/KyrieWang7/nous-agent/platform-go",
+			"external/github.com/gin-gonic/gin", "external/github.com/spf13/viper",
+			"external/go.uber.org/zap", "external/gorm.io",
 			"external/github.com/jackc/pgx", "external/github.com/redis/go-redis",
 		},
 		why: "内核只吃 typed contracts，不认识配置、wire、数据库驱动或 capability 具体实现",
@@ -81,7 +84,7 @@ var rules = []rule{
 		why:       "库不得依赖 internal；wire 格式适配是单向的",
 	},
 	{
-		from: "internal/transport",
+		from: "internal/handler",
 		forbidden: []string{
 			"pkg/loop", "pkg/harness", "pkg/config",
 			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
@@ -92,7 +95,7 @@ var rules = []rule{
 	{
 		from: "pkg/runtime/runmanager",
 		forbidden: []string{
-			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"internal/handler", "internal/service", "pkg/config", "pkg/harness", "pkg/loop",
 			"pkg/runtime/postgres", "pkg/runtime/redis",
 			"pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community",
 			"pkg/sandbox/local", "pkg/sandbox/remote",
@@ -102,7 +105,7 @@ var rules = []rule{
 	{
 		from: "pkg/runtime/capability",
 		forbidden: []string{
-			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"internal/handler", "internal/service", "pkg/config", "pkg/harness", "pkg/loop",
 			"pkg/runtime/postgres", "pkg/runtime/redis",
 		},
 		why: "Capability contract 不得反向依赖产品、Kernel 或 persistence implementation",
@@ -110,7 +113,7 @@ var rules = []rule{
 	{
 		from: "pkg/runtime/metadata",
 		forbidden: []string{
-			"internal/transport", "pkg/config", "pkg/harness", "pkg/loop",
+			"internal/handler", "internal/service", "pkg/config", "pkg/harness", "pkg/loop",
 			"pkg/runtime/runmanager", "pkg/runtime/postgres", "pkg/runtime/redis",
 		},
 		why: "Metadata persistence port 是底层 Runtime contract，不得反向依赖编排、Transport 或具体实现",
@@ -146,7 +149,9 @@ func (v violation) String() string {
 // check 对一组包及其依赖求解违规。
 //
 // deps 是包 → 其全部（含间接）依赖的映射，键与值都是相对模块根的路径。
-func check(deps map[string][]string) []violation {
+func check(deps map[string][]string) []violation { return checkRules(deps, rules) }
+
+func checkRules(deps map[string][]string, rules []rule) []violation {
 	var out []violation
 
 	pkgs := make([]string, 0, len(deps))
@@ -215,4 +220,15 @@ func underPath(p, prefix string) bool {
 		return false
 	}
 	return p == prefix || strings.HasPrefix(p, prefix+"/")
+}
+
+// Application tiers use direct imports: handler may reach persistence only
+// through service, while the transitive Kernel rules above remain stricter.
+var applicationRules = []rule{
+	{from: "internal/handler", forbidden: []string{"internal/server", "internal/repository", "internal/middleware", "pkg/loop", "pkg/harness", "pkg/config", "pkg/model/provider", "pkg/tool/builtin", "pkg/tool/community", "pkg/sandbox/local", "pkg/sandbox/remote", "external/github.com/jackc/pgx", "external/github.com/redis/go-redis"}, why: "Handler 只解码和投影，存储与业务调用必须经过 Service"},
+	{from: "internal/service", forbidden: []string{"internal/handler", "internal/router", "internal/middleware", "internal/server", "external/net/http", "pkg/loop", "pkg/harness", "pkg/config", "pkg/model/provider", "pkg/tool/builtin", "pkg/sandbox/local", "pkg/sandbox/remote", "external/github.com/jackc/pgx", "external/github.com/redis/go-redis"}, why: "Service 不认识 HTTP，不创建第二套 Agent Loop，只调用 Runtime contract 与 Repository"},
+	{from: "internal/repository", forbidden: []string{"internal/service", "internal/handler", "internal/router", "internal/middleware", "internal/server", "pkg/loop", "pkg/harness"}, why: "Repository 只实现存储，不反向依赖业务或传输层"},
+	{from: "internal/model", forbidden: []string{"internal/service", "internal/repository", "internal/handler", "internal/router", "internal/middleware", "internal/server", "external/net/http", "external/github.com/jackc/pgx"}, why: "Model 是共享数据契约，不能依赖上层或数据库驱动"},
+	{from: "internal/router", forbidden: []string{"internal/service", "internal/repository", "internal/handler", "internal/server", "pkg"}, why: "Router 只注册 HTTP endpoint，不装配业务或 Runtime"},
+	{from: "internal/middleware", forbidden: []string{"internal/service", "internal/repository", "internal/handler", "internal/server", "pkg"}, why: "Middleware 只处理 HTTP 横切事务，不能进入 Agent 生命周期"},
 }

@@ -4,11 +4,12 @@ FROM golang:1.25-alpine AS build
 
 RUN apk add --no-cache ca-certificates git
 
-WORKDIR /src
-COPY go.mod go.sum ./
+WORKDIR /src/agent-go
+COPY agent-go/go.mod agent-go/go.sum ./
+COPY platform-go /src/platform-go
 RUN go mod download
 
-COPY . .
+COPY agent-go/ .
 RUN CGO_ENABLED=0 go build -trimpath -tags=docker -ldflags="-s -w" -o /out/agentd ./cmd/agentd \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/agentctl ./cmd/agentctl
 
@@ -23,7 +24,7 @@ RUN apk add --no-cache bash ca-certificates curl git tzdata \
 WORKDIR /app
 COPY --from=build /out/agentd /usr/local/bin/agentd
 COPY --from=build /out/agentctl /usr/local/bin/agentctl
-COPY --chown=nous:nous config.example.yaml /etc/nous-agent/config.yaml
+COPY --chown=nous:nous agent-go/config.example.yaml /etc/nous-agent/config.yaml
 
 USER nous
 

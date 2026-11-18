@@ -7,12 +7,12 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/memory"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
-type MemoryStore struct{ pool *pgxpool.Pool }
+type MemoryStore struct{ pool *platformdb.DB }
 
-func NewMemoryStore(pool *pgxpool.Pool) (*MemoryStore, error) {
+func NewMemoryStore(pool *platformdb.DB) (*MemoryStore, error) {
 	if pool == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
@@ -46,7 +46,7 @@ func (s *MemoryStore) List(ctx context.Context, scope memory.Scope, limit int) (
 	if err != nil {
 		return nil, fmt.Errorf("runtime/postgres: listing memory facts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var facts []memory.Fact
 	for rows.Next() {
 		var fact memory.Fact

@@ -1,5 +1,8 @@
 # 文件上传功能
 
+> 历史文档：旧 Python `gateway/` 已删除。当前 Gateway 使用仓库根目录的 `gateway-go/`；下文 Python Gateway 路径和示例仅保留为历史记录。
+
+
 ## 概述
 
 DeerFlow 后端提供了完整的文件上传功能，支持多文件上传，并自动将 Office 文档和 PDF 转换为 Markdown 格式。

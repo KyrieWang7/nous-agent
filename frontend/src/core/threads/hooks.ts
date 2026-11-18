@@ -11,6 +11,7 @@ import type {
 import type { ThreadStream } from "@/core/types/thread";
 
 import { getAPIClient } from "../api";
+import { childSessionKey } from "../subagents/api";
 import { useUpdateSubtask } from "../tasks/context";
 import { uploadFiles } from "../uploads";
 
@@ -21,6 +22,12 @@ import {
   fetchThreads as gwFetchThreads,
   updateThread as gwUpdateThread,
 } from "./api";
+import {
+  enqueueSessionInput,
+  inboxKey,
+  pendingInputSnapshot,
+  type InputDelivery,
+} from "./inbox";
 import {
   findEquivalentMessageIndex,
   mergeSSEValuesMessages,
@@ -38,6 +45,7 @@ import {
 import { isThreadNotFoundError } from "./thread-lifecycle";
 import {
   answerUserQuestion,
+  cancelAgentRun,
   fetchActiveRunId,
   reconnectSSE,
   streamSSE,
@@ -187,6 +195,15 @@ function useSSEStream(
   });
 
   const abortRef = useRef<AbortController | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
+  const stoppingRef = useRef(false);
+  useEffect(() => {
+    if (!state.isLoading) {
+      stoppingRef.current = false;
+      setIsStopping(false);
+    }
+  }, [state.isLoading]);
+  useEffect(() => () => abortRef.current?.abort(), []);
   const msgManagerRef = useRef(new MessageManager());
   const onCustomEventRef = useRef(onCustomEvent);
   onCustomEventRef.current = onCustomEvent;
@@ -207,6 +224,8 @@ function useSSEStream(
     abortRef.current?.abort();
     msgManagerRef.current.clear();
     activeRunIdRef.current = null;
+    stoppingRef.current = false;
+    setIsStopping(false);
     setState({
       values: EMPTY_STATE,
       isLoading: false,
@@ -239,13 +258,19 @@ function useSSEStream(
     const tryReconnect = async () => {
       try {
         const activeRunId = await fetchActiveRunId(threadId);
-        if (cancelled || !activeRunId) return;
+        if (
+          cancelled ||
+          !activeRunId ||
+          (abortRef.current && !abortRef.current.signal.aborted)
+        )
+          return;
 
         // There's an active run — reconnect to its stream
         reconnectingRef.current = true;
         setState((prev) => ({
           ...prev,
           isLoading: true,
+          pendingQuestion: null,
           error: undefined,
           riskLevel: null,
           riskVerdict: null,
@@ -265,16 +290,17 @@ function useSSEStream(
             activeRunId,
             ac.signal,
           )) {
-            if (cancelled) break;
+            if (cancelled || abortRef.current !== ac) break;
             processSSEEvent(event, data);
           }
-          if (!cancelled) {
+          if (!cancelled && abortRef.current === ac) {
             setState((prev) => ({ ...prev, isLoading: false }));
           }
         } catch (err: unknown) {
           if (err instanceof Error && err.name === "AbortError") {
-            setState((prev) => ({ ...prev, isLoading: false }));
-          } else if (!cancelled) {
+            if (!cancelled && abortRef.current === ac)
+              setState((prev) => ({ ...prev, isLoading: false }));
+          } else if (!cancelled && abortRef.current === ac) {
             console.warn("Reconnect stream ended:", err);
             setState((prev) => ({ ...prev, isLoading: false }));
           }
@@ -391,6 +417,15 @@ function useSSEStream(
           return { ...prev, tokenUsage: incoming };
         });
       }
+      if (
+        customData.type === "plan_mode_changed" &&
+        typeof customData.active === "boolean"
+      ) {
+        setState((prev) => ({
+          ...prev,
+          values: { ...prev.values, is_plan_mode: customData.active },
+        }));
+      }
       if (customData.type === "guardrail_blocked") {
         guardrailBlockedRef.current = true;
       }
@@ -443,6 +478,7 @@ function useSSEStream(
       }
       onCustomEventRef.current?.(customData);
     } else if (effectiveEvent === "end" || effectiveEvent === "run_end") {
+      setState((prev) => ({ ...prev, pendingQuestion: null }));
       const endData =
         data && typeof data === "object"
           ? (data as Record<string, unknown>)
@@ -510,7 +546,12 @@ function useSSEStream(
         errData.error?.message ?? errData.message ?? "Stream error";
       console.info(`[SSE] Backend error: ${errMsg}`);
       if (isCancellationError(errMsg)) {
-        setState((prev) => ({ ...prev, isLoading: false, error: undefined }));
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          error: undefined,
+          pendingQuestion: null,
+        }));
         return;
       }
       toast.error(errMsg);
@@ -521,6 +562,56 @@ function useSSEStream(
       }));
     }
   }, []);
+
+  const attachRun = useCallback(
+    async (runId: string) => {
+      if (!threadId) throw new Error("threadId is required");
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      activeRunIdRef.current = runId;
+      activeMessageIdRef.current = null;
+      replacementReceivedRef.current = false;
+      guardrailBlockedRef.current = false;
+      msgManagerRef.current.clear();
+      setState((prev) => ({
+        ...prev,
+        isLoading: true,
+        pendingQuestion: null,
+        error: undefined,
+        riskLevel: null,
+        riskVerdict: null,
+      }));
+      try {
+        for await (const { event, data } of reconnectSSE(
+          threadId,
+          runId,
+          ac.signal,
+        )) {
+          if (ac.signal.aborted || abortRef.current !== ac) return;
+          processSSEEvent(event, data);
+        }
+        if (ac.signal.aborted || abortRef.current !== ac) return;
+        const persisted =
+          await getAPIClient().threads.getState<AgentThreadState>(threadId);
+        if (!ac.signal.aborted && abortRef.current === ac)
+          setState((prev) => ({
+            ...prev,
+            values: persisted.values ?? prev.values,
+          }));
+      } catch (error) {
+        if (!ac.signal.aborted && abortRef.current === ac)
+          setState((prev) => ({ ...prev, error }));
+      } finally {
+        if (abortRef.current === ac) {
+          setState((prev) => ({ ...prev, isLoading: false }));
+          stoppingRef.current = false;
+          setIsStopping(false);
+        }
+      }
+    },
+    [threadId, processSSEEvent],
+  );
 
   const submit = useCallback(
     async (
@@ -552,6 +643,7 @@ function useSSEStream(
           ...prev,
           values: optimistic,
           isLoading: true,
+          pendingQuestion: null,
           error: undefined,
           riskLevel: null,
           riskVerdict: null,
@@ -565,17 +657,23 @@ function useSSEStream(
           context: options?.context,
           signal: ac.signal,
         })) {
+          if (ac.signal.aborted || abortRef.current !== ac) return;
           processSSEEvent(event, data);
           if (event === "error") return;
         }
 
+        if (ac.signal.aborted || abortRef.current !== ac) return;
         // SSE can finish after a browser reconnect or proxy interruption has
         // dropped one or more message deltas. The persisted projection is the
         // source of truth, so reconcile it once at the terminal boundary.
         try {
           const persisted =
             await getAPIClient().threads.getState<AgentThreadState>(threadId);
-          if (persisted.values?.messages?.length) {
+          if (
+            persisted.values?.messages?.length &&
+            !ac.signal.aborted &&
+            abortRef.current === ac
+          ) {
             flushSync(() => {
               setState((prev) => ({
                 ...prev,
@@ -597,6 +695,7 @@ function useSSEStream(
 
         setState((prev) => ({ ...prev, isLoading: false }));
       } catch (err: unknown) {
+        if (abortRef.current !== ac) return;
         if (isCancellationError(err)) {
           setState((prev) => ({
             ...prev,
@@ -617,11 +716,30 @@ function useSSEStream(
   );
 
   const stop = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    msgManagerRef.current.clear();
-    setState((prev) => ({ ...prev, isLoading: false }));
-  }, []);
+    if (!threadId || stoppingRef.current) return;
+    stoppingRef.current = true;
+    setIsStopping(true);
+    // Cancellation is a durable server command, not an SSE disconnection.
+    // Keep the connection until the server confirms tools and children settled.
+    void (async () => {
+      try {
+        const runId =
+          activeRunIdRef.current ?? (await fetchActiveRunId(threadId));
+        if (runId) await cancelAgentRun(threadId, runId);
+        else {
+          stoppingRef.current = false;
+          setIsStopping(false);
+        }
+      } catch (error) {
+        setState((prev) => ({ ...prev, error }));
+        toast.error(
+          error instanceof Error ? error.message : "Could not cancel run",
+        );
+        stoppingRef.current = false;
+        setIsStopping(false);
+      }
+    })();
+  }, [threadId]);
 
   return {
     values: state.values,
@@ -632,6 +750,9 @@ function useSSEStream(
     riskLevel: state.riskLevel,
     riskVerdict: state.riskVerdict,
     pendingQuestion: state.pendingQuestion,
+    attachRun,
+    runId: activeRunIdRef.current,
+    isStopping,
     submit,
     stop,
   };
@@ -656,6 +777,14 @@ export function useThreadStream({
   const handleCustomEvent = useCallback(
     (data: Record<string, unknown>) => {
       const type = data.type as string | undefined;
+      if (type?.startsWith("task_") && threadId)
+        void queryClient.invalidateQueries({
+          queryKey: childSessionKey(threadId),
+        });
+      // Nested sessions render in their own persisted conversation/tree. Raw
+      // provider tool IDs may repeat across parents and must not overwrite a
+      // direct child card in the root conversation.
+      if (data.is_nested === true) return;
       const taskId = data.task_id as string | undefined;
       if (!taskId) return;
       if (type === "task_started") {
@@ -678,7 +807,11 @@ export function useThreadStream({
           status: "completed",
           result: (data.result as string) ?? "",
         });
-      } else if (type === "task_failed" || type === "task_timed_out") {
+      } else if (
+        type === "task_failed" ||
+        type === "task_timed_out" ||
+        type === "task_cancelled"
+      ) {
         updateSubtask({
           id: taskId,
           status: "failed",
@@ -686,7 +819,7 @@ export function useThreadStream({
         });
       }
     },
-    [updateSubtask],
+    [updateSubtask, threadId, queryClient],
   );
 
   const history = useThreadHistory(threadId, isNewThread);
@@ -755,6 +888,9 @@ export function useThreadStream({
     (): ThreadStream<AgentThreadState> & {
       pendingQuestion: PendingUserQuestion | null;
       answerQuestion: typeof answerQuestion;
+      attachRun: typeof stream.attachRun;
+      runId: string | null;
+      isStopping: boolean;
     } => ({
       values: stream.values,
       messages: stream.messages,
@@ -765,6 +901,9 @@ export function useThreadStream({
       tokenUsage: stream.tokenUsage,
       pendingQuestion: stream.pendingQuestion,
       answerQuestion,
+      attachRun: stream.attachRun,
+      runId: stream.runId,
+      isStopping: stream.isStopping,
       submit: submitFn,
       stop: stream.stop,
     }),
@@ -782,7 +921,11 @@ export function useSubmitThread({
   threadContext,
   isNewThread,
   afterSubmit,
+  enqueueDelivery,
+  submissionDraft,
 }: {
+  submissionDraft?: { text: string; attachmentIds: string[] };
+  enqueueDelivery?: InputDelivery;
   isNewThread: boolean;
   threadId: string | null | undefined;
   thread: ThreadStream<AgentThreadState>;
@@ -792,6 +935,10 @@ export function useSubmitThread({
   const queryClient = useQueryClient();
   const callback = useCallback(
     async (message: PromptInputMessage) => {
+      if (enqueueDelivery && threadId && pendingInputSnapshot(threadId))
+        throw new Error(
+          "Resolve the unconfirmed message before sending another one.",
+        );
       const text = message.text.trim();
       const attachedContents: MessageContentComplex[] = [];
       let attachedText = "";
@@ -898,6 +1045,26 @@ export function useSubmitThread({
         ],
       };
 
+      if (enqueueDelivery) {
+        if (!threadId) throw new Error("Thread is not ready.");
+        await enqueueSessionInput(threadId, {
+          id: crypto.randomUUID(),
+          delivery: enqueueDelivery,
+          input: { messages: [humanMessage] },
+          draft: submissionDraft?.text ?? message.text,
+          attachment_ids: submissionDraft?.attachmentIds,
+          ...(enqueueDelivery === "next_turn"
+            ? {
+                config: { recursion_limit: 1000 },
+                context: { ...threadContext, thread_id: threadId },
+              }
+            : {}),
+        });
+        afterSubmit?.();
+        await queryClient.invalidateQueries({ queryKey: inboxKey(threadId) });
+        void queryClient.invalidateQueries({ queryKey: ["gateway-threads"] });
+        return;
+      }
       const submitPromise = thread.submit(
         { messages: [humanMessage] },
         {
@@ -923,7 +1090,16 @@ export function useSubmitThread({
       await submitPromise;
       void queryClient.invalidateQueries({ queryKey: ["gateway-threads"] });
     },
-    [thread, isNewThread, threadId, threadContext, queryClient, afterSubmit],
+    [
+      thread,
+      isNewThread,
+      threadId,
+      threadContext,
+      queryClient,
+      afterSubmit,
+      enqueueDelivery,
+      submissionDraft,
+    ],
   );
   return callback;
 }

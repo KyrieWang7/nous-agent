@@ -91,41 +91,60 @@ func RegisterValue(r *Registry, value Value) error {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]Entry
+	owners  map[string]*uint64
 }
 
 // NewRegistry returns an empty capability registry.
-func NewRegistry() *Registry { return &Registry{entries: make(map[string]Entry)} }
+func NewRegistry() *Registry {
+	return &Registry{entries: make(map[string]Entry), owners: make(map[string]*uint64)}
+}
 
 // Register adds one capability. Names are globally unique across kinds so a
 // typo cannot silently resolve a different domain's capability.
 func (r *Registry) Register(entry Entry) error {
+	_, err := r.RegisterOwned(entry)
+	return err
+}
+
+// RegisterOwned returns an identity-bound disposer for a scope-owned entry.
+func (r *Registry) RegisterOwned(entry Entry) (func(), error) {
 	if r == nil {
-		return errors.New("capability: registry is nil")
+		return nil, errors.New("capability: registry is nil")
 	}
 	if entry.Name == "" {
-		return errors.New("capability: name must not be empty")
+		return nil, errors.New("capability: name must not be empty")
 	}
 	if entry.Kind == "" {
-		return fmt.Errorf("capability %q: kind must not be empty", entry.Name)
+		return nil, fmt.Errorf("capability %q: kind must not be empty", entry.Name)
 	}
 	if entry.Resolver == nil {
-		return fmt.Errorf("capability %q: resolver must not be nil", entry.Name)
+		return nil, fmt.Errorf("capability %q: resolver must not be nil", entry.Name)
 	}
 	if entry.Scope == "" {
 		entry.Scope = ScopeGlobal
 	}
 	if entry.Scope != ScopeGlobal && entry.Scope != ScopeThread && entry.Scope != ScopeRun {
-		return fmt.Errorf("capability %q: unknown scope %q", entry.Name, entry.Scope)
+		return nil, fmt.Errorf("capability %q: unknown scope %q", entry.Name, entry.Scope)
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.entries[entry.Name]; exists {
-		return fmt.Errorf("capability %q: already registered", entry.Name)
+		return nil, fmt.Errorf("capability %q: already registered", entry.Name)
 	}
 	entry.Metadata = cloneMetadata(entry.Metadata)
+	token := new(uint64)
+	r.owners[entry.Name] = token
 	r.entries[entry.Name] = entry
-	return nil
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.owners[entry.Name] != token {
+			return
+		}
+		delete(r.entries, entry.Name)
+		delete(r.owners, entry.Name)
+	}, nil
 }
 
 // Get returns a definition without invoking its resolver.

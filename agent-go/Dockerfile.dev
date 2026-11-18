@@ -5,7 +5,8 @@ RUN apk add --no-cache bash ca-certificates curl docker-cli git \
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
+COPY agent-go/go.mod agent-go/go.sum ./
+COPY platform-go /platform-go
 RUN go mod download
 
 EXPOSE 7776

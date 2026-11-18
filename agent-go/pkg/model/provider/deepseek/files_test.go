@@ -83,7 +83,9 @@ func TestFilesDoNotRedirectCredentials(t *testing.T) {
 	var requests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1) }))
 	defer target.Close()
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, 307) }))
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
 	defer source.Close()
 	m, _ := New(model.ProviderConfig{Model: "ds", BaseURL: source.URL, APIKey: "secret"})
 	_, err := m.(*Client).UploadFile(context.Background(), []byte("x"), "image/png", "x.png", 3600)

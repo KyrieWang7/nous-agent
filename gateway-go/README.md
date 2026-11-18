@@ -17,6 +17,31 @@ Implemented APIs include:
 - Swarm teams, members, messages, and SSE change events
 - health and CORS
 
+## Shared platform
+
+The sibling `platform-go` module supplies Gin routing, GORM/PostgreSQL, Viper,
+Zap logging and go-redis. An optional `NOUS_GATEWAY_CONFIG_PATH` YAML file can
+supply configuration; the established environment variables override its values.
+See `config.example.yaml`. Database schemas stay under explicit SQL migrations.
+
+HTTP rate limiting defaults off. It can be enabled with `REDIS_URL`,
+`HTTP_RATE_LIMIT_ENABLED=true`, `HTTP_RATE_LIMIT_REQUESTS=60` and
+`HTTP_RATE_LIMIT_WINDOW=1m`. `LOG_LEVEL` defaults to `info`.
+
+Build from the repository root with
+`docker build -f gateway-go/Dockerfile -t nous-gateway .` so the common module
+is available in the build context.
+
+## Application layers
+
+`internal/router` registers routes, `middleware` handles HTTP concerns, `handler`
+decodes and projects HTTP/SSE, `service` owns use cases, `repository` implements
+persistence, `model` defines application data, and `server` composes the boundary.
+
+Catalog, filesystem and conversion adapters live under
+`internal/repository/{catalog,files,convert}`. Swarm polling and member-status
+reconciliation belong to `internal/service`; handlers only encode SSE events.
+
 ## Repository development
 
 The default repository workflow starts this Gateway on port `7777`:

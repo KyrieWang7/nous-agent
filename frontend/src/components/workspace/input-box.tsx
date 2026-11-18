@@ -3,6 +3,7 @@
 import type { ChatStatus } from "ai";
 import {
   CheckIcon,
+  SquareIcon,
   GraduationCapIcon,
   LightbulbIcon,
   Network,
@@ -105,8 +106,10 @@ export function InputBox({
   onContextChange,
   onSubmit,
   onStop,
+  allowBusySubmit = false,
   ...props
 }: Omit<ComponentProps<typeof PromptInput>, "onSubmit"> & {
+  allowBusySubmit?: boolean;
   assistantId?: string | null;
   status?: ChatStatus;
   disabled?: boolean;
@@ -212,22 +215,16 @@ export function InputBox({
     [onContextChange, context, supportThinking],
   );
 
-  const handleAddSkill = useCallback(
-    (skill: Skill) => {
-      setSelectedSkills((prev) => {
-        if (prev.some((s) => s.name === skill.name)) return prev;
-        return [...prev, skill];
-      });
-    },
-    [],
-  );
+  const handleAddSkill = useCallback((skill: Skill) => {
+    setSelectedSkills((prev) => {
+      if (prev.some((s) => s.name === skill.name)) return prev;
+      return [...prev, skill];
+    });
+  }, []);
 
-  const handleRemoveSkill = useCallback(
-    (skillName: string) => {
-      setSelectedSkills((prev) => prev.filter((s) => s.name !== skillName));
-    },
-    [],
-  );
+  const handleRemoveSkill = useCallback((skillName: string) => {
+    setSelectedSkills((prev) => prev.filter((s) => s.name !== skillName));
+  }, []);
 
   const handleSelectSkillFromPicker = useCallback(
     (skill: Skill) => {
@@ -256,11 +253,12 @@ export function InputBox({
 
   const handleSubmit = useCallback(
     async (message: PromptInputMessage) => {
-      if (status === "streaming") {
-        onStop?.();
-        return;
+      if (status === "streaming" && !allowBusySubmit) {
+        throw new Error(
+          "A run is already active; keep this input until it finishes.",
+        );
       }
-      if (!message.text) {
+      if (!message.text && !message.files?.length) {
         return;
       }
 
@@ -273,7 +271,7 @@ export function InputBox({
       await onSubmit?.({ ...message, text: finalText });
       setSelectedSkills([]);
     },
-    [onSubmit, onStop, status, selectedSkills],
+    [onSubmit, status, selectedSkills, allowBusySubmit],
   );
 
   const handleTextareaChange = useCallback(
@@ -298,9 +296,14 @@ export function InputBox({
   // 选中索引变化时，自动滚动到可见区域
   useEffect(() => {
     if (skillListRef.current && showSkillPicker) {
-      const selectedElement = skillListRef.current.children[skillPickerIndex] as HTMLElement;
+      const selectedElement = skillListRef.current.children[
+        skillPickerIndex
+      ] as HTMLElement;
       if (selectedElement) {
-        selectedElement.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        selectedElement.scrollIntoView({
+          block: "nearest",
+          behavior: "smooth",
+        });
       }
     }
   }, [skillPickerIndex, showSkillPicker]);
@@ -311,14 +314,10 @@ export function InputBox({
 
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setSkillPickerIndex((i) =>
-          i < filteredSkills.length - 1 ? i + 1 : 0,
-        );
+        setSkillPickerIndex((i) => (i < filteredSkills.length - 1 ? i + 1 : 0));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        setSkillPickerIndex((i) =>
-          i > 0 ? i - 1 : filteredSkills.length - 1,
-        );
+        setSkillPickerIndex((i) => (i > 0 ? i - 1 : filteredSkills.length - 1));
       } else if (e.key === "Enter" && !e.shiftKey) {
         if (filteredSkills[skillPickerIndex]) {
           e.preventDefault();
@@ -331,16 +330,21 @@ export function InputBox({
         setSkillFilter("");
       }
     },
-    [showSkillPicker, filteredSkills, skillPickerIndex, handleSelectSkillFromPicker],
+    [
+      showSkillPicker,
+      filteredSkills,
+      skillPickerIndex,
+      handleSelectSkillFromPicker,
+    ],
   );
 
   return (
     <PromptInput
       className={cn(
-        "rounded-[22px] bg-white shadow-[0_16px_48px_rgba(38,38,34,0.08),0_1px_2px_rgba(38,38,34,0.08)] backdrop-blur-md transition-all duration-300 ease-out hover:shadow-[0_18px_54px_rgba(38,38,34,0.1),0_1px_2px_rgba(38,38,34,0.08)] focus-within:shadow-[0_18px_54px_rgba(38,38,34,0.11),0_0_0_4px_rgba(38,38,34,0.04)] *:data-[slot='input-group']:rounded-[22px]",
+        "rounded-[22px] bg-white shadow-[0_16px_48px_rgba(38,38,34,0.08),0_1px_2px_rgba(38,38,34,0.08)] backdrop-blur-md transition-all duration-300 ease-out focus-within:shadow-[0_18px_54px_rgba(38,38,34,0.11),0_0_0_4px_rgba(38,38,34,0.04)] hover:shadow-[0_18px_54px_rgba(38,38,34,0.1),0_1px_2px_rgba(38,38,34,0.08)] *:data-[slot='input-group']:rounded-[22px]",
         status === "streaming"
           ? "streaming-border"
-          : "border border-[var(--manus-line)] hover:border-[var(--manus-line-strong)] focus-within:border-[var(--manus-line-strong)]",
+          : "border border-[var(--manus-line)] focus-within:border-[var(--manus-line-strong)] hover:border-[var(--manus-line-strong)]",
         className,
       )}
       disabled={disabled}
@@ -364,14 +368,14 @@ export function InputBox({
           {selectedSkills.map((skill) => (
             <span
               key={skill.name}
-              className="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-0.5 text-sm font-medium text-foreground"
+              className="bg-muted text-foreground inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-sm font-medium"
             >
               <SparklesIcon className="size-3" />
               {skill.name}
               <button
                 type="button"
                 onClick={() => handleRemoveSkill(skill.name)}
-                className="ml-0.5 rounded-full p-0.5 hover:bg-accent transition-colors"
+                className="hover:bg-accent ml-0.5 rounded-full p-0.5 transition-colors"
               >
                 <XIcon className="size-2.5" />
               </button>
@@ -395,8 +399,9 @@ export function InputBox({
               ref={skillPickerRef}
               className="absolute bottom-full left-0 z-50 mb-2 w-72 rounded-xl border bg-white shadow-[0_18px_46px_rgba(38,38,34,0.12)]"
             >
-              <div className="px-3 py-2 text-xs font-medium text-muted-foreground border-b">
-                选择技能（输入 <kbd className="rounded bg-muted px-1 font-mono">/</kbd> 触发）
+              <div className="text-muted-foreground border-b px-3 py-2 text-xs font-medium">
+                选择技能（输入{" "}
+                <kbd className="bg-muted rounded px-1 font-mono">/</kbd> 触发）
               </div>
               <div className="max-h-52 overflow-y-auto p-1" ref={skillListRef}>
                 {filteredSkills.map((skill, idx) => {
@@ -416,21 +421,21 @@ export function InputBox({
                         "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors",
                         idx === skillPickerIndex && "bg-accent",
                         isSelected
-                          ? "opacity-40 cursor-default"
+                          ? "cursor-default opacity-40"
                           : "hover:bg-accent cursor-pointer",
                       )}
                     >
-                      <SparklesIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">
+                      <SparklesIcon className="text-muted-foreground size-4 shrink-0" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium">
                           {skill.name}
                         </div>
-                        <div className="text-muted-foreground text-xs truncate">
+                        <div className="text-muted-foreground truncate text-xs">
                           {skill.description}
                         </div>
                       </div>
                       {isSelected && (
-                        <CheckIcon className="size-4 shrink-0 text-foreground" />
+                        <CheckIcon className="text-foreground size-4 shrink-0" />
                       )}
                     </button>
                   );
@@ -447,9 +452,9 @@ export function InputBox({
             <ModeHoverGuide
               mode={
                 context.mode === "flash" ||
-                  context.mode === "thinking" ||
-                  context.mode === "pro" ||
-                  context.mode === "ultra"
+                context.mode === "thinking" ||
+                context.mode === "pro" ||
+                context.mode === "ultra"
                   ? context.mode
                   : "flash"
               }
@@ -500,7 +505,7 @@ export function InputBox({
                           className={cn(
                             "mr-2 size-4",
                             context.mode === "flash" &&
-                            "text-accent-foreground",
+                              "text-accent-foreground",
                           )}
                         />
                         {t.inputBox.flashMode}
@@ -530,7 +535,7 @@ export function InputBox({
                             className={cn(
                               "mr-2 size-4",
                               context.mode === "thinking" &&
-                              "text-accent-foreground",
+                                "text-accent-foreground",
                             )}
                           />
                           {t.inputBox.reasoningMode}
@@ -587,7 +592,8 @@ export function InputBox({
                         <RocketIcon
                           className={cn(
                             "mr-2 size-4",
-                            context.mode === "ultra" && "text-[var(--manus-blue)]",
+                            context.mode === "ultra" &&
+                              "text-[var(--manus-blue)]",
                           )}
                         />
                         <div
@@ -615,9 +621,7 @@ export function InputBox({
         </PromptInputTools>
         <PromptInputTools>
           <TokenUsageIndicator tokenUsage={tokenUsage} />
-          <Tooltip
-            content={swarmEnabled ? "Swarm Mode ON" : "Swarm Mode OFF"}
-          >
+          <Tooltip content={swarmEnabled ? "Swarm Mode ON" : "Swarm Mode OFF"}>
             <PromptInputButton
               aria-label={swarmEnabled ? "Swarm Mode ON" : "Swarm Mode OFF"}
               aria-pressed={swarmEnabled}
@@ -637,7 +641,7 @@ export function InputBox({
             >
               <Network className="size-4" />
               {swarmEnabled && (
-                <span className="text-[10px] font-semibold leading-none">
+                <span className="text-[10px] leading-none font-semibold">
                   ON
                 </span>
               )}
@@ -682,11 +686,34 @@ export function InputBox({
               </ModelSelectorList>
             </ModelSelectorContent>
           </ModelSelector>
+          {allowBusySubmit && status === "streaming" && (
+            <PromptInputButton
+              type="button"
+              aria-label={t.subagentWorkspace.mainStop}
+              title={t.subagentWorkspace.mainStop}
+              onClick={() => onStop?.()}
+            >
+              <SquareIcon className="size-4" />
+            </PromptInputButton>
+          )}
           <PromptInputSubmit
-            className="rounded-full bg-muted text-muted-foreground hover:bg-primary hover:text-primary-foreground"
+            className="bg-muted text-muted-foreground hover:bg-primary hover:text-primary-foreground rounded-full"
             disabled={disabled}
             variant="outline"
-            status={status}
+            status={allowBusySubmit ? "ready" : status}
+            type={
+              status === "streaming" && !allowBusySubmit ? "button" : "submit"
+            }
+            aria-label={
+              status === "streaming" && !allowBusySubmit
+                ? t.subagentWorkspace.mainStop
+                : t.subagentWorkspace.mainSend
+            }
+            onClick={
+              status === "streaming" && !allowBusySubmit
+                ? () => onStop?.()
+                : undefined
+            }
           />
         </PromptInputTools>
       </PromptInputFooter>
@@ -725,7 +752,7 @@ function SuggestionList() {
   return (
     <Suggestions className="min-h-12 w-fit items-start gap-2.5">
       <ConfettiButton
-        className="h-9 cursor-pointer rounded-full border-border/85 bg-white/78 px-4 text-[14px] font-medium leading-none text-[var(--manus-text-soft)] shadow-[0_1px_2px_rgba(38,38,34,0.04)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[var(--manus-line-strong)] hover:bg-white hover:text-foreground hover:shadow-[0_8px_20px_rgba(38,38,34,0.08)] [&>svg]:size-4 [&>svg]:stroke-[1.8]"
+        className="border-border/85 hover:text-foreground h-9 cursor-pointer rounded-full bg-white/78 px-4 text-[14px] leading-none font-medium text-[var(--manus-text-soft)] shadow-[0_1px_2px_rgba(38,38,34,0.04)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[var(--manus-line-strong)] hover:bg-white hover:shadow-[0_8px_20px_rgba(38,38,34,0.08)] [&>svg]:size-4 [&>svg]:stroke-[1.8]"
         variant="outline"
         size="sm"
         onClick={() => handleSuggestionClick(t.inputBox.surpriseMePrompt)}

@@ -230,24 +230,24 @@ func TestLoopCommitsModelLedgerBeforeSamplerAndToolSideEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantOrder := []string{
-		"model_input_committed", "sample-0", "model_output_committed", "tool_start", "tool", "tool_result",
-		"model_input_committed", "sample-1", "model_output_committed",
+		"agent_turn_start", "agent_step_start", "model_input_committed", "sample-0", "model_output_committed", "tool_start", "tool", "tool_result", "agent_step_end",
+		"agent_step_start", "model_input_committed", "sample-1", "model_output_committed", "agent_step_end", "agent_turn_end",
 	}
 	if !slices.Equal(order, wantOrder) {
 		t.Fatalf("execution order = %v, want %v", order, wantOrder)
 	}
-	if len(events) != 6 {
+	if len(events) != 12 {
 		t.Fatalf("events = %v", events)
 	}
 	var input runtime.ModelInputCommitted
-	if err := json.Unmarshal(events[0].Data, &input); err != nil {
+	if err := json.Unmarshal(events[2].Data, &input); err != nil {
 		t.Fatal(err)
 	}
 	if input.ExecutionRunID != "run-1" || input.GenerationID != "generation-1" || input.Iteration != 0 || len(input.Messages) != 1 || input.Messages[0].Content != "do it" {
 		t.Fatalf("model input commit = %#v", input)
 	}
-	if events[0].Category != runtime.CategoryAudit || events[0].IdempotencyKey != "run:run-1:model-input:0" {
-		t.Fatalf("model input event = %#v", events[0])
+	if events[2].Category != runtime.CategoryAudit || events[2].IdempotencyKey != "run:run-1:model-input:0" {
+		t.Fatalf("model input event = %#v", events[2])
 	}
 }
 

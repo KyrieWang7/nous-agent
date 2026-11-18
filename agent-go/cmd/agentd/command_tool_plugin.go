@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"sort"
 
 	commandplugin "github.com/KyrieWang7/nous-agent/agent-go/pkg/plugin"
@@ -31,15 +29,11 @@ func commandToolPlugins(contributions []commandplugin.Contribution) []runtimeplu
 	return plugins
 }
 
-func (p *commandToolPlugin) Name() string             { return "command-tools." + p.name }
-func (*commandToolPlugin) Dependencies() []string     { return nil }
-func (*commandToolPlugin) Stop(context.Context) error { return nil }
-func (p *commandToolPlugin) Start(_ context.Context, host runtimeplugin.Host) error {
-	if host.Tools == nil {
-		return errors.New("command tool plugin requires a tool registry")
-	}
+func (p *commandToolPlugin) Name() string   { return "command-tools." + p.name }
+func (*commandToolPlugin) Inject() []string { return []string{runtimeplugin.ToolService} }
+func (p *commandToolPlugin) Apply(ctx *runtimeplugin.Context) error {
 	for _, contribution := range p.contributions {
-		if err := host.Tools.Register(contribution.Definition); err != nil {
+		if err := ctx.RegisterTool(contribution.Definition); err != nil {
 			return err
 		}
 	}

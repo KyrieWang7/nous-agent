@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -21,7 +22,7 @@ import (
 	"github.com/ory/dockertest/v3"
 )
 
-const latestVersion = 12
+const latestVersion = 16
 
 func TestUpMigratesFreshDatabaseAndIsIdempotent(t *testing.T) {
 	databaseURL, db := startPostgres(t)
@@ -214,7 +215,7 @@ func TestPostgresApprovalFirstTerminalDecisionWinsAcrossManagers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := runtimepostgres.NewApprovalStore(db)
+	store, err := runtimepostgres.NewApprovalStore(testGORM(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +301,7 @@ func TestPostgresQuestionFirstTerminalAnswerWinsAcrossManagers(t *testing.T) {
 	if _, err := db.Exec(ctx, `INSERT INTO agent_run(id,thread_id,status) VALUES ('run-question-race','thread-question-race','running')`); err != nil {
 		t.Fatal(err)
 	}
-	store, err := runtimepostgres.NewQuestionStore(db)
+	store, err := runtimepostgres.NewQuestionStore(testGORM(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +373,7 @@ func TestPostgresProjectionSnapshotRoundTripAndMonotonicCursor(t *testing.T) {
 	if _, err := db.Exec(ctx, `INSERT INTO agent_run(id,thread_id,status) VALUES ('run-snapshot','thread-snapshot','running')`); err != nil {
 		t.Fatal(err)
 	}
-	store, err := runtimepostgres.NewSnapshotStore(db)
+	store, err := runtimepostgres.NewSnapshotStore(testGORM(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +414,7 @@ func TestPostgresRuntimeMetadataStoreOwnsExecutionState(t *testing.T) {
 	if _, err := db.Exec(ctx, `INSERT INTO agent_run(id,thread_id,status) VALUES ('run-runtime-metadata','thread-runtime-metadata','pending')`); err != nil {
 		t.Fatal(err)
 	}
-	store, err := runtimepostgres.NewMetadataStore(db)
+	store, err := runtimepostgres.NewMetadataStore(testGORM(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +469,7 @@ func TestPostgresMemoryStorePreservesCapabilityScope(t *testing.T) {
 	if _, err := db.Exec(ctx, `INSERT INTO agent_thread(id) VALUES ('thread-memory-store')`); err != nil {
 		t.Fatal(err)
 	}
-	store, err := runtimepostgres.NewMemoryStore(db)
+	store, err := runtimepostgres.NewMemoryStore(testGORM(t, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,9 +570,24 @@ func startPostgres(t *testing.T) (string, *pgxpool.Pool) {
 		}
 	})
 
-	databaseURL := fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%s/postgres?sslmode=disable", resource.GetPort("5432/tcp"))
+	var databaseURL string
 	var db *pgxpool.Pool
 	if err := pool.Retry(func() error {
+		// Docker Desktop may not publish a port mapping in the first container snapshot.
+		// Never let an empty test port fall back to a database on the developer's 5432.
+		container, err := pool.Client.InspectContainer(resource.Container.ID)
+		if err != nil {
+			return err
+		}
+		// Expire reads the original Resource from its timer goroutine.
+		// Inspect into a local copy instead of racing that cleanup owner.
+		current := *resource
+		current.Container = container
+		port := current.GetPort("5432/tcp")
+		if port == "" {
+			return fmt.Errorf("test PostgreSQL port is not published yet")
+		}
+		databaseURL = fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%s/postgres?sslmode=disable", port)
 		candidate, err := pgxpool.New(context.Background(), databaseURL)
 		if err != nil {
 			return err
@@ -618,4 +634,14 @@ func assertReceiptCount(t *testing.T, db *pgxpool.Pool, messageID int64, want in
 	if count != want {
 		t.Fatalf("receipt count for message %d = %d, want %d", messageID, count, want)
 	}
+}
+
+func testGORM(t *testing.T, pool *pgxpool.Pool) *platformdb.DB {
+	t.Helper()
+	db, err := platformdb.FromPool(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	return db
 }

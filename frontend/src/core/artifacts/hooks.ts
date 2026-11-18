@@ -24,14 +24,14 @@ export function useArtifactContent({
     }
     return null;
   }, [filepath, isWriteFile, thread]);
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["artifact", filepath, threadId],
-    queryFn: () => {
-      return loadArtifactContent({ filepath, threadId });
+    queryFn: ({ signal }) => {
+      return loadArtifactContent({ filepath, threadId, signal });
     },
     enabled,
     // Cache artifact content for 5 minutes to avoid repeated fetches (especially for .skill ZIP extraction)
     staleTime: 5 * 60 * 1000,
   });
-  return { content: isWriteFile ? content : data, isLoading, error };
+  return { content: isWriteFile ? content : data, isLoading, error, refetch };
 }

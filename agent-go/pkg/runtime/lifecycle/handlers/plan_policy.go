@@ -51,8 +51,12 @@ func (p *PlanPolicy) BeforeModel(_ context.Context, state *lifecycle.State) erro
 func (p *PlanPolicy) Evaluate(_ context.Context, _ string, state *lifecycle.State) (string, error) {
 	active, _ := state.Value("is_plan_mode")
 	if active == true {
+		// Match the DeepSeek/DeerFlow TodoMiddleware contract: plan mode does
+		// not make every turn a mandatory plan. Simple, conversational, or
+		// clarification requests may finish without creating a todo list.
+		// Once todos exist, however, the plan review gate remains strict.
 		if !hasAnyTodos(state) {
-			return "plan mode requires a structured task list; call write_todos, then submit the complete plan with exit_plan_mode", nil
+			return "", nil
 		}
 		return "plan mode is still active; submit the complete plan with exit_plan_mode and wait for user approval before executing it", nil
 	}

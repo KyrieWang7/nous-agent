@@ -16,10 +16,11 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/hooks"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/loop"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/delegation"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
+	"github.com/google/uuid"
 )
 
 type Definition struct {
@@ -45,13 +46,15 @@ type PreparedRunnerFactory func(Definition, []string) (PreparedRunner, error)
 // settings). RunnerFactory remains supported for fixed-runner embedders.
 type ContextRunnerFactory func(context.Context, Definition, []string, DispatchRequest) (*loop.Runner, error)
 type DispatchRequest struct {
-	SubagentType  string
-	Description   string
-	Name          string
-	MaxTurns      int
-	Prompt        string
-	RestrictTools []string
-	ToolCallID    string
+	ResumeSessionID string
+	Provider        string // spawn (default) or fork; independent of the agent profile.
+	SubagentType    string
+	Description     string
+	Name            string
+	MaxTurns        int
+	Prompt          string
+	RestrictTools   []string
+	ToolCallID      string
 }
 
 // DispatchLifecycle lets an optional coordinator attach trusted state to a
@@ -66,25 +69,8 @@ type DispatchLifecycle interface {
 // The model cannot supply a timeout; application assembly may choose distinct
 // limits for ordinary subagents and Swarm teammates.
 type TimeoutResolver func(runtime.RunContext, DispatchRequest) time.Duration
-type Result struct {
-	TaskID       string `json:"task_id"`
-	SubagentType string `json:"subagent_type"`
-	Status       string `json:"status"`
-	Output       string `json:"output,omitempty"`
-	Error        string `json:"error,omitempty"`
-	// CoordinationError describes a failure after the child execution reached
-	// its terminal state (for example a Swarm announcement transaction). It is
-	// deliberately separate from Error so consumers never mistake a completed
-	// piece of work for a failed model execution.
-	CoordinationError string      `json:"coordination_error,omitempty"`
-	Usage             model.Usage `json:"usage"`
-	StartedAt         time.Time   `json:"started_at"`
-	CompletedAt       *time.Time  `json:"completed_at,omitempty"`
-}
-type TaskStore interface {
-	Put(context.Context, Result, time.Duration) error
-	Get(context.Context, string) (Result, error)
-}
+type Result = delegation.Result
+type TaskStore = delegation.TaskStore
 type Manager struct {
 	mu              sync.RWMutex
 	defs            map[string]Definition
@@ -93,12 +79,20 @@ type Manager struct {
 	contextFactory  ContextRunnerFactory
 	store           TaskStore
 	ttl             time.Duration
-	sem             chan struct{}
+	concurrency     int
+	slotMu          sync.Mutex
+	slots           map[string]*parentSlots
 	lifecycle       DispatchLifecycle
 	timeout         TimeoutResolver
 	hooks           *hooks.Runner
 	stateMu         sync.Mutex
 	stateWaits      map[*runtime.RunStateMachine]subagentStateWait
+	ownershipMu     sync.Mutex
+	active          map[string]*execution
+	closed          bool
+	closeOnce       sync.Once
+	closeDone       chan struct{}
+	closeErr        error
 }
 
 type subagentStateWait struct {
@@ -147,7 +141,7 @@ func newManager(factory RunnerFactory, contextFactory ContextRunnerFactory, stor
 	if len(maxConcurrent) > 0 && maxConcurrent[0] > 0 {
 		limit = maxConcurrent[0]
 	}
-	return &Manager{defs: map[string]Definition{}, factory: factory, contextFactory: contextFactory, store: store, ttl: ttl, sem: make(chan struct{}, limit), stateWaits: make(map[*runtime.RunStateMachine]subagentStateWait)}
+	return &Manager{defs: map[string]Definition{}, factory: factory, contextFactory: contextFactory, store: store, ttl: ttl, concurrency: limit, slots: make(map[string]*parentSlots), stateWaits: make(map[*runtime.RunStateMachine]subagentStateWait), active: make(map[string]*execution), closeDone: make(chan struct{})}
 }
 func (m *Manager) Register(d Definition) error {
 	if d.Name == "" || d.Description == "" {
@@ -161,6 +155,7 @@ func (m *Manager) Register(d Definition) error {
 	if _, ok := m.defs[d.Name]; ok {
 		return fmt.Errorf("subagent: %q already registered", d.Name)
 	}
+	d.AllowedTools = append([]string(nil), d.AllowedTools...)
 	m.defs[d.Name] = d
 	return nil
 }
@@ -169,29 +164,49 @@ func (m *Manager) Definitions() []Definition {
 	defer m.mu.RUnlock()
 	out := make([]Definition, 0, len(m.defs))
 	for _, d := range m.defs {
+		d.AllowedTools = append([]string(nil), d.AllowedTools...)
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 func (m *Manager) Dispatch(ctx context.Context, req DispatchRequest) (Result, error) {
+	req.RestrictTools = append([]string(nil), req.RestrictTools...)
 	taskID := strings.TrimSpace(req.ToolCallID)
 	if taskID == "" {
 		taskID = newTaskID()
 	}
-	result, err := m.dispatch(ctx, req, taskID)
+	ctx, handle, err := m.accept(ctx, req, taskID, false)
+	if err != nil {
+		return Result{}, err
+	}
+	defer m.releaseExecution(handle)
+	result, err := m.execute(ctx, req, taskID, true)
+	handle.coordinationError = result.CoordinationError
+	return result, err
+}
+
+func (m *Manager) execute(ctx context.Context, req DispatchRequest, taskID string, waitParent bool) (Result, error) {
+	result, err := m.dispatch(ctx, req, taskID, waitParent)
 	if err != nil && result.TaskID == "" {
 		return m.recordEarlyFailure(ctx, req, taskID, err)
 	}
 	return result, err
 }
 
-func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID string) (result Result, err error) {
-	select {
-	case m.sem <- struct{}{}:
-		defer func() { <-m.sem }()
-	case <-ctx.Done():
-		return Result{}, ctx.Err()
+func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID string, waitParent bool) (result Result, err error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	previous, resumeErr := m.loadResume(ctx, &req)
+	if resumeErr != nil {
+		return Result{}, resumeErr
+	}
+	if req.Provider == "" {
+		req.Provider = "spawn"
+	}
+	if req.Provider != "spawn" && req.Provider != "fork" {
+		return Result{}, fmt.Errorf("subagent: unknown provider %q", req.Provider)
 	}
 	agentName := strings.TrimSpace(req.SubagentType)
 	if agentName == "" {
@@ -203,6 +218,7 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	if !ok {
 		return Result{}, fmt.Errorf("subagent: unknown subagent type %q", agentName)
 	}
+	def.AllowedTools = append([]string(nil), def.AllowedTools...)
 	if req.MaxTurns > 0 {
 		if req.MaxTurns > def.MaxTurns {
 			return Result{}, fmt.Errorf("subagent: max_turns %d exceeds the trusted limit %d for %q", req.MaxTurns, def.MaxTurns, def.Name)
@@ -231,22 +247,34 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	if parent.MaxRecursionDepth > 0 && parent.AgentDepth >= parent.MaxRecursionDepth {
 		return Result{}, fmt.Errorf("subagent: maximum recursion depth %d reached", parent.MaxRecursionDepth)
 	}
+	releaseSlot, err := m.acquireParentSlot(ctx, parent)
+	if err != nil {
+		return Result{}, err
+	}
+	defer releaseSlot()
 	if err := parent.Budget.Charge(runtime.BudgetAmount{Subagents: 1}); err != nil {
 		if errors.Is(err, runtime.ErrBudgetExceeded) {
 			return Result{}, fmt.Errorf("subagent: %w", loop.ErrBudgetExhausted)
 		}
 		return Result{}, fmt.Errorf("subagent: charging budget: %w", err)
 	}
-	if m.timeout != nil {
-		if timeout := m.timeout(parent, req); timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
-		}
-	}
 	allowed, err := restrict(def.AllowedTools, parent.AllowedTools, req.RestrictTools)
 	if err != nil {
 		return Result{}, err
+	}
+	if previous != nil {
+		// Continuations inherit the original ceiling and can only narrow it.
+		previousTools := set(previous.AllowedTools)
+		narrowed := make([]string, 0, len(allowed))
+		for _, name := range allowed {
+			if previousTools[name] {
+				narrowed = append(narrowed, name)
+			}
+		}
+		allowed = narrowed
+		if previous.MaxTurns < def.MaxTurns {
+			def.MaxTurns = previous.MaxTurns
+		}
 	}
 	if m.factory == nil && m.preparedFactory == nil && m.contextFactory == nil {
 		return Result{}, errors.New("subagent: runner factory is nil")
@@ -263,13 +291,15 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	} else {
 		runner, err = m.factory(def, allowed)
 	}
-	if err != nil {
-		return Result{}, err
-	}
 	if releaseRunner != nil {
 		release := releaseRunner
 		released := false
-		releaseRunner = func() error {
+		releaseRunner = func() (releaseErr error) {
+			defer func() {
+				if p := recover(); p != nil {
+					releaseErr = fmt.Errorf("subagent: runner cleanup panicked: %v", p)
+				}
+			}()
 			if released {
 				return nil
 			}
@@ -283,11 +313,19 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 			err = errors.Join(err, releaseRunner())
 		}()
 	}
-	restoreState, err := m.beginSubagentWait(parent.StateMachine)
 	if err != nil {
 		return Result{}, err
 	}
-	defer restoreState()
+	if runner == nil {
+		return Result{}, errors.New("subagent: factory returned no runner")
+	}
+	if waitParent {
+		restoreState, waitErr := m.beginSubagentWait(parent.StateMachine)
+		if waitErr != nil {
+			return Result{}, waitErr
+		}
+		defer restoreState()
+	}
 	if err := m.runStartHook(ctx, parent, taskID, def.Name); err != nil {
 		return Result{}, err
 	}
@@ -297,7 +335,7 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	}
 	trustedBudget := childContext.Budget
 	if m.lifecycle != nil {
-		childContext, err = m.lifecycle.Start(ctx, parent, taskID, req)
+		childContext, err = startLifecycle(m.lifecycle, ctx, parent, taskID, req)
 		if err != nil {
 			return Result{}, fmt.Errorf("subagent: starting lifecycle for %q: %w", def.Name, err)
 		}
@@ -321,36 +359,46 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 		return Result{}, fmt.Errorf("subagent: starting child run state: %w", err)
 	}
 	persistCtx := context.WithoutCancel(ctx)
-	result = Result{TaskID: taskID, SubagentType: def.Name, Status: "running", StartedAt: time.Now().UTC()}
-	description := taskDescription(req, def.Description)
-	publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
-		"task_id":       result.TaskID,
-		"subagent_type": def.Name,
-		"description":   description,
-	})
-	if err := m.store.Put(persistCtx, result, m.ttl); err != nil {
-		result.Status = "failed"
-		runErr := fmt.Errorf("persisting running task: %w", err)
-		result.Error = runErr.Error()
-		completed := time.Now().UTC()
-		result.CompletedAt = &completed
-		runErr = releaseChildRunner(releaseRunner, &result, runErr)
-		runErr = m.finishLifecycle(persistCtx, parent, childContext, req, &result, runErr)
-		runErr = m.persistTerminal(persistCtx, &result, runErr)
-		m.runEndHook(persistCtx, parent, result)
-		publish(persistCtx, parent, runtime.EventSubagentResult, result)
-		return result, runErr
-	}
+	result = Result{Description: taskDescription(req, def.Description), TaskID: taskID, ParentRunID: parent.RunID, ThreadID: parent.ThreadID, RunID: childContext.RunID, Provider: req.Provider, SubagentType: def.Name, Status: "running", StartedAt: time.Now().UTC()}
 	history := message.NewHistory()
+	if previous != nil {
+		history.Load(message.CloneAll(previous.History))
+	} else if req.Provider == "fork" {
+		history.Load(message.CloneAll(parent.DelegationHistory))
+	}
+	ctx, session, sessionErr := m.openSession(ctx, parent, &result, def, allowed, history, previous)
+	if sessionErr != nil {
+		return Result{}, sessionErr
+	}
+	childContext.SubagentSessionID = result.SessionID
+	if session != nil {
+		childContext.PersistValues = session.persistValues
+		delete(childContext.Values, "todos")
+		if previous != nil {
+			for key, value := range previous.State {
+				childContext.Values[key] = cloneValue(value)
+			}
+		}
+	}
+	// Both the initial record and start event must commit before model/tool work.
+	startErr := m.putTask(persistCtx, result)
+	if startErr == nil {
+		startErr = publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
+			"task_id": result.TaskID, "session_id": result.SessionID, "subagent_type": def.Name, "parent_run_id": parent.RunID,
+			"description": taskDescription(req, def.Description), "provider": req.Provider,
+		})
+	}
 	childJournal := parent.Journal.Child()
 	childContext.Journal = childJournal
 	ctx = runtime.WithRunContext(ctx, childContext)
 	var runResult *loop.Result
 	var runErr error
-	if err := ctx.Err(); err != nil {
+	if startErr != nil {
+		runErr = fmt.Errorf("subagent: persisting start: %w", startErr)
+	} else if err := ctx.Err(); err != nil {
 		runErr = fmt.Errorf("subagent: context ended before %q started: %w", def.Name, err)
 	} else {
-		runResult, runErr = runChild(ctx, runner, loop.Request{ThreadID: parent.ThreadID, RunID: childContext.RunID, AssistantID: def.Name, SystemPrompt: def.SystemPrompt, History: history, Prompt: req.Prompt, Values: cloneValues(childContext.Values)})
+		runResult, runErr = runChild(ctx, runner, loop.Request{ThreadID: parent.ThreadID, RunID: childContext.RunID, AssistantID: def.Name, SystemPrompt: def.SystemPrompt, History: history, Prompt: req.Prompt, Values: cloneValues(childContext.Values), Checkpoint: session.checkpoint, PullInputs: session.pullInputs})
 		if runErr != nil {
 			runErr = fmt.Errorf("subagent: running %q: %w", def.Name, runErr)
 		}
@@ -360,15 +408,18 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	if runResult != nil {
 		result.Usage = runResult.Usage
 	}
+	result.Output = finalAssistantOutput(history.Since(0))
+	if runResult != nil && runResult.Output != "" {
+		result.Output = runResult.Output
+	}
+	result.StopReason, runErr = childStopReason(runResult, runErr)
 	if runErr != nil {
 		result.Status = failureStatus(runErr)
 		result.Error = runErr.Error()
 	} else {
 		result.Status = "completed"
-		if runResult != nil {
-			result.Output = runResult.Output
-		}
 	}
+
 	runErr = releaseChildRunner(releaseRunner, &result, runErr)
 	if parent.Journal != nil {
 		if childJournal.Totals().LLMCalls == 0 && runResult != nil && runResult.Usage.TotalTokens() > 0 {
@@ -385,9 +436,20 @@ func (m *Manager) dispatch(ctx context.Context, req DispatchRequest, taskID stri
 	// authoritative outcome, never a provisional success that can be revoked
 	// after an async status poll has already consumed it.
 	runErr = m.finishLifecycle(persistCtx, parent, childContext, req, &result, runErr)
+	persistedCoordination := result.CoordinationError
 	runErr = m.persistTerminal(persistCtx, &result, runErr)
 	m.runEndHook(persistCtx, parent, result)
-	publish(persistCtx, parent, runtime.EventSubagentResult, result)
+	if publishErr := publish(persistCtx, parent, runtime.EventSubagentResult, result); publishErr != nil {
+		result.CoordinationError = joinErrorText(result.CoordinationError, publishErr)
+		runErr = errors.Join(runErr, publishErr)
+	}
+	if sessionErr := session.finish(persistCtx, &result, history.All()); sessionErr != nil {
+		result.CoordinationError = joinErrorText(result.CoordinationError, sessionErr)
+		runErr = errors.Join(runErr, sessionErr)
+	}
+	if result.CoordinationError != persistedCoordination {
+		runErr = m.persistTerminal(persistCtx, &result, runErr)
+	}
 	return result, runErr
 }
 
@@ -448,7 +510,7 @@ func (m *Manager) finishLifecycle(ctx context.Context, parent, child runtime.Run
 	if m.lifecycle == nil {
 		return cause
 	}
-	if err := m.lifecycle.Finish(ctx, parent, child, req, *result); err != nil {
+	if err := finishLifecycle(m.lifecycle, ctx, parent, child, req, *result); err != nil {
 		coordinationErr := fmt.Errorf("finalizing subagent lifecycle: %w", err)
 		result.CoordinationError = joinErrorText(result.CoordinationError, coordinationErr)
 		cause = errors.Join(cause, coordinationErr)
@@ -456,8 +518,25 @@ func (m *Manager) finishLifecycle(ctx context.Context, parent, child runtime.Run
 	return cause
 }
 
+func startLifecycle(lifecycle DispatchLifecycle, ctx context.Context, parent runtime.RunContext, id string, req DispatchRequest) (child runtime.RunContext, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("subagent lifecycle start panicked: %v", p)
+		}
+	}()
+	return lifecycle.Start(ctx, parent, id, req)
+}
+func finishLifecycle(lifecycle DispatchLifecycle, ctx context.Context, parent, child runtime.RunContext, req DispatchRequest, result Result) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("subagent lifecycle finish panicked: %v", p)
+		}
+	}()
+	return lifecycle.Finish(ctx, parent, child, req, result)
+}
+
 func (m *Manager) persistTerminal(ctx context.Context, result *Result, cause error) error {
-	if err := m.store.Put(ctx, *result, m.ttl); err == nil {
+	if err := m.putTask(ctx, *result); err == nil {
 		return cause
 	} else {
 		cause = errors.Join(cause, fmt.Errorf("persisting terminal task: %w", err))
@@ -465,7 +544,7 @@ func (m *Manager) persistTerminal(ctx context.Context, result *Result, cause err
 
 	result.Status = message.SubagentFailed
 	result.Error = cause.Error()
-	if err := m.store.Put(ctx, *result, m.ttl); err != nil {
+	if err := m.putTask(ctx, *result); err != nil {
 		cause = errors.Join(cause, fmt.Errorf("persisting final task state: %w", err))
 		result.Error = cause.Error()
 	}
@@ -534,7 +613,10 @@ func releaseChildRunner(release func() error, result *Result, cause error) error
 	return errors.Join(cause, releaseErr)
 }
 
+// DispatchAsync transfers accepted work to the parent execution owner, rather
+// than detaching cancellation. Close and Interrupt cancel and drain that work.
 func (m *Manager) DispatchAsync(ctx context.Context, req DispatchRequest) (string, error) {
+	req.RestrictTools = append([]string(nil), req.RestrictTools...)
 	if strings.TrimSpace(req.SubagentType) == "" {
 		return "", errors.New("subagent: subagent_type is required")
 	}
@@ -546,16 +628,19 @@ func (m *Manager) DispatchAsync(ctx context.Context, req DispatchRequest) (strin
 	if id == "" {
 		id = newTaskID()
 	}
-	initial := Result{TaskID: id, SubagentType: strings.TrimSpace(req.SubagentType), Status: "pending", StartedAt: time.Now().UTC()}
-	if err := m.store.Put(context.WithoutCancel(ctx), initial, m.ttl); err != nil {
+	owned, handle, err := m.accept(ctx, req, id, true)
+	if err != nil {
 		return "", err
 	}
-	detached := context.WithoutCancel(ctx)
+	initial := Result{TaskID: id, ParentRunID: parent.RunID, ThreadID: parent.ThreadID, SubagentType: strings.TrimSpace(req.SubagentType), Status: "pending", StartedAt: time.Now().UTC()}
+	if err := m.putTask(context.WithoutCancel(ctx), initial); err != nil {
+		m.releaseExecution(handle)
+		return "", err
+	}
 	go func() {
-		res, err := m.dispatch(detached, req, id)
-		if err != nil && res.TaskID == "" {
-			_, _ = m.recordEarlyFailure(detached, req, id, err)
-		}
+		defer m.releaseExecution(handle)
+		result, _ := m.execute(owned, req, id, false)
+		handle.coordinationError = result.CoordinationError
 	}()
 	return id, nil
 }
@@ -567,15 +652,23 @@ func (m *Manager) recordEarlyFailure(ctx context.Context, req DispatchRequest, t
 		Error: cause.Error(), StartedAt: now, CompletedAt: &now,
 	}
 	parent, _ := runtime.RunContextFrom(ctx)
+	result.ParentRunID, result.ThreadID, result.Provider = parent.RunID, parent.ThreadID, req.Provider
+	result.StopReason = "error"
+	if errors.Is(cause, context.Canceled) {
+		result.StopReason = "aborted"
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		result.StopReason = "timed-out"
+	}
 	persistCtx := context.WithoutCancel(ctx)
-	publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
+	cause = errors.Join(cause, publish(persistCtx, parent, runtime.EventSubagentStart, map[string]any{
 		"task_id":       taskID,
 		"subagent_type": result.SubagentType,
 		"description":   taskDescription(req, result.SubagentType),
-	})
+	}))
 	cause = m.persistTerminal(persistCtx, &result, cause)
 	m.runEndHook(persistCtx, parent, result)
-	publish(persistCtx, parent, runtime.EventSubagentResult, result)
+	cause = errors.Join(cause, publish(persistCtx, parent, runtime.EventSubagentResult, result))
 	return result, cause
 }
 
@@ -588,7 +681,7 @@ func taskDescription(req DispatchRequest, fallback string) string {
 }
 
 func (m *Manager) TaskStatus(ctx context.Context, id string) (Result, error) {
-	return m.store.Get(ctx, id)
+	return m.taskStatus(ctx, id)
 }
 
 func restrict(base, parent, requested []string) ([]string, error) {
@@ -601,7 +694,7 @@ func restrict(base, parent, requested []string) ([]string, error) {
 		}
 	}
 	for n := range baseSet {
-		if len(parentSet) == 0 || parentSet[n] {
+		if parentSet[n] {
 			allowed = append(allowed, n)
 		}
 	}
@@ -624,15 +717,17 @@ func set(in []string) map[string]bool {
 	}
 	return m
 }
-func publish(ctx context.Context, p runtime.RunContext, t runtime.EventType, data any) {
+func publish(ctx context.Context, p runtime.RunContext, t runtime.EventType, data any) error {
 	e := runtime.MustEvent(p.EventStreamRunID(), p.ThreadID, t, data)
 	if p.Publish != nil {
-		_, _ = p.Publish(ctx, e)
+		_, err := p.Publish(ctx, e)
+		return err
 	} else if p.Bus != nil {
 		p.Bus.Publish(ctx, e)
 	}
+	return nil
 }
-func newTaskID() string { return fmt.Sprintf("task-%d", time.Now().UnixNano()) }
+func newTaskID() string { return "task-" + uuid.NewString() }
 
 func nestedRunID(parentRunID, taskID string) string {
 	if strings.TrimSpace(parentRunID) == "" {
@@ -656,6 +751,7 @@ func cloneRunContext(parent runtime.RunContext) (runtime.RunContext, error) {
 	child.AllowedTools = append([]string(nil), parent.AllowedTools...)
 	child.AllowedCapabilities = append([]string(nil), parent.AllowedCapabilities...)
 	child.Values = cloneValues(parent.Values)
+	child.DelegationHistory = message.CloneAll(parent.DelegationHistory)
 	if child.Values == nil {
 		child.Values = make(map[string]any)
 	}
@@ -717,22 +813,21 @@ func cloneValues(in map[string]any) map[string]any {
 	if in == nil {
 		return nil
 	}
-	out := make(map[string]any, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
+	return cloneValueMap(in)
 }
 
 func (m *Manager) TaskTool() tool.Definition {
-	return tool.Definition{Name: "task", Group: "subagent", Description: "Delegate a bounded task to a specialized subagent and wait for its terminal result.", Parameters: json.RawMessage(`{"type":"object","properties":{"description":{"type":"string","description":"Short description shown in the task card."},"prompt":{"type":"string"},"subagent_type":{"type":"string","description":"Registered subagent type."},"name":{"type":"string","description":"Optional teammate name in swarm mode."},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}}},"required":["description","prompt","subagent_type"]}`), Metadata: tool.Metadata{IsAgentState: true, IsConcurrencySafe: true}, Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
+	return tool.Definition{Name: "task", Group: "subagent", Description: "Delegate a bounded task to a specialized child session; wait for its result or run it as supervised background work.", Parameters: json.RawMessage(`{"type":"object","properties":{"session_id":{"type":"string","description":"Continue a previously returned child session; profile and tool ceiling remain fixed."},"background":{"type":"boolean","description":"Run concurrently under this parent turn; use subagent_control to wait or interrupt."},"description":{"type":"string","description":"Short description shown in the task card."},"prompt":{"type":"string"},"subagent_type":{"type":"string","description":"Registered subagent type."},"provider":{"type":"string","enum":["spawn","fork"],"description":"spawn starts fresh; fork inherits only completed parent turns."},"name":{"type":"string","description":"Optional teammate name in swarm mode."},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}}},"required":["description","prompt","subagent_type"]}`), Metadata: tool.Metadata{IsAgentState: true, IsConcurrencySafe: true}, Handler: func(ctx context.Context, call tool.Call) (*tool.Result, error) {
 		var args struct {
-			Description  string   `json:"description"`
-			Prompt       string   `json:"prompt"`
-			SubagentType string   `json:"subagent_type"`
-			Name         string   `json:"name"`
-			MaxTurns     int      `json:"max_turns"`
-			Restrict     []string `json:"restrict_tools"`
+			ResumeSessionID string   `json:"session_id"`
+			Background      bool     `json:"background"`
+			Provider        string   `json:"provider"`
+			Description     string   `json:"description"`
+			Prompt          string   `json:"prompt"`
+			SubagentType    string   `json:"subagent_type"`
+			Name            string   `json:"name"`
+			MaxTurns        int      `json:"max_turns"`
+			Restrict        []string `json:"restrict_tools"`
 		}
 		decoder := json.NewDecoder(bytes.NewReader(call.Args))
 		decoder.DisallowUnknownFields()
@@ -756,12 +851,30 @@ func (m *Manager) TaskTool() tool.Definition {
 		if description == "" {
 			return taskFailure("missing required field description"), nil
 		}
-		req := DispatchRequest{SubagentType: agentName, Description: description, Name: strings.TrimSpace(args.Name), MaxTurns: args.MaxTurns, Prompt: args.Prompt, RestrictTools: args.Restrict, ToolCallID: call.ID}
+		m.mu.RLock()
+		profile, registered := m.defs[agentName]
+		m.mu.RUnlock()
+		if registered && args.MaxTurns > profile.MaxTurns {
+			return taskFailure(fmt.Sprintf("subagent: max_turns %d exceeds the trusted limit %d for %q", args.MaxTurns, profile.MaxTurns, agentName)), nil
+		}
+		req := DispatchRequest{ResumeSessionID: args.ResumeSessionID, Provider: args.Provider, SubagentType: agentName, Description: description, Name: strings.TrimSpace(args.Name), MaxTurns: args.MaxTurns, Prompt: args.Prompt, RestrictTools: args.Restrict, ToolCallID: call.ID}
+		if args.Background {
+			id, err := m.DispatchAsync(ctx, req)
+			if err != nil {
+				return taskFailure(err.Error()), nil
+			}
+			return &tool.Result{Content: "Task accepted: " + id + ". Use subagent_control to wait; leaving this parent turn cancels unfinished children.", AdditionalKwargs: map[string]any{"subagent_state": "pending", "subagent_task_id": id}}, nil
+		}
 		res, err := m.Dispatch(ctx, req)
 		if err != nil {
 			return taskFailureFromResult(res, err), nil
 		}
-		return taskSuccess(res.Output), nil
+		result := taskSuccess(res.Output)
+		result.Content += "\nSession ID: " + res.SessionID
+		result.AdditionalKwargs["subagent_session_id"] = res.SessionID
+		result.AdditionalKwargs["subagent_provider"] = res.Provider
+		result.AdditionalKwargs["subagent_stop_reason"] = res.StopReason
+		return result, nil
 	}}
 }
 
@@ -786,7 +899,21 @@ func failureStatus(err error) string {
 	}
 }
 
-func taskFailureFromResult(res Result, err error) *tool.Result {
+func taskFailureFromResult(res Result, err error) (failure *tool.Result) {
+	defer func() {
+		if failure == nil {
+			return
+		}
+		if res.SessionID != "" {
+			failure.AdditionalKwargs["subagent_session_id"] = res.SessionID
+		}
+		if res.StopReason != "" {
+			failure.AdditionalKwargs["subagent_stop_reason"] = res.StopReason
+		}
+		if res.Output != "" && res.Status != message.SubagentCompleted {
+			failure.Content += "\nPartial result: " + res.Output
+		}
+	}()
 	errText := dispatchError(res, err)
 	if res.Status == message.SubagentCompleted && res.CoordinationError != "" {
 		// The child completed successfully, but the coordinator could not make
@@ -842,16 +969,35 @@ type MemoryTaskStore struct {
 func NewMemoryTaskStore() *MemoryTaskStore { return &MemoryTaskStore{tasks: map[string]Result{}} }
 func (s *MemoryTaskStore) Put(_ context.Context, r Result, _ time.Duration) error {
 	s.mu.Lock()
-	s.tasks[r.TaskID] = r
+	s.tasks[r.ThreadID+"\x00"+r.ParentRunID+"\x00"+r.TaskID] = r
 	s.mu.Unlock()
 	return nil
 }
 func (s *MemoryTaskStore) Get(_ context.Context, id string) (Result, error) {
 	s.mu.RLock()
-	r, ok := s.tasks[id]
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
+	var result Result
+	found := false
+	for _, r := range s.tasks {
+		if r.TaskID == id {
+			if found {
+				return Result{}, errors.New("ambiguous task ID")
+			}
+			result = r
+			found = true
+		}
+	}
+	if !found {
+		return Result{}, delegation.ErrNotFound
+	}
+	return result, nil
+}
+func (s *MemoryTaskStore) GetScoped(_ context.Context, thread, parent, id string) (Result, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.tasks[thread+"\x00"+parent+"\x00"+id]
 	if !ok {
-		return Result{}, fmt.Errorf("subagent: task %q not found", id)
+		return Result{}, delegation.ErrNotFound
 	}
 	return r, nil
 }

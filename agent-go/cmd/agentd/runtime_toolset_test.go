@@ -207,13 +207,14 @@ func TestRestrictedToolSetGivesSwarmTeammatesWorkToolsWithoutNestedOrchestration
 	}
 }
 
-func TestRestrictedToolSetInheritedProfileExcludesChildControlTools(t *testing.T) {
+func TestRestrictedToolSetInheritedProfileAllowsBoundedDelegation(t *testing.T) {
 	registry := tool.NewRegistry()
 	for _, definition := range []tool.Definition{
 		testTool("ask_clarification", "interaction", true),
 		testTool("present_files", "interaction", true),
 		testTool("read_file", "file:read", true),
 		testTool("task", "subagent", true),
+		testTool("subagent_control", "subagent", true),
 		testTool("write_file", "file:write", false),
 	} {
 		if err := registry.Register(definition); err != nil {
@@ -231,10 +232,23 @@ func TestRestrictedToolSetInheritedProfileExcludesChildControlTools(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"read_file", "write_file"}
+	want := []string{"read_file", "subagent_control", "task", "write_file"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
+	ctx := policyContext(t, policy)
+	run, _ := runtime.RunContextFrom(ctx)
+	run.AgentDepth = 2
+	run.MaxRecursionDepth = 2
+	ctx = runtime.WithRunContext(ctx, run)
+	got, _, err = resolver.Resolve(ctx, lifecycle.NewState(lifecycle.StateInit{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"read_file", "subagent_control", "write_file"}) {
+		t.Fatalf("at depth ceiling tools=%v", got)
+	}
+
 }
 
 func assertTools(t *testing.T, ctx context.Context, resolver runtimeToolSet, values map[string]any, want []string) {

@@ -1,4 +1,4 @@
-.PHONY: check test race lint fmt fmt-check tidy-check coverage layer-check build migrate
+.PHONY: check test race lint fmt fmt-check tidy-check coverage layer-check gateway-layer-check build migrate
 
 # 默认门禁：离线、无网络、无 API key，与 CI 一致
 check: fmt-check tidy-check lint layer-check test
@@ -26,6 +26,10 @@ coverage:
 
 layer-check:
 	go run ./internal/tools/layercheck
+	go run ./internal/tools/layercheck -dir ../gateway-go
+
+gateway-layer-check:
+	go run ./internal/tools/layercheck -dir ../gateway-go
 
 build:
 	go build ./...

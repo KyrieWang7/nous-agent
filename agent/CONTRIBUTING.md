@@ -1,5 +1,8 @@
 # Contributing to DeerFlow Backend
 
+> 历史文档：旧 Python `gateway/` 已删除。当前 Gateway 使用仓库根目录的 `gateway-go/`；下文 Python Gateway 路径和示例仅保留为历史记录。
+
+
 Thank you for your interest in contributing to DeerFlow! This document provides guidelines and instructions for contributing to the backend codebase.
 
 ## Table of Contents

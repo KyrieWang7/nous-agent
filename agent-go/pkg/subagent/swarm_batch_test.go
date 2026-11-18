@@ -21,7 +21,7 @@ func TestSwarmBatchDispatchesWorkersConcurrentlyAndPreservesOrder(t *testing.T) 
 	manager := NewManagerWithContextFactory(func(_ context.Context, _ Definition, _ []string, req DispatchRequest) (*loop.Runner, error) {
 		ready <- struct{}{}
 		<-release
-		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done-" + req.Name))})
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done-" + req.Name))}) //nolint:contextcheck // assembly accepts no request context
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +69,7 @@ func TestSwarmBatchReportsPartialFailureAndRunsReviewer(t *testing.T) {
 			reviewPrompt = req.Prompt
 			mu.Unlock()
 		}
-		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done-" + req.Name))})
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("done-" + req.Name))}) //nolint:contextcheck // assembly accepts no request context
 		if err != nil {
 			return nil, err
 		}

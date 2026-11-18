@@ -6,17 +6,17 @@ interface GenericMessageGroup<T = string> {
   messages: Message[];
 }
 
-interface HumanMessageGroup extends GenericMessageGroup<"human"> { }
+interface HumanMessageGroup extends GenericMessageGroup<"human"> {}
 
-interface AssistantProcessingGroup extends GenericMessageGroup<"assistant:processing"> { }
+interface AssistantProcessingGroup extends GenericMessageGroup<"assistant:processing"> {}
 
-interface AssistantMessageGroup extends GenericMessageGroup<"assistant"> { }
+interface AssistantMessageGroup extends GenericMessageGroup<"assistant"> {}
 
-interface AssistantPresentFilesGroup extends GenericMessageGroup<"assistant:present-files"> { }
+interface AssistantPresentFilesGroup extends GenericMessageGroup<"assistant:present-files"> {}
 
-interface AssistantClarificationGroup extends GenericMessageGroup<"assistant:clarification"> { }
+interface AssistantClarificationGroup extends GenericMessageGroup<"assistant:clarification"> {}
 
-interface AssistantSubagentGroup extends GenericMessageGroup<"assistant:subagent"> { }
+interface AssistantSubagentGroup extends GenericMessageGroup<"assistant:subagent"> {}
 
 type MessageGroup =
   | HumanMessageGroup
@@ -84,14 +84,20 @@ export function groupMessages<T>(
       }
     } else if (message.type === "ai") {
       const msgId = message.id ?? crypto.randomUUID();
-      if (hasReasoning(message) || hasToolCalls(message) || hasToolPreparations(message)) {
+      if (
+        hasReasoning(message) ||
+        hasToolCalls(message) ||
+        hasToolPreparations(message)
+      ) {
         if (hasPresentFiles(message)) {
+          activeProcessingGroup = null;
           groups.push({
             id: msgId,
             type: "assistant:present-files",
             messages: [message],
           });
         } else if (hasSubagent(message)) {
+          activeProcessingGroup = null;
           groups.push({
             id: msgId,
             type: "assistant:subagent",
@@ -109,7 +115,11 @@ export function groupMessages<T>(
           activeProcessingGroup.messages.push(message);
         }
       }
-      if (hasContent(message) && !hasToolCalls(message) && !hasToolPreparations(message)) {
+      if (
+        hasContent(message) &&
+        !hasToolCalls(message) &&
+        !hasToolPreparations(message)
+      ) {
         groups.push({
           id: msgId + ":content",
           type: "assistant",
@@ -154,7 +164,7 @@ export function extractContentFromMessage(message: Message) {
             return content.text;
           case "image_url":
             const imageURL = extractURLFromImageURLContent(content.image_url);
-            // Hide Base64 data URIs from the markdown text to prevent UI lag. 
+            // Hide Base64 data URIs from the markdown text to prevent UI lag.
             // The image is already visible via the <uploaded_files> visual card.
             if (imageURL.startsWith("data:")) {
               return "";
@@ -191,8 +201,8 @@ export function extractURLFromImageURLContent(
   content:
     | string
     | {
-      url: string;
-    },
+        url: string;
+      },
 ) {
   if (typeof content === "string") {
     return content;

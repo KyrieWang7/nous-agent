@@ -10,13 +10,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/model"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/scope"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
 
@@ -94,6 +93,10 @@ type Config struct {
 
 // Request 是一次 run 的输入。
 type Request struct {
+	PullInputs func(context.Context) ([]message.Message, func(context.Context, []message.Message) error, error)
+	// Checkpoint persists admitted input, assistant tool intent and settled step
+	// history. A failed write prevents subsequent model/tool work.
+	Checkpoint   func(context.Context, []message.Message) error
 	ThreadID     string
 	RunID        string
 	AssistantID  string
@@ -119,6 +122,8 @@ type Result struct {
 
 	Response   *model.Response
 	StopReason string
+	// EndReason is the turn outcome, independent of the provider finish reason.
+	EndReason  string
 	Iterations int
 	Usage      model.Usage
 
@@ -168,11 +173,18 @@ func (r *Runner) Run(ctx context.Context, req Request) (_ *Result, runErr error)
 	if req.History == nil {
 		return nil, errors.New("loop: request requires a history")
 	}
+	owner := scope.New(ctx)
+	defer func() { runErr = errors.Join(runErr, owner.Dispose()) }() //nolint:contextcheck // scope disposal uses its captured cancellation and cleanup context
+	ctx = owner.Context()
 	var err error
 	ctx, err = prepareRunContext(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+
+	run, _ := runtime.RunContextFrom(ctx) //nolint:contextcheck // ctx is inherited through the execution owner scope
+	run.ExecutionOwner = owner
+	ctx = runtime.WithRunContext(ctx, run)
 
 	// Every runner gets a run-scoped child ledger. When a parent context already
 	// carries a root ledger, this child keeps the configured per-run limits while
@@ -182,12 +194,16 @@ func (r *Runner) Run(ctx context.Context, req Request) (_ *Result, runErr error)
 		return nil, err
 	}
 
+	// Assemble proposed input privately. Policy and request preparation may reject
+	// it; the caller-owned transcript changes only at the first model barrier.
+	proposed := message.NewHistory()
+	proposed.Load(req.History.All())
 	st := lifecycle.NewState(lifecycle.StateInit{
 		ThreadID:     req.ThreadID,
 		RunID:        req.RunID,
 		AssistantID:  req.AssistantID,
 		SystemPrompt: req.SystemPrompt,
-		History:      req.History,
+		History:      proposed,
 	})
 	// Values belongs to this run and is intentionally shared with RunContext.
 	// Trusted tool lifecycle code can therefore update state that later model
@@ -202,363 +218,8 @@ func (r *Runner) Run(ctx context.Context, req Request) (_ *Result, runErr error)
 		return nil, err
 	}
 
-	tracker := r.cfg.Limits.NewTracker()
-	res := &Result{}
-	var pending *toolStepRecovery
-
-	// AfterAgent 必须跑到，即便回合失败：它承载遥测、记忆入队、标题生成这类收尾。
-	defer func() {
-		if err := pending.settle(ctx, st.History); err != nil {
-			runErr = errors.Join(runErr, err)
-		}
-		_ = r.cfg.Lifecycle.Execute(context.WithoutCancel(ctx), lifecycle.StageAfterAgent, st)
-		r.syncSpend(ctx, tracker)
-		res.Compacted = st.Compacted
-		res.CostMicros = tracker.CostMicros()
-		res.Values = cloneValues(st.Values)
-		res.RiskLevel = st.RiskLevel
-	}()
-
-	if err := r.cfg.Lifecycle.Execute(ctx, lifecycle.StageBeforeAgent, st); err != nil {
-		return res, err
-	}
-	if st.Take() == lifecycle.DirectiveStop {
-		return res, nil
-	}
-
-	stopReinjections := 0
-
-	for iteration := 0; ; iteration++ {
-		// Includes governance Continue and partially executed batches. Clear the
-		// owner before settlement so a failed append is not retried by defer.
-		previous := pending
-		pending = nil
-		if err := previous.settle(ctx, st.History); err != nil {
-			return res, err
-		}
-		st.Iteration = iteration
-		res.Iterations = iteration + 1
-
-		// 1 取消
-		if err := ctx.Err(); err != nil {
-			res.Iterations = iteration
-			return res, err
-		}
-		// 2 不可删的安全上限
-		r.syncSpend(ctx, tracker)
-		if err := tracker.Check(iteration); err != nil {
-			res.Iterations = iteration
-			return res, err
-		}
-		// 3 采样前压缩
-		if err := r.compact(ctx, st); err != nil {
-			return res, err
-		}
-		// 4 裁剪 + 5 本轮工具集
-		st.ModelInput, err = r.buildRequest(ctx, st)
-		if err != nil {
-			return res, err
-		}
-
-		st.ModelHistory = message.CloneAll(st.ModelInput.Messages)
-		st.RebuildModelHistory = func() []message.Message {
-			messages := st.History.All()
-			if r.cfg.Trimmer != nil {
-				messages = r.cfg.Trimmer.Trim(messages)
-			}
-			return messages
-		}
-
-		// 6 采样前切面
-		beforeModelWatermark := st.History.Watermark()
-		if err := r.cfg.Lifecycle.Execute(ctx, lifecycle.StageBeforeModel, st); err != nil {
-			return res, err
-		}
-		// Only genuine canonical appends belong to the projection. Searching
-		// the full history by value confuses trimmed-out messages with transient
-		// reinsertions and loses duplicate occurrences.
-		st.ModelHistory = append(st.ModelHistory, st.History.Since(beforeModelWatermark)...)
-
-		switch st.Take() {
-		case lifecycle.DirectiveStop:
-			if st.ModelOutput != nil {
-				res.Response = st.ModelOutput
-				res.StopReason = st.ModelOutput.StopReason
-				res.Output = st.ModelOutput.Message.Content
-				if r.cfg.Publisher != nil {
-					r.cfg.Publisher.PublishReply(ctx, st, false)
-				}
-			}
-			return res, nil
-		case lifecycle.DirectiveContinue:
-			continue
-		}
-		// BeforeModel may perform metered work (for example compaction or a
-		// policy lookup). Re-read the shared budget before starting the lead
-		// model so that auxiliary and child usage cannot bypass the ceiling.
-		r.syncSpend(ctx, tracker)
-		if err := tracker.Check(iteration); err != nil {
-			return res, err
-		}
-		// The exact model-visible request is a durable write-ahead record. If
-		// persistence fails, do not call the model: a response without its input
-		// ledger cannot be replayed or audited deterministically.
-		st.ModelAttempt = 0
-		st.BeforeModelAttempt = func(attemptCtx context.Context, info model.Info) error {
-			r.syncSpend(attemptCtx, tracker)
-			if err := tracker.Check(iteration); err != nil {
-				return err
-			}
-			st.ModelName = info.Name
-			st.EffectiveOutputTokens = info.MaxOutputTokens
-			st.ModelAttempt++
-			return commitModelInput(attemptCtx, st)
-		}
-		if sampler, ok := r.cfg.Sampler.(interface{ ManagesModelAttempts() bool }); !ok || !sampler.ManagesModelAttempts() {
-			if err := st.BeforeModelAttempt(ctx, model.Info{}); err != nil {
-				return res, err
-			}
-		}
-
-		// 7 采样
-		resp, streamed, err := r.cfg.Sampler.Sample(ctx, st)
-		if err != nil {
-			return res, err
-		}
-		if err := normalizeToolCallIDs(resp, st.RunID, iteration); err != nil {
-			return res, err
-		}
-		st.ModelOutput = resp
-		st.Streamed = streamed
-		st.OriginalOutput = resp.Message.Content
-		res.Streamed = res.Streamed || streamed
-		res.Response = resp
-		res.StopReason = resp.StopReason
-		// Record every successful provider response immediately after normalizing
-		// its tool-call identity. Later budget or governance failures must not leave
-		// an input commit without the corresponding output fact.
-		if err := commitModelOutput(ctx, st); err != nil {
-			return res, err
-		}
-		res.Usage = res.Usage.Add(resp.Usage)
-		r.observeLeadUsage(ctx, resp)
-		if err := r.chargeModelBudget(ctx, resp); err != nil {
-			return res, err
-		}
-
-		// 8 落存回复
-		pending = newToolStepRecovery(ctx, st.History)
-		st.History.Append(resp.Message)
-
-		// 9 采样后切面（逆序：Safety → LoopDetection → Guardrail → Schema）
-		if err := r.cfg.Lifecycle.Execute(ctx, lifecycle.StageAfterModel, st); err != nil {
-			return res, err
-		}
-		directive := st.Take()
-		r.syncSpend(ctx, tracker)
-
-		// 9b 切面通过后才对外发布。顺序反过来就等于把被护栏拦截的文本
-		// 留在用户屏幕上。
-		res.Output = st.ModelOutput.Message.Content
-		if r.cfg.Publisher != nil {
-			r.cfg.Publisher.PublishReply(ctx, st, streamed)
-		}
-
-		switch directive {
-		case lifecycle.DirectiveStop:
-			return res, nil
-		case lifecycle.DirectiveContinue:
-			continue
-		}
-
-		// 10 有工具调用则执行后继续
-		if calls := toolCallsOf(st.ModelOutput); len(calls) > 0 {
-			if err := tracker.Check(iteration); err != nil {
-				return res, err
-			}
-			stop, err := r.runTools(ctx, st, calls, pending)
-			if err != nil {
-				return res, err
-			}
-			if stop {
-				return res, nil
-			}
-			continue
-		}
-
-		// 11 停止判定
-		blocking, err := r.evaluateStop(ctx, st)
-		if err != nil {
-			return res, err
-		}
-		if blocking != "" {
-			stopReinjections++
-			if stopReinjections > r.stopReinjectionLimit() {
-				return res, fmt.Errorf("loop: stop blocked: %s", blocking)
-			}
-			st.History.Append(message.Message{
-				Role:    message.RoleUser,
-				Content: fmt.Sprintf("[System] 停止被拦截：%s。请先处理该问题。", blocking),
-			})
-			continue
-		}
-
-		// 12 回合结束
-		return res, nil
-	}
-}
-
-func commitModelInput(ctx context.Context, st *lifecycle.State) error {
-	if st == nil || st.ModelInput == nil {
-		return errors.New("loop: model input commit requires a request")
-	}
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || run.Publish == nil {
-		return nil
-	}
-	request := st.ModelInput
-	event, err := runtime.NewEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventModelInputCommitted, runtime.ModelInputCommitted{
-		ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID, SubagentTaskID: run.SubagentTaskID,
-		GenerationID: run.GenerationID, Iteration: st.Iteration, Attempt: st.ModelAttempt, ModelName: st.ModelName, EffectiveOutputTokens: st.EffectiveOutputTokens, System: request.System,
-		Messages: message.CloneAll(request.Messages), Tools: append([]model.ToolSchema(nil), request.Tools...),
-		MaxTokens: request.MaxTokens, Temperature: request.Temperature, Thinking: request.Thinking,
-		ExtraBody: request.ExtraBody, EnablePromptCache: request.EnablePromptCache,
-	})
-	if err != nil {
-		return fmt.Errorf("loop: encoding model input commit: %w", err)
-	}
-	event.IdempotencyKey = fmt.Sprintf("run:%s:model-input:%d", run.RunID, st.Iteration)
-	if st.ModelAttempt > 1 {
-		event.IdempotencyKey += fmt.Sprintf(":attempt:%d", st.ModelAttempt)
-	}
-	if _, err := run.Publish(context.WithoutCancel(ctx), event); err != nil {
-		return fmt.Errorf("loop: persisting model input commit: %w", err)
-	}
-	return nil
-}
-
-func commitModelOutput(ctx context.Context, st *lifecycle.State) error {
-	if st == nil || st.ModelOutput == nil {
-		return errors.New("loop: model output commit requires a response")
-	}
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || run.Publish == nil {
-		return nil
-	}
-	response := st.ModelOutput
-	event, err := runtime.NewEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventModelOutputCommitted, runtime.ModelOutputCommitted{
-		ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID, SubagentTaskID: run.SubagentTaskID,
-		GenerationID: run.GenerationID, Iteration: st.Iteration, Message: message.Clone(response.Message),
-		StopReason: response.StopReason, CallID: response.CallID, ModelName: response.ModelName, Usage: response.Usage,
-	})
-	if err != nil {
-		return fmt.Errorf("loop: encoding model output commit: %w", err)
-	}
-	event.IdempotencyKey = fmt.Sprintf("run:%s:model-output:%d", run.RunID, st.Iteration)
-	if _, err := run.Publish(context.WithoutCancel(ctx), event); err != nil {
-		return fmt.Errorf("loop: persisting model output commit: %w", err)
-	}
-	return nil
-}
-
-func prepareRunContext(ctx context.Context, req Request) (context.Context, error) {
-	run, _ := runtime.RunContextFrom(ctx)
-	if run.RunID == "" {
-		run.RunID = req.RunID
-	}
-	if run.ThreadID == "" {
-		run.ThreadID = req.ThreadID
-	}
-	if run.RunID == "" || run.ThreadID == "" {
-		return ctx, errors.New("loop: request requires run_id and thread_id")
-	}
-	if run.RunID != req.RunID || run.ThreadID != req.ThreadID {
-		return ctx, fmt.Errorf("loop: run context identity %q/%q does not match request %q/%q", run.RunID, run.ThreadID, req.RunID, req.ThreadID)
-	}
-	if run.StateMachine == nil {
-		state, err := runtime.NewRunStateMachine(run.RunID, run.ThreadID)
-		if err != nil {
-			return ctx, err
-		}
-		if err := state.Start(); err != nil {
-			return ctx, err
-		}
-		run.StateMachine = state
-	}
-	snapshot := run.StateMachine.Snapshot()
-	if snapshot.RunID != req.RunID || snapshot.ThreadID != req.ThreadID {
-		return ctx, fmt.Errorf("loop: run state identity %q/%q does not match request %q/%q", snapshot.RunID, snapshot.ThreadID, req.RunID, req.ThreadID)
-	}
-	if snapshot.Phase != runtime.RunRunning {
-		return ctx, fmt.Errorf("loop: run state must be %s, got %s", runtime.RunRunning, snapshot.Phase)
-	}
-	return runtime.WithRunContext(ctx, run), nil
-}
-
-func (r *Runner) syncSpend(ctx context.Context, tracker *Tracker) {
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || run.Journal == nil {
-		return
-	}
-	tokens, cost := run.Journal.Spend()
-	tracker.ObserveSpend(tokens, cost)
-}
-
-func (r *Runner) installBudget(ctx context.Context) (context.Context, error) {
-	run, _ := runtime.RunContextFrom(ctx)
-	limits := runtime.BudgetAmount{
-		Tokens:     int64(r.cfg.Limits.MaxTokens),
-		CostMicros: r.cfg.Limits.MaxCostMicros,
-		ToolCalls:  int64(r.cfg.Limits.MaxToolCalls),
-		Subagents:  int64(r.cfg.Limits.MaxSubagents),
-	}
-	var budget *runtime.BudgetLedger
-	var err error
-	if run.Budget != nil {
-		budget, err = run.Budget.Child(limits)
-	} else {
-		budget = runtime.NewBudgetLedger(limits)
-	}
-	if err != nil {
-		return ctx, err
-	}
-	run.Budget = budget
-	return runtime.WithRunContext(ctx, run), nil
-}
-
-func (r *Runner) chargeModelBudget(ctx context.Context, response *model.Response) error {
-	if response == nil {
-		return nil
-	}
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || run.Budget == nil {
-		return nil
-	}
-	amount := runtime.BudgetAmount{Tokens: int64(response.Usage.TotalTokens())}
-	if run.Journal != nil {
-		amount.CostMicros = run.Journal.EstimateCost(response.ModelName, response.Usage)
-	}
-	if err := run.Budget.Charge(amount); err != nil {
-		if errors.Is(err, runtime.ErrBudgetExceeded) {
-			return ErrBudgetExhausted
-		}
-		return err
-	}
-	return nil
-}
-
-func (r *Runner) observeLeadUsage(ctx context.Context, response *model.Response) {
-	if response == nil {
-		return
-	}
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || run.Journal == nil {
-		return
-	}
-	run.Journal.Observe(runtime.Entry{
-		Bucket: runtime.BucketLead, Source: "lead", CallID: response.CallID,
-		ModelName: response.ModelName, Usage: response.Usage,
-	})
+	driver := &agentDriver{runner: r, ctx: ctx, state: st, canonical: req.History, checkpoint: req.Checkpoint, pullInputs: req.PullInputs, tracker: r.cfg.Limits.NewTracker(), result: &Result{}}
+	return driver.run() //nolint:contextcheck // the driver retains the scoped context for every step
 }
 
 func cloneValues(in map[string]any) map[string]any {
@@ -570,192 +231,6 @@ func cloneValues(in map[string]any) map[string]any {
 		out[key] = value
 	}
 	return out
-}
-
-// seed 把本轮的用户输入写入转录。
-func (r *Runner) seed(st *lifecycle.State, req Request) error {
-	prompt := strings.TrimSpace(req.Prompt)
-	if prompt == "" && len(req.ContentBlocks) == 0 {
-		if st.History.Len() == 0 {
-			return errors.New("loop: request requires a prompt or a non-empty history")
-		}
-		return nil
-	}
-
-	st.History.Append(message.Message{
-		Role:          message.RoleUser,
-		Content:       prompt,
-		ContentBlocks: req.ContentBlocks,
-	})
-	return nil
-}
-
-func (r *Runner) compact(ctx context.Context, st *lifecycle.State) error {
-	if sampler, ok := r.cfg.Sampler.(interface{ ManagesCompaction() bool }); ok && sampler.ManagesCompaction() {
-		return nil
-	}
-	if r.cfg.Compactor == nil {
-		return nil
-	}
-	run, hasRun := runtime.RunContextFrom(ctx)
-	trackState := false
-	if decider, ok := r.cfg.Compactor.(CompactionDecider); ok && decider.ShouldCompact(st.History) && hasRun && run.StateMachine != nil && run.StateMachine.Snapshot().Phase == runtime.RunRunning {
-		if err := run.StateMachine.BeginCompaction(); err != nil {
-			return fmt.Errorf("loop: beginning compaction: %w", err)
-		}
-		trackState = true
-		if err := publishCompactionEvent(ctx, run, runtime.EventCompactionStart, st.Iteration, map[string]any{"iteration": st.Iteration}); err != nil {
-			return err
-		}
-	}
-	compacted, err := r.cfg.Compactor.MaybeCompact(ctx, st.History)
-	if trackState {
-		payload := map[string]any{"iteration": st.Iteration, "compacted": compacted}
-		if err != nil {
-			payload["error"] = err.Error()
-		}
-		if publishErr := publishCompactionEvent(context.WithoutCancel(ctx), run, runtime.EventCompactionComplete, st.Iteration, payload); publishErr != nil && err == nil {
-			err = publishErr
-		}
-		if !run.StateMachine.Snapshot().Phase.Terminal() {
-			if resumeErr := run.StateMachine.Resume(); resumeErr != nil && err == nil {
-				err = resumeErr
-			}
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("loop: compaction: %w", err)
-	}
-	// 标志一旦置位就保持：持久化层要知道"本回合内发生过压缩"，
-	// 而不是"最后一轮是否压缩"。
-	st.Compacted = st.Compacted || compacted
-	return nil
-}
-
-func publishCompactionEvent(ctx context.Context, run runtime.RunContext, typ runtime.EventType, iteration int, payload any) error {
-	event := runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, typ, payload)
-	event.IdempotencyKey = fmt.Sprintf("run:%s:compaction:%d:%s", run.RunID, iteration, typ)
-	if run.Publish != nil {
-		_, err := run.Publish(ctx, event)
-		return err
-	}
-	if run.Bus != nil {
-		run.Bus.Publish(ctx, event)
-	}
-	return nil
-}
-
-// buildRequest 组装本轮的模型请求。每轮都重算工具集。
-func (r *Runner) buildRequest(ctx context.Context, st *lifecycle.State) (*model.Request, error) {
-	msgs := st.History.All()
-	if r.cfg.Trimmer != nil {
-		msgs = r.cfg.Trimmer.Trim(msgs)
-	}
-
-	allow, disclosed, err := r.resolveToolSet(ctx, st)
-	if err != nil {
-		return nil, err
-	}
-	st.ToolSet = allow
-	st.DisclosedTools = disclosed
-
-	return &model.Request{
-		System:   st.SystemPrompt,
-		Messages: msgs,
-		Tools:    r.cfg.Registry.Schemas(allow, disclosed...),
-	}, nil
-}
-
-func (r *Runner) resolveToolSet(ctx context.Context, st *lifecycle.State) (allow, disclosed []string, err error) {
-	if r.cfg.ToolSet != nil {
-		allow, disclosed, err = r.cfg.ToolSet.Resolve(ctx, st)
-		if err != nil {
-			return nil, nil, fmt.Errorf("loop: resolving tool capabilities: %w", err)
-		}
-	} else {
-		// 没有解析器时披露全部已注册工具。这是库的默认行为；
-		// 生产装配必须提供解析器以让权限与 skill 收窄生效。
-		allow = r.cfg.Registry.Names()
-	}
-	run, ok := runtime.RunContextFrom(ctx)
-	if !ok || !run.Capabilities.Initialized() {
-		return allow, disclosed, nil
-	}
-	capabilities := make(map[string]struct{}, len(run.Capabilities.Names()))
-	for _, name := range run.Capabilities.Names() {
-		capabilities[name] = struct{}{}
-	}
-	filtered := allow[:0]
-	for _, name := range allow {
-		if _, permitted := capabilities["tool."+name]; permitted {
-			filtered = append(filtered, name)
-		}
-	}
-	return filtered, disclosed, nil
-}
-
-// runTools 执行本轮的工具调用，返回是否应结束回合。
-func (r *Runner) runTools(ctx context.Context, st *lifecycle.State, calls []tool.Call, recovery *toolStepRecovery) (bool, error) {
-	for _, call := range calls {
-		if !r.toolAvailable(st, call.Name) {
-			return false, fmt.Errorf("loop: tool %q is not available in the current capability view", call.Name)
-		}
-	}
-	run, hasRun := runtime.RunContextFrom(ctx)
-	if hasRun && run.Budget != nil {
-		if err := run.Budget.Charge(runtime.BudgetAmount{ToolCalls: int64(len(calls))}); err != nil {
-			if errors.Is(err, runtime.ErrBudgetExceeded) {
-				return false, ErrBudgetExhausted
-			}
-			return false, err
-		}
-	}
-	waitingTool := false
-	if hasRun && run.StateMachine != nil && run.StateMachine.Snapshot().Phase == runtime.RunRunning {
-		if err := run.StateMachine.WaitTool(); err != nil {
-			return false, err
-		}
-		waitingTool = true
-	}
-	if waitingTool {
-		defer func() {
-			if !run.StateMachine.Snapshot().Phase.Terminal() && run.StateMachine.Snapshot().Phase != runtime.RunRunning {
-				_ = run.StateMachine.Resume()
-			}
-		}()
-	}
-	recovery.dispatched = true
-	_, recovery.trackedDispatch = r.cfg.Executor.(*tool.Executor)
-	execCtx := tool.WithTransactionObserver(ctx, &runtimeToolTransactionObserver{run: run, recovery: recovery})
-	outcomes, err := r.cfg.Executor.Run(execCtx, calls, r.cfg.Lifecycle.ToolInterceptor(st))
-
-	// Keep returned outcomes for custom executors. Native committed results were
-	// already observed; step settlement appends every result in assistant order.
-	for _, o := range outcomes {
-		if o.Result == nil {
-			continue
-		}
-		recovery.recordResult(toolOutcomeMessage(o), false)
-	}
-
-	if err != nil {
-		return false, err
-	}
-	if r.cfg.Executor.EndTurnRequested() || st.Take() == lifecycle.DirectiveStop {
-		return true, nil
-	}
-	return false, nil
-}
-
-func (r *Runner) toolAvailable(st *lifecycle.State, name string) bool {
-	if !slices.Contains(st.ToolSet, name) {
-		return false
-	}
-	definition, err := r.cfg.Registry.Get(name)
-	if err != nil || !definition.Deferred {
-		return err == nil
-	}
-	return slices.Contains(st.DisclosedTools, name)
 }
 
 func cloneAdditionalKwargs(in map[string]any) map[string]any {
@@ -785,33 +260,4 @@ func (r *Runner) stopReinjectionLimit() int {
 		return r.cfg.Limits.StopReinjectionLimit
 	}
 	return defaultStopReinjectionLimit
-}
-
-func toolCallsOf(resp *model.Response) []tool.Call {
-	if resp == nil || len(resp.Message.ToolCalls) == 0 {
-		return nil
-	}
-	out := make([]tool.Call, len(resp.Message.ToolCalls))
-	for i, tc := range resp.Message.ToolCalls {
-		out[i] = tool.Call{ID: tc.ID, Name: tc.Name, Args: tc.Arguments}
-	}
-	return out
-}
-
-func normalizeToolCallIDs(resp *model.Response, runID string, iteration int) error {
-	if resp == nil {
-		return errors.New("loop: sampler returned no response")
-	}
-	seen := make(map[string]struct{}, len(resp.Message.ToolCalls))
-	for i := range resp.Message.ToolCalls {
-		call := &resp.Message.ToolCalls[i]
-		if call.ID == "" {
-			call.ID = fmt.Sprintf("%s:tool:%d:%d", runID, iteration, i)
-		}
-		if _, duplicate := seen[call.ID]; duplicate {
-			return fmt.Errorf("loop: model returned duplicate tool call id %q", call.ID)
-		}
-		seen[call.ID] = struct{}{}
-	}
-	return nil
 }

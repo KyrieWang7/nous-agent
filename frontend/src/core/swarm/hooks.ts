@@ -13,6 +13,7 @@ export interface SwarmState {
   members: SwarmTeamMember[];
   messages: SwarmMessage[];
   statuses: Record<string, TeammateDisplayStatus>;
+  closed: boolean;
   connected: boolean;
   error: string | null;
 }
@@ -21,13 +22,18 @@ const INITIAL_STATE: SwarmState = {
   members: [],
   messages: [],
   statuses: {},
+  closed: false,
   connected: false,
   error: null,
 };
 
-export function useSwarmStream(teamId: string | null): SwarmState {
+export function useSwarmStream(
+  teamId: string | null,
+): SwarmState & { reconnect: () => void } {
   const [state, setState] = useState<SwarmState>(INITIAL_STATE);
   const generationRef = useRef(0);
+  const [revision, setRevision] = useState(0);
+  const reconnect = useCallback(() => setRevision((v) => v + 1), []);
 
   const handleEvent = useCallback((event: string, data: unknown): boolean => {
     switch (event) {
@@ -57,6 +63,7 @@ export function useSwarmStream(teamId: string | null): SwarmState {
           ...s,
           members: [],
           statuses: {},
+          closed: true,
           connected: false,
           error: null,
         }));
@@ -122,6 +129,7 @@ export function useSwarmStream(teamId: string | null): SwarmState {
       try {
         const response = await fetch(getSwarmStreamURL(teamId), {
           signal: controller.signal,
+          credentials: "include",
           headers: requestHeaders,
         });
         if (!response.ok) throw new Error(`SSE failed: ${response.status}`);
@@ -169,7 +177,7 @@ export function useSwarmStream(teamId: string | null): SwarmState {
       controller?.abort();
       if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
-  }, [teamId, handleEvent]);
+  }, [teamId, handleEvent, revision]);
 
-  return state;
+  return { ...state, reconnect };
 }

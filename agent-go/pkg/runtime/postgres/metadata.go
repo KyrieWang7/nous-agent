@@ -9,21 +9,21 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/metadata"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/storage"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
 // MetadataStore persists the state required by Runtime execution. Product
 // thread search and HTTP response DTOs remain in the transport adapter.
 type MetadataStore struct {
-	pool       *pgxpool.Pool
+	pool       *platformdb.DB
 	transcript *storage.Postgres
 }
 
-func NewMetadataStore(pool *pgxpool.Pool) (*MetadataStore, error) {
-	if pool == nil {
+func NewMetadataStore(pool *platformdb.DB) (*MetadataStore, error) {
+	if pool == nil || pool.Native == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
-	transcript, err := storage.NewPostgres(pool)
+	transcript, err := storage.NewPostgres(pool.Native)
 	if err != nil {
 		return nil, err
 	}
@@ -66,14 +66,23 @@ func (s *MetadataStore) SaveThreadValues(ctx context.Context, threadID string, v
 		return fmt.Errorf("runtime/postgres: encoding thread values: %w", err)
 	}
 	title, _ := values["title"].(string)
-	tag, err := s.pool.Exec(ctx, `UPDATE agent_thread SET state=state||$2::jsonb,title=CASE WHEN $3='' THEN title ELSE $3 END,updated_at=NOW() WHERE id=$1`, threadID, state, title)
-	if err != nil {
-		return fmt.Errorf("runtime/postgres: saving thread values: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("runtime/postgres: thread %q not found", threadID)
-	}
-	return nil
+	return s.pool.Transaction(ctx, func(tx *platformdb.DB) error {
+		var locked string
+		if err := tx.QueryRow(ctx, `SELECT id FROM agent_thread WHERE id=$1 FOR UPDATE`, threadID).Scan(&locked); err != nil {
+			return err
+		}
+		if expected := metadata.Writer(ctx); expected != "" {
+			var current string
+			if err := tx.QueryRow(ctx, `SELECT run_id FROM agent_thread_writer WHERE thread_id=$1`, threadID).Scan(&current); err != nil {
+				return err
+			}
+			if current != expected {
+				return metadata.ErrStaleWriter
+			}
+		}
+		_, err := tx.Exec(ctx, `UPDATE agent_thread SET state=state||$2::jsonb,title=CASE WHEN $3='' THEN title ELSE $3 END,updated_at=NOW() WHERE id=$1`, threadID, state, title)
+		return err
+	})
 }
 
 func (s *MetadataStore) MarkRunRunning(ctx context.Context, runID string) error {

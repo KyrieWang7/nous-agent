@@ -1,0 +1,10 @@
+address: ":7777"
+database_url: ${DATABASE_URL}
+redis_url: ${REDIS_URL}
+rate_limit:
+  enabled: false
+  requests: 60
+  window: 1m
+cors_origins:
+  - http://localhost:7775
+  - http://127.0.0.1:7775

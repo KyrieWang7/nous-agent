@@ -2,21 +2,21 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/replay"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
 // SnapshotStore is the PostgreSQL projection-cache adapter. Canonical events
 // remain authoritative; replacing or deleting rows does not lose run facts.
-type SnapshotStore struct{ pool *pgxpool.Pool }
+type SnapshotStore struct{ pool *platformdb.DB }
 
-func NewSnapshotStore(pool *pgxpool.Pool) (*SnapshotStore, error) {
+func NewSnapshotStore(pool *platformdb.DB) (*SnapshotStore, error) {
 	if pool == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
@@ -50,7 +50,7 @@ func (s *SnapshotStore) Load(ctx context.Context, runID, threadID string) (repla
 	err := s.pool.QueryRow(ctx, `SELECT run_id,thread_id,last_seq,messages,created_at FROM agent_projection_snapshot WHERE run_id=$1 AND thread_id=$2`, runID, threadID).Scan(
 		&snapshot.RunID, &snapshot.ThreadID, &snapshot.LastSeq, &messages, &snapshot.CreatedAt,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return replay.Snapshot{}, replay.ErrSnapshotNotFound
 	}
 	if err != nil {

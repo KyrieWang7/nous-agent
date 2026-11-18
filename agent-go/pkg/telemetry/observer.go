@@ -57,7 +57,7 @@ func (m *Observer) BeforeAgent(ctx context.Context, st *lifecycle.State) error {
 		if !trace.SpanContextFromContext(ctx).IsValid() {
 			if stored, exists := m.runs.Load(run.ParentRunID); exists {
 				if typed, valid := stored.(runSpan); valid {
-					parent = typed.ctx
+					parent = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(typed.ctx)) //nolint:contextcheck // borrow only stored trace identity; cancellation is inherited from ctx
 				}
 			}
 		}
@@ -110,7 +110,7 @@ func (m *Observer) BeforeModel(ctx context.Context, st *lifecycle.State) error {
 	parent := ctx //nolint:contextcheck // model spans intentionally use the stored run span as parent
 	if stored, ok := m.runs.Load(st.RunID); ok {
 		if typed, ok := stored.(runSpan); ok {
-			parent = typed.ctx
+			parent = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(typed.ctx)) //nolint:contextcheck // borrow only stored trace identity; cancellation is inherited from ctx
 		}
 	}
 	_, span := m.tracer.Start(parent, "agent.model", trace.WithAttributes(attribute.Int("agent.iteration", st.Iteration)))
@@ -142,7 +142,7 @@ func (m *Observer) BeforeTool(ctx context.Context, st *lifecycle.State) (tool.De
 	parent := ctx
 	if stored, ok := m.runs.Load(st.RunID); ok {
 		if typed, valid := stored.(runSpan); valid {
-			parent = typed.ctx
+			parent = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(typed.ctx)) //nolint:contextcheck // borrow only stored trace identity; cancellation is inherited from ctx
 		}
 	}
 	spanCtx, span := m.tracer.Start(parent, "agent.tool", trace.WithAttributes(

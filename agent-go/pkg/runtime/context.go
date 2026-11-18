@@ -2,13 +2,22 @@ package runtime
 
 import (
 	"context"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/scope"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
 )
 
 type RunContext struct {
-	RunID       string
-	ParentRunID string
+	// ExecutionContext owns background delegations beyond a short-lived tool call.
+	// It is installed by the loop, never supplied by model input.
+	ExecutionContext context.Context
+	ExecutionOwner   *scope.Scope
+	// DelegationHistory is the immutable completed-turn prefix captured before
+	// the current run's input is admitted. Fork children never see in-flight tools.
+	DelegationHistory []message.Message
+	RunID             string
+	ParentRunID       string
 	// GenerationID identifies the immutable capability assembly pinned for this
 	// run. Reloadable transports must keep the corresponding generation alive
 	// until the run releases it.
@@ -33,8 +42,9 @@ type RunContext struct {
 	// SubagentTaskID is assigned by the trusted dispatcher. It is empty for a
 	// lead run; stream publishers use it to keep child progress out of the
 	// parent's normal message channel.
-	SubagentTaskID string
-	Journal        *Journal
+	SubagentSessionID string
+	SubagentTaskID    string
+	Journal           *Journal
 	// StateMachine is the durable lifecycle authority for this run. Kernel
 	// execution requires it to be present and aligned with RunID and ThreadID.
 	StateMachine *RunStateMachine

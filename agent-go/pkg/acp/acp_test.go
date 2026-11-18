@@ -56,7 +56,7 @@ func TestACPHelperProcess(t *testing.T) {
 		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
 			os.Exit(2)
 		}
-		var result any = map[string]any{}
+		var result any
 		switch request.Method {
 		case "initialize":
 			result = map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}}

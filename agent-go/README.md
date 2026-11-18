@@ -24,6 +24,61 @@ reported as `auxiliary_tokens`.
 The sibling `../gateway-go` is the primary control plane. Historical Python
 sources are not built, imported, queried, or used as a fallback by this runtime.
 
+## Shared platform
+
+The sibling `platform-go` module provides Gin, GORM/PostgreSQL, Viper, Zap and
+go-redis. Keep all three Go modules in the repository layout; local module
+replacements and container builds use that shared source. Build Docker images
+from the repository root. Existing SQL migrations own the schema; no GORM
+`AutoMigrate` runs. Transcript and Swarm native transactions share the same pool.
+
+HTTP rate limiting is optional and defaults off. Set `REDIS_URL`,
+`HTTP_RATE_LIMIT_ENABLED=true`, `HTTP_RATE_LIMIT_REQUESTS=60` and
+`HTTP_RATE_LIMIT_WINDOW=1m` to enable it. `LOG_LEVEL` controls Zap logging.
+
+## Application layers
+
+`internal/router` registers routes, `middleware` handles HTTP concerns, `handler`
+decodes and projects HTTP/SSE, `service` owns use cases, `repository` implements
+persistence, `model` defines application data, and `server` composes the boundary.
+
+The Agent kernel stays in `pkg/loop`. Each run creates an isolated driver;
+`preStep`, `step`, request preparation and ordered tool settlement follow the
+responsibility boundaries of DSH's Agent implementation. A step settles its
+accepted tool calls before another step or turn cleanup can run. Adapter call
+preparation precedes input admission, and turn/step boundaries are durable events.
+Runtime plugins use `Name / Inject / Apply` with owned registrations, cleanup and
+workers; there is no paired plugin `Start / Stop` implementation. Configuration
+reload publishes a complete new generation and drains the old generation.
+See [the DSH contract](../docs/delivery/2026-11-17-dsh-orchestration-and-plugins.md)
+for the kernel contracts and behavior tests.
+
+Subagent `task` supports `provider=spawn` (default) and `provider=fork` (completed
+parent history only). Owned executions cancel and drain with their run/generation;
+truncated/refused results are not successful tasks. Tool batches use a rolling
+pool with ordered policy/result settlement and dynamic exclusive barriers.
+See [the local DSH integration notes](../docs/delivery/2026-11-17-dsh-subagent-and-tool-scheduler.md).
+
+## Durable backend and child sessions
+
+The daemon requires `DATABASE_URL` and schema migration **016** or newer. Run
+`go run ./cmd/agentctl migrate up` before starting it; missing/dirty schemas fail
+startup. Memory stores exist for tests/embedders and are not a daemon fallback.
+PostgreSQL owns events, run registration, cancel intent, child results, child
+history and inbox delivery. Redis is needed only when HTTP rate limiting is on.
+
+A thread permits one active writer across processes. Concurrent run/state writes
+return 409. Cancellation requests are acknowledgements; terminal status is saved
+only after tools, children and runner resources settle. Interrupted tool intents
+are recovered as unknown outcomes and are never replayed automatically.
+
+Persistent child APIs under `/api/v1/threads/{tid}/subagents` support listing,
+inspection, wait, cancel, messages and continuation. Continuation uses a new normal
+RunManager run and pins its runtime generation; it preserves child history and
+narrows the original policy against the current parent/profile. Background tasks
+remain supervised by their parent turn. See
+[the backend contract](../docs/delivery/2026-11-17-backend-session-closure.md).
+
 ## Repository development
 
 From the repository root:
@@ -301,7 +356,7 @@ the configured Go Compose service.
 Build the non-reloading image directly:
 
 ```bash
-docker build -t nous-agent-go .
+docker build -f agent-go/Dockerfile -t nous-agent-go .
 docker run --rm -p 7776:7776 \
   --env-file ../.env \
   -v "$(pwd)/config.example.yaml:/etc/nous-agent/config.yaml:ro" \
@@ -329,3 +384,11 @@ go test -tags=docker ./pkg/sandbox/docker ./cmd/agentd
 
 The `cmd/agentd` suite covers HTTP input through provider streaming, runtime
 events, and SSE projection with a local stub provider.
+
+### 持久消息与插件控制
+
+数据库需要干净的 migration 016。聊天输入支持 `/api/v1/threads/{tid}/messages` 的 `next_turn` / `next_step` 队列，保持单线程写入和真实模型输入 ACK；直接 `/runs` 接口在线程忙或有待处理输入时返回 409。默认允许三层委派，每个父 Agent 的并发孩子数由 `subagents.max_concurrent` 控制，整棵树共享 `loop.subagent_budget`。
+
+原生已安装插件可通过 `/api/v1/runtime/plugins` 查询和启停，修改需要返回的配置 revision；`/reload` 重新装配运行环境。旧运行完成后释放其插件，控制状态不会提前宣告资源排空。个体偏好保存在独立 `plugins.json`；可设置 `NOUS_PLUGIN_STATE_PATH`，默认位于扩展配置同目录，未配置扩展路径时为 `.nous/plugins.json`。管理多个实例时需共享设置和安装目录；界面的执行引用数属于当前实例。
+
+具体契约、迁移与本地验收记录见 `docs/delivery/2026-11-17-session-inbox-and-nested-agents.md` 和 `docs/delivery/2026-11-17-plugin-control.md`（仓库根目录）。

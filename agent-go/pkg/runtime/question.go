@@ -4,17 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
 
 type QuestionStatus string
 
+const QuestionIntentClarification = "clarification"
+
 const (
 	QuestionPending   QuestionStatus = "pending"
 	QuestionAnswered  QuestionStatus = "answered"
 	QuestionDismissed QuestionStatus = "dismissed"
 	QuestionExpired   QuestionStatus = "expired"
+	// QuestionLateAnswered records an answer that arrived after the foreground
+	// wait timed out. It remains auditable without pretending the original tool
+	// call is still running; callers may use the answer to start a follow-up run.
+	QuestionLateAnswered QuestionStatus = "late_answered"
 )
 
 type QuestionOption struct {
@@ -109,7 +116,7 @@ func (m *QuestionManager) Create(ctx context.Context, value QuestionRequest) (Qu
 	if value.ID == "" || value.RunID == "" || value.Header == "" || value.Question == "" {
 		return QuestionRequest{}, errors.New("runtime: question id, run id, header and question are required")
 	}
-	if len(value.Options) == 0 {
+	if len(value.Options) == 0 && value.Intent != QuestionIntentClarification {
 		return QuestionRequest{}, errors.New("runtime: question requires at least one option")
 	}
 	seen := make(map[string]struct{}, len(value.Options))
@@ -185,14 +192,22 @@ func (m *QuestionManager) Wait(ctx context.Context, id string, pollInterval time
 }
 
 func (m *QuestionManager) Answer(ctx context.Context, id string, answer QuestionAnswer, answeredBy string) (QuestionRequest, error) {
-	return m.resolve(ctx, id, QuestionAnswered, answer, answeredBy)
+	return m.resolve(ctx, id, QuestionAnswered, answer, answeredBy, true)
+}
+
+// AnswerLate is an explicit late-reply path used by clients that timed out
+// their foreground request. The original pending decision remains first-write
+// wins; a late answer is stored as a distinct terminal state for follow-up
+// admission and audit.
+func (m *QuestionManager) AnswerLate(ctx context.Context, id string, answer QuestionAnswer, answeredBy string) (QuestionRequest, error) {
+	return m.resolve(ctx, id, QuestionLateAnswered, answer, answeredBy, true)
 }
 
 func (m *QuestionManager) Dismiss(ctx context.Context, id, answeredBy string) (QuestionRequest, error) {
-	return m.resolve(ctx, id, QuestionDismissed, QuestionAnswer{}, answeredBy)
+	return m.resolve(ctx, id, QuestionDismissed, QuestionAnswer{}, answeredBy, false)
 }
 
-func (m *QuestionManager) resolve(ctx context.Context, id string, status QuestionStatus, answer QuestionAnswer, answeredBy string) (QuestionRequest, error) {
+func (m *QuestionManager) resolve(ctx context.Context, id string, status QuestionStatus, answer QuestionAnswer, answeredBy string, allowLate bool) (QuestionRequest, error) {
 	if m == nil || m.store == nil {
 		return QuestionRequest{}, ErrQuestionNotFound
 	}
@@ -203,12 +218,26 @@ func (m *QuestionManager) resolve(ctx context.Context, id string, status Questio
 		return QuestionRequest{}, err
 	}
 	if value.Status != QuestionPending {
+		if status == QuestionLateAnswered && value.Status == QuestionExpired {
+			if err := validateQuestionAnswer(value, answer); err != nil {
+				return QuestionRequest{}, err
+			}
+			value.Status, value.Answer, value.AnsweredBy, value.UpdatedAt = QuestionLateAnswered, cloneAnswer(answer), answeredBy, time.Now().UTC()
+			if err := m.store.Put(ctx, value); err != nil {
+				return QuestionRequest{}, err
+			}
+			return m.store.Get(ctx, id)
+		}
 		return value, nil
 	}
-	if !value.ExpiresAt.IsZero() && !time.Now().Before(value.ExpiresAt) {
+	late := !value.ExpiresAt.IsZero() && !time.Now().Before(value.ExpiresAt)
+	if late && !allowLate {
 		status, answer, answeredBy = QuestionExpired, QuestionAnswer{}, "system"
 	}
-	if status == QuestionAnswered {
+	if late && allowLate && status == QuestionAnswered {
+		status = QuestionLateAnswered
+	}
+	if status == QuestionAnswered || status == QuestionLateAnswered {
 		if err := validateQuestionAnswer(value, answer); err != nil {
 			return QuestionRequest{}, err
 		}
@@ -221,6 +250,9 @@ func (m *QuestionManager) resolve(ctx context.Context, id string, status Questio
 }
 
 func validateQuestionAnswer(question QuestionRequest, answer QuestionAnswer) error {
+	if question.Intent == QuestionIntentClarification && len(answer.Selected) == 0 && strings.TrimSpace(answer.Custom) != "" {
+		return nil
+	}
 	if len(answer.Selected) != 1 {
 		return errors.New("runtime: question answer must select exactly one option")
 	}

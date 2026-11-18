@@ -13,10 +13,10 @@ import (
 
 type runtimeToolPlugin struct{}
 
-func (runtimeToolPlugin) Name() string           { return "test.runtime-tool" }
-func (runtimeToolPlugin) Dependencies() []string { return nil }
-func (runtimeToolPlugin) Start(_ context.Context, host runtimeplugin.Host) error {
-	return host.Tools.Register(tool.Definition{
+func (runtimeToolPlugin) Name() string     { return "test.runtime-tool" }
+func (runtimeToolPlugin) Inject() []string { return []string{runtimeplugin.ToolService} }
+func (runtimeToolPlugin) Apply(ctx *runtimeplugin.Context) error {
+	return ctx.RegisterTool(tool.Definition{
 		Name:        "plugin_echo",
 		Group:       "test",
 		Description: "registered during runtime plugin startup",
@@ -25,7 +25,6 @@ func (runtimeToolPlugin) Start(_ context.Context, host runtimeplugin.Host) error
 		},
 	})
 }
-func (runtimeToolPlugin) Stop(context.Context) error { return nil }
 
 func TestHarnessPublishesStaticDomainCapabilities(t *testing.T) {
 	provider := struct{ Name string }{Name: "thread-memory"}

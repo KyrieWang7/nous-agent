@@ -160,7 +160,6 @@ func TestComplete_UsesConfiguredTemperatureAndAllowsRequestOverride(t *testing.T
 		{name: "request override", req: model.Request{Temperature: &override}, want: override},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			m, cap := stub(t, jsonResponse(okResponse), model.ProviderConfig{Temperature: &configured})
@@ -302,7 +301,6 @@ func TestComplete_ThinkingExtraBodyIsConditional(t *testing.T) {
 		{name: "enabled", thinking: true, wantMode: "thinking", wantThinking: true},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			m, cap := stub(t, jsonResponse(okResponse), model.ProviderConfig{
@@ -924,5 +922,31 @@ func TestRegistersInModelRegistry(t *testing.T) {
 	}
 	if _, err := r.Get(openai.Name); err != nil {
 		t.Fatalf("Get() error = %v", err)
+	}
+}
+
+func TestPreparedCallFreezesWireRequestBeforeAdmission(t *testing.T) {
+	calls := 0
+	m, cap := stub(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}, model.ProviderConfig{})
+	req := model.Request{Messages: []message.Message{{Role: message.RoleUser, Content: "before"}}, ExtraBody: map[string]any{"seed": 7}}
+	call, err := model.PrepareCall(context.Background(), m, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatal("preparation sent a model request")
+	}
+	req.Messages[0].Content = "after"
+	req.ExtraBody["seed"] = 9
+	if _, err := call.Complete(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	payload := cap.payload(t)
+	messages := payload["messages"].([]any)
+	if messages[0].(map[string]any)["content"] != "before" || payload["seed"] != float64(7) {
+		t.Fatal(payload)
 	}
 }

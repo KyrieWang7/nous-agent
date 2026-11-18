@@ -48,6 +48,8 @@ skills/custom/*
 # Data
 agent/.deer-flow/
 agent/.nous-agent/
+agent-go/.nous/
+agent-go/.nous-agent/
 postgres_data/
 minio_data/
 

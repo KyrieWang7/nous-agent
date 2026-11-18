@@ -42,7 +42,14 @@ type manifest struct {
 	} `json:"tools"`
 }
 
-func Load(directories []string, reserved []string) ([]Contribution, error) {
+func Load(directories []string, reserved []string, override ...map[string]bool) ([]Contribution, error) {
+	var states map[string]bool
+	if len(override) > 0 {
+		states = override[0]
+	}
+	if _, err := Inspect(directories, states); err != nil {
+		return nil, err
+	}
 	reservedSet := make(map[string]struct{}, len(reserved))
 	for _, name := range reserved {
 		reservedSet[name] = struct{}{}
@@ -81,7 +88,11 @@ func Load(directories []string, reserved []string) ([]Contribution, error) {
 			if strings.TrimSpace(item.Name) == "" {
 				return nil, fmt.Errorf("plugin: %s requires name", path)
 			}
-			if item.Enabled != nil && !*item.Enabled {
+			enabled := item.Enabled == nil || *item.Enabled
+			if value, ok := states[item.Name]; ok {
+				enabled = value
+			}
+			if !enabled {
 				continue
 			}
 			for _, declared := range item.Tools {

@@ -28,6 +28,10 @@ const (
 	// sampler call. They are never projected to clients. The input commit is a
 	// write-ahead barrier; the output commit happens before any requested tool
 	// can execute.
+	EventAgentTurnStart       EventType = "agent_turn_start"
+	EventAgentStepStart       EventType = "agent_step_start"
+	EventAgentStepEnd         EventType = "agent_step_end"
+	EventAgentTurnEnd         EventType = "agent_turn_end"
 	EventModelInputCommitted  EventType = "model_input_committed"
 	EventModelOutputCommitted EventType = "model_output_committed"
 	EventContentDelta         EventType = "content_delta"
@@ -82,7 +86,7 @@ const (
 // categoryOf 返回事件类型的默认分类。
 func categoryOf(t EventType) Category {
 	switch t {
-	case EventMessageReplace, EventGuardrailBlock, EventModelInputCommitted, EventModelOutputCommitted, EventTranscriptAppend, EventTranscriptReplace, EventToolStart, EventToolResult, EventSubagentStart, EventSubagentResult,
+	case EventAgentTurnStart, EventAgentStepStart, EventAgentStepEnd, EventAgentTurnEnd, EventMessageReplace, EventGuardrailBlock, EventModelInputCommitted, EventModelOutputCommitted, EventTranscriptAppend, EventTranscriptReplace, EventToolStart, EventToolResult, EventSubagentStart, EventSubagentResult,
 		EventApprovalRequested, EventApprovalResolved, EventQuestionRequested, EventQuestionResolved, EventCompactionStart, EventCompactionComplete,
 		EventRunEnd, EventError, EventRunStart, EventRunStateChanged, EventBudgetChanged, EventPlanModeChanged, EventStateValues, EventMessage:
 		return CategoryAudit
@@ -274,6 +278,8 @@ type TranscriptReplace struct {
 // uses the canonical transcript type; the HTTP adapter converts it to the
 // client message projection and adds the task_id.
 type SubagentProgress struct {
+	ParentRunID  string          `json:"parent_run_id,omitempty"`
+	SessionID    string          `json:"session_id,omitempty"`
 	TaskID       string          `json:"task_id"`
 	MessageID    string          `json:"message_id"`
 	MessageIndex int             `json:"message_index"`
@@ -303,4 +309,16 @@ type UsageReport struct {
 	SubagentTokens  int   `json:"subagent_tokens"`
 	AuxiliaryTokens int   `json:"auxiliary_tokens"`
 	CostMicros      int64 `json:"cost_micros"`
+}
+
+// AgentBoundary records the concrete loop's admission/settlement boundaries.
+// Run events remain owned by RunManager; child executions share the parent
+// event stream and are distinguished by ExecutionRunID.
+type AgentBoundary struct {
+	ExecutionRunID string `json:"execution_run_id"`
+	GenerationID   string `json:"generation_id,omitempty"`
+	Turn           int    `json:"turn"`
+	Step           int    `json:"step,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	Error          string `json:"error,omitempty"`
 }

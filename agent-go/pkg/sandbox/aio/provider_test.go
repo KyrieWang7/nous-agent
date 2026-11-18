@@ -2,6 +2,7 @@ package aio
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -59,7 +60,7 @@ func TestProviderRejectsEscapingPath(t *testing.T) {
 	p, _ := NewProvider(Options{ProvisionerURL: "http://provisioner"})
 	h := &handle{provider: p, root: "/mnt/user-data"}
 	fs := &remoteFS{handle: h}
-	if _, err := fs.Resolve("/etc/passwd"); err != sandbox.ErrEscape {
+	if _, err := fs.Resolve("/etc/passwd"); !errors.Is(err, sandbox.ErrEscape) {
 		t.Fatalf("err=%v", err)
 	}
 }

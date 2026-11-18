@@ -7,18 +7,21 @@ import { urlOfArtifact } from "./utils";
 export async function loadArtifactContent({
   filepath,
   threadId,
+  signal,
 }: {
   filepath: string;
   threadId: string;
+  signal?: AbortSignal;
 }) {
   let enhancedFilepath = filepath;
   if (filepath.endsWith(".skill")) {
     enhancedFilepath = filepath + "/SKILL.md";
   }
   const url = urlOfArtifact({ filepath: enhancedFilepath, threadId });
-  const response = await fetch(url);
-  const text = await response.text();
-  return text;
+  const response = await fetch(url, { signal });
+  if (!response.ok)
+    throw new Error(`Could not load artifact (${response.status})`);
+  return response.text();
 }
 
 export function loadArtifactContentFromToolCall({
@@ -35,9 +38,7 @@ export function loadArtifactContentFromToolCall({
     const message = thread.messages.find((message) => message.id === messageId);
     if (message?.type === "ai") {
       // First try parsed tool_calls
-      const toolCall = message.tool_calls?.find(
-        (tc) => tc.id === toolCallId,
-      );
+      const toolCall = message.tool_calls?.find((tc) => tc.id === toolCallId);
       if (toolCall?.args?.content) {
         return toolCall.args.content;
       }
@@ -45,7 +46,10 @@ export function loadArtifactContentFromToolCall({
       // During streaming, args may still be a partial JSON string in
       // tool_call_chunks. Try to extract the "content" value from it.
       const msgAny = message as unknown as {
-        tool_call_chunks?: { id?: string; args?: string | Record<string, unknown> }[];
+        tool_call_chunks?: {
+          id?: string;
+          args?: string | Record<string, unknown>;
+        }[];
       };
       const chunks = msgAny.tool_call_chunks as
         | { id?: string; args?: string | Record<string, unknown> }[]

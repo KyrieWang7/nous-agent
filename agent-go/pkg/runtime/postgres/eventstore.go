@@ -7,13 +7,12 @@ import (
 	"fmt"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
-type EventStore struct{ pool *pgxpool.Pool }
+type EventStore struct{ pool *platformdb.DB }
 
-func NewEventStore(pool *pgxpool.Pool) (*EventStore, error) {
+func NewEventStore(pool *platformdb.DB) (*EventStore, error) {
 	if pool == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
@@ -24,7 +23,7 @@ func (s *EventStore) PutBatch(ctx context.Context, events []runtime.Event) error
 	if len(events) == 0 {
 		return nil
 	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return s.pool.Transaction(ctx, func(tx *platformdb.DB) error {
 		for _, event := range events {
 			if _, err := tx.Exec(ctx, `INSERT INTO agent_run_event(run_id,seq,thread_id,event_type,category,idempotency_key,content,created_at) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8) ON CONFLICT DO NOTHING`, event.RunID, event.Seq, event.ThreadID, event.Type, event.Category, event.IdempotencyKey, event.Data, event.CreatedAt); err != nil {
 				return fmt.Errorf("runtime/postgres: inserting event: %w", err)
@@ -42,7 +41,7 @@ func (s *EventStore) Get(ctx context.Context, runID string, afterSeq int64, limi
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var events []runtime.Event
 	for rows.Next() {
 		var event runtime.Event

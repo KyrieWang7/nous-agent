@@ -9,6 +9,7 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/delegation"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 )
@@ -16,6 +17,7 @@ import (
 // Agent adapts a native Kernel runner to the Runtime RunManager. It pins one
 // immutable capability view and contains no transport or wire-format logic.
 type Agent struct {
+	Delegate            func(context.Context, delegation.Request) (delegation.Result, error)
 	Runner              *loop.Runner
 	SystemPrompt        string
 	SystemPromptBuilder func(map[string]any) string
@@ -77,6 +79,18 @@ func (a Agent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager
 		lease := sandbox.NewLease(sandboxProvider, req.ThreadID)
 		ctx = sandbox.NewContext(ctx, lease)
 	}
+	if req.Delegation != nil {
+		if a.Delegate == nil {
+			return runmanager.AgentResult{}, errors.New("harness: delegation is unavailable")
+		}
+		run.DelegationHistory = message.CloneAll(req.History)
+		ctx = runtime.WithRunContext(ctx, run)
+		result, runErr := a.Delegate(ctx, *req.Delegation)
+		return runmanager.AgentResult{Output: result.Output, Messages: []message.Message{
+			{Role: message.RoleUser, Content: req.Delegation.Prompt},
+			{Role: message.RoleAssistant, Content: result.Output},
+		}}, runErr
+	}
 	systemPrompt := a.SystemPrompt
 	if a.SystemPromptBuilder != nil {
 		systemPrompt = a.SystemPromptBuilder(values)
@@ -84,10 +98,10 @@ func (a Agent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager
 	result, runErr := a.Runner.Run(ctx, loop.Request{
 		ThreadID: req.ThreadID, RunID: req.RunID, AssistantID: req.AssistantID,
 		SystemPrompt: systemPrompt, History: history, Prompt: req.Prompt,
-		ContentBlocks: req.ContentBlocks, Values: values,
+		ContentBlocks: req.ContentBlocks, Values: values, Checkpoint: req.Checkpoint, PullInputs: req.PullInputs,
 	})
 	agentResult := runmanager.AgentResult{
-		Messages: history.Since(watermark),
+		Messages: history.Since(watermark), Checkpointed: req.Checkpoint != nil,
 	}
 	if result != nil {
 		agentResult.Output = result.Output
@@ -97,7 +111,7 @@ func (a Agent) Run(ctx context.Context, req runmanager.AgentRequest) (runmanager
 		agentResult.Values = result.Values
 		agentResult.RiskLevel = result.RiskLevel
 		agentResult.Usage = runmanager.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens}
-		if result.Compacted {
+		if result.Compacted || req.Checkpoint != nil {
 			agentResult.Transcript = history.All()
 		}
 	}

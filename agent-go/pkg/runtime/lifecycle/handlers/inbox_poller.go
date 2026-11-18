@@ -45,8 +45,10 @@ func (p *InboxPoller) BeforeModel(ctx context.Context, st *lifecycle.State) erro
 	}
 	if st.RunID != "" && p.interval > 0 {
 		now := p.now()
-		if last, ok := p.lastPoll.Load(st.RunID); ok && now.Sub(last.(time.Time)) < p.interval {
-			return nil
+		if last, exists := p.lastPoll.Load(st.RunID); exists {
+			if at, ok := last.(time.Time); ok && now.Sub(at) < p.interval {
+				return nil
+			}
 		}
 		p.lastPoll.Store(st.RunID, now)
 	}

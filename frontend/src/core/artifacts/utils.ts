@@ -10,7 +10,12 @@ export function urlOfArtifact({
   threadId: string;
   download?: boolean;
 }) {
-  return `${getBackendBaseURL()}/api/threads/${threadId}/artifacts${filepath}${download ? "?download=true" : ""}`;
+  const encoded = filepath
+    .replace(/^\/+/, "")
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  return `${getBackendBaseURL()}/api/threads/${encodeURIComponent(threadId)}/artifacts/${encoded}${download ? "?download=true" : ""}`;
 }
 
 export function extractArtifactsFromThread(thread: AgentThread) {
@@ -18,5 +23,5 @@ export function extractArtifactsFromThread(thread: AgentThread) {
 }
 
 export function resolveArtifactURL(absolutePath: string, threadId: string) {
-  return `${getBackendBaseURL()}/api/threads/${threadId}/artifacts${absolutePath}`;
+  return urlOfArtifact({ filepath: absolutePath, threadId });
 }

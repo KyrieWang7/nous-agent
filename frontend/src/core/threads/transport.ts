@@ -12,6 +12,20 @@ import { getAgentAPIBaseURL } from "../config";
 
 import type { PendingUserQuestion } from "./types";
 
+export async function cancelAgentRun(
+  threadId: string,
+  runId: string,
+): Promise<void> {
+  const response = await fetch(
+    `${getAgentAPIBaseURL()}/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    { method: "POST", credentials: "include" },
+  );
+  if (!response.ok)
+    throw new Error(
+      `Cancel request failed (${response.status}): ${await response.text()}`,
+    );
+}
+
 export interface SSEEvent {
   event: string;
   data: unknown;
@@ -187,6 +201,21 @@ export async function fetchActiveRunId(
   } catch {
     return null;
   }
+}
+
+// Runs are returned in creation order. Confirming the latest run prevents an
+// old queued run from taking over a newer explicit child continuation.
+export async function fetchLatestRunId(
+  threadId: string,
+): Promise<string | null> {
+  const response = await fetch(
+    `${getAgentAPIBaseURL()}/threads/${encodeURIComponent(threadId)}/runs`,
+    { credentials: "include", cache: "no-store" },
+  );
+  if (!response.ok)
+    throw new Error(`Could not check latest run (${response.status})`);
+  const runs = (await response.json()) as Array<{ run_id: string }>;
+  return runs.at(-1)?.run_id ?? null;
 }
 
 export async function answerUserQuestion(

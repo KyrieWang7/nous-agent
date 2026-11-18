@@ -2,19 +2,19 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
-type QuestionStore struct{ pool *pgxpool.Pool }
+type QuestionStore struct{ pool *platformdb.DB }
 
-func NewQuestionStore(pool *pgxpool.Pool) (*QuestionStore, error) {
+func NewQuestionStore(pool *platformdb.DB) (*QuestionStore, error) {
 	if pool == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
@@ -30,7 +30,7 @@ func (s *QuestionStore) Get(ctx context.Context, id string) (runtime.QuestionReq
 		&value.Detail, &options, &value.Intent, &value.Status, &answer, &value.CreatedAt, &value.UpdatedAt,
 		&expiresAt, &value.AnsweredBy,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return runtime.QuestionRequest{}, runtime.ErrQuestionNotFound
 	}
 	if err != nil {

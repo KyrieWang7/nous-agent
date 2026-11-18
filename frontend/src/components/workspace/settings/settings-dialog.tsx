@@ -7,6 +7,7 @@ import {
   PaletteIcon,
   SparklesIcon,
   WrenchIcon,
+  PlugIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -21,6 +22,7 @@ import { AboutSettingsPage } from "@/components/workspace/settings/about-setting
 import { AppearanceSettingsPage } from "@/components/workspace/settings/appearance-settings-page";
 import { MemorySettingsPage } from "@/components/workspace/settings/memory-settings-page";
 import { NotificationSettingsPage } from "@/components/workspace/settings/notification-settings-page";
+import { PluginSettingsPage } from "@/components/workspace/settings/plugin-settings-page";
 import { SkillSettingsPage } from "@/components/workspace/settings/skill-settings-page";
 import { ToolSettingsPage } from "@/components/workspace/settings/tool-settings-page";
 import { useI18n } from "@/core/i18n/hooks";
@@ -30,6 +32,7 @@ type SettingsSection =
   | "appearance"
   | "memory"
   | "tools"
+  | "plugins"
   | "skills"
   | "notification"
   | "about";
@@ -68,10 +71,12 @@ export function SettingsDialog(props: SettingsDialogProps) {
         icon: BrainIcon,
       },
       { id: "tools", label: t.settings.sections.tools, icon: WrenchIcon },
+      { id: "plugins", label: t.pluginSettings.title, icon: PlugIcon },
       { id: "skills", label: t.settings.sections.skills, icon: SparklesIcon },
       { id: "about", label: t.settings.sections.about, icon: InfoIcon },
     ],
     [
+      t.pluginSettings.title,
       t.settings.sections.appearance,
       t.settings.sections.memory,
       t.settings.sections.tools,
@@ -86,28 +91,29 @@ export function SettingsDialog(props: SettingsDialogProps) {
       {...dialogProps}
       onOpenChange={(open) => props.onOpenChange?.(open)}
     >
-        <DialogContent
-          className="flex h-[75vh] max-h-[calc(100vh-2rem)] flex-col sm:max-w-5xl md:max-w-6xl"
-          aria-describedby={undefined}
-        >
+      <DialogContent
+        className="flex h-[75vh] max-h-[calc(100vh-2rem)] flex-col sm:max-w-5xl md:max-w-6xl"
+        aria-describedby={undefined}
+      >
         <DialogHeader className="gap-1">
           <DialogTitle>{t.settings.title}</DialogTitle>
           <p className="text-muted-foreground text-sm">
             {t.settings.description}
           </p>
         </DialogHeader>
-        <div className="grid min-h-0 flex-1 gap-4 md:grid-cols-[220px_1fr]">
-          <nav className="bg-sidebar min-h-0 overflow-y-auto rounded-lg border p-2">
-            <ul className="space-y-1 pr-1">
+        <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-4 md:grid-cols-[220px_1fr] md:grid-rows-1">
+          <nav className="bg-sidebar min-h-0 overflow-x-auto rounded-lg border p-2 md:overflow-y-auto">
+            <ul className="flex gap-1 md:block md:space-y-1 md:pr-1">
               {sections.map(({ id, label, icon: Icon }) => {
                 const active = activeSection === id;
                 return (
                   <li key={id}>
                     <button
                       type="button"
+                      aria-current={active ? "page" : undefined}
                       onClick={() => setActiveSection(id as SettingsSection)}
                       className={cn(
-                        "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+                        "flex w-auto shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm font-medium whitespace-nowrap transition-colors md:w-full md:gap-3",
                         active
                           ? "bg-primary text-primary-foreground shadow-sm"
                           : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -126,6 +132,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
               {activeSection === "appearance" && <AppearanceSettingsPage />}
               {activeSection === "memory" && <MemorySettingsPage />}
               {activeSection === "tools" && <ToolSettingsPage />}
+              {activeSection === "plugins" && <PluginSettingsPage />}
               {activeSection === "skills" && (
                 <SkillSettingsPage
                   onClose={() => props.onOpenChange?.(false)}

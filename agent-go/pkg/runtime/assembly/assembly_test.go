@@ -11,15 +11,14 @@ import (
 
 type registeringPlugin struct{}
 
-func (registeringPlugin) Name() string           { return "registering" }
-func (registeringPlugin) Dependencies() []string { return nil }
-func (registeringPlugin) Start(_ context.Context, host plugin.Host) error {
-	return host.Capabilities.Register(capability.Entry{
+func (registeringPlugin) Name() string     { return "registering" }
+func (registeringPlugin) Inject() []string { return []string{plugin.CapabilityService} }
+func (registeringPlugin) Apply(ctx *plugin.Context) error {
+	return ctx.RegisterCapability(capability.Entry{
 		Definition: capability.Definition{Name: "tool.echo", Kind: capability.KindTool},
 		Resolver:   func(context.Context, capability.ResolveRequest) (any, error) { return "echo", nil },
 	})
 }
-func (registeringPlugin) Stop(context.Context) error { return nil }
 
 func TestNewPublishesPluginCapabilitiesInGeneration(t *testing.T) {
 	r, err := assembly.New(context.Background(), assembly.Options{GenerationID: "g1", Plugins: []plugin.Plugin{registeringPlugin{}}})

@@ -30,7 +30,16 @@ func (s *DirectSampler) Sample(ctx context.Context, st *lifecycle.State) (*model
 		return nil, false, errors.New("loop: model input was not built")
 	}
 
-	resp, err := s.m.Complete(ctx, *st.ModelInput)
+	call, err := model.PrepareCall(ctx, s.m, *st.ModelInput)
+	if err != nil {
+		return nil, false, err
+	}
+	if st.BeforeModelAttempt != nil {
+		if err := st.BeforeModelAttempt(ctx, call.Info()); err != nil {
+			return nil, false, err
+		}
+	}
+	resp, err := call.Complete(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -39,3 +48,6 @@ func (s *DirectSampler) Sample(ctx context.Context, st *lifecycle.State) (*model
 	}
 	return resp, false, nil
 }
+
+// ManagesModelAttempts keeps adapter preparation ahead of the input commit.
+func (*DirectSampler) ManagesModelAttempts() bool { return true }

@@ -11,11 +11,9 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
-	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 )
@@ -121,17 +119,8 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 			if !strings.HasPrefix(args.Plan, "# ") || strings.TrimSpace(strings.TrimPrefix(strings.SplitN(args.Plan, "\n", 2)[0], "# ")) == "" {
 				return errResult(fmt.Errorf("exit_plan_mode requires a non-empty Markdown plan starting with a # heading")), nil
 			}
-			if !run.Capabilities.Initialized() {
-				return nil, errors.New("exit_plan_mode: capability view is not initialized")
-			}
-			questions, err := capability.ResolveViewAs[*runtime.QuestionManager](ctx, run.Capabilities, questionCapability, capability.KindInteraction, capability.ResolveRequest{
-				GenerationID: run.GenerationID, ThreadID: run.ThreadID, RunID: run.RunID, Values: run.Values,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("exit_plan_mode: resolving user question capability: %w", err)
-			}
 			questionID := planReviewID(run.RunID, call.ID, args.Plan)
-			question, err := questions.Create(ctx, runtime.QuestionRequest{
+			question, err := askUser(ctx, run, questionCapability, runtime.QuestionRequest{
 				ID: questionID, RunID: run.RunID, ThreadID: run.ThreadID, ToolCallID: call.ID,
 				Header: "Review the complete plan", Question: "Approve this complete plan once and execute all todos?", Detail: args.Plan,
 				Options: []runtime.QuestionOption{
@@ -140,37 +129,8 @@ func ExitPlanMode(questionCapability string) tool.Definition {
 				},
 				Intent: "plan-review",
 			})
-			if err != nil && !errors.Is(err, runtime.ErrQuestionExists) {
+			if err != nil {
 				return nil, err
-			}
-			if errors.Is(err, runtime.ErrQuestionExists) {
-				question, err = questions.Get(ctx, questionID)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if question.Status == runtime.QuestionPending {
-				if run.StateMachine == nil {
-					return nil, errors.New("exit_plan_mode: run state machine is unavailable")
-				}
-				if err := run.StateMachine.WaitUser(questionID); err != nil {
-					return nil, err
-				}
-				if err := publishQuestion(ctx, run, runtime.EventQuestionRequested, question, questionID+":requested"); err != nil {
-					return nil, err
-				}
-				question, err = questions.Wait(ctx, questionID, 100*time.Millisecond)
-				if err != nil {
-					return nil, err
-				}
-				if !run.StateMachine.Snapshot().Phase.Terminal() {
-					if err := run.StateMachine.WaitTool(); err != nil {
-						return nil, err
-					}
-				}
-				if err := publishQuestion(context.WithoutCancel(ctx), run, runtime.EventQuestionResolved, question, questionID+":resolved"); err != nil {
-					return nil, err
-				}
 			}
 			if question.Status == runtime.QuestionDismissed {
 				return errResult(errors.New("the user dismissed the plan review; stay in plan mode and wait for their message")), nil

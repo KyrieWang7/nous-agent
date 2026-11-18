@@ -15,12 +15,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/sandboxapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/handler/sandboxapi"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/controller"
 	dockersandbox "github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/docker"
+	"github.com/KyrieWang7/nous-agent/platform-go/logging"
 )
 
 func main() {
+	flush, err := logging.Install(logging.Options{Service: "sandboxd", Level: os.Getenv("LOG_LEVEL")})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer func() { _ = flush() }()
+
 	if err := run(); err != nil {
 		slog.Error("sandboxd stopped", "error", err)
 		os.Exit(1)

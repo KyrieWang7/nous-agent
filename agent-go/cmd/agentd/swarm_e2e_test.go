@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/repository"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/server"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/migrations"
 	runtimepostgres "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/postgres"
@@ -111,15 +113,15 @@ func TestSwarmTaskHTTPFlowPersistsLifecycleAndUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(built.Close)
-	postgresStore, err := httpapi.NewPostgresStore(pool)
+	postgresStore, err := repository.NewPostgresStore(testGORM(t, pool))
 	if err != nil {
 		t.Fatal(err)
 	}
-	postgresEvents, err := runtimepostgres.NewEventStore(pool)
+	postgresEvents, err := runtimepostgres.NewEventStore(testGORM(t, pool))
 	if err != nil {
 		t.Fatal(err)
 	}
-	api, err := httpapi.New(httpapi.Options{
+	api, err := server.New(server.Options{
 		Agent: built.agent, Store: postgresStore, EventStore: postgresEvents,
 		AllowedTools: built.tools, Pricer: buildPricer(cfg.Models),
 	})
@@ -346,9 +348,24 @@ func startAgentdPostgres(t *testing.T) (string, *pgxpool.Pool) {
 		}
 	})
 
-	databaseURL := fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%s/postgres?sslmode=disable", resource.GetPort("5432/tcp"))
+	var databaseURL string
 	var pool *pgxpool.Pool
 	if err := dockerPool.Retry(func() error {
+		// Docker Desktop may not publish a port mapping in the first container snapshot.
+		// Never let an empty test port fall back to a database on the developer's 5432.
+		container, err := dockerPool.Client.InspectContainer(resource.Container.ID)
+		if err != nil {
+			return err
+		}
+		// Expire reads the original Resource from its timer goroutine.
+		// Inspect into a local copy instead of racing that cleanup owner.
+		current := *resource
+		current.Container = container
+		port := current.GetPort("5432/tcp")
+		if port == "" {
+			return fmt.Errorf("test PostgreSQL port is not published yet")
+		}
+		databaseURL = fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%s/postgres?sslmode=disable", port)
 		candidate, err := pgxpool.New(context.Background(), databaseURL)
 		if err != nil {
 			return err
@@ -364,4 +381,14 @@ func startAgentdPostgres(t *testing.T) (string, *pgxpool.Pool) {
 	}
 	t.Cleanup(pool.Close)
 	return databaseURL, pool
+}
+
+func testGORM(t *testing.T, pool *pgxpool.Pool) *platformdb.DB {
+	t.Helper()
+	db, err := platformdb.FromPool(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	return db
 }

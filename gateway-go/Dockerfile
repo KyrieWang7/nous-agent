@@ -1,9 +1,10 @@
 FROM golang:1.25-alpine AS build
 
-WORKDIR /src
-COPY go.mod go.sum ./
+WORKDIR /src/gateway-go
+COPY gateway-go/go.mod gateway-go/go.sum ./
+COPY platform-go /src/platform-go
 RUN go mod download
-COPY . .
+COPY gateway-go/ .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nous-gateway ./cmd/gateway
 
 FROM debian:bookworm-slim

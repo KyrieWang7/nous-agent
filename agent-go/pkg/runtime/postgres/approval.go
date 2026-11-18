@@ -2,20 +2,20 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
 )
 
 // ApprovalStore provides cross-process approval recovery. The update
 // predicate makes terminal decisions first-writer-wins at the database layer.
-type ApprovalStore struct{ pool *pgxpool.Pool }
+type ApprovalStore struct{ pool *platformdb.DB }
 
-func NewApprovalStore(pool *pgxpool.Pool) (*ApprovalStore, error) {
+func NewApprovalStore(pool *platformdb.DB) (*ApprovalStore, error) {
 	if pool == nil {
 		return nil, errors.New("runtime/postgres: postgres pool is nil")
 	}
@@ -30,7 +30,7 @@ func (s *ApprovalStore) Get(ctx context.Context, id string) (runtime.ApprovalReq
 		&req.ID, &req.RunID, &req.TransactionID, &req.ToolName, &args, &req.Reason,
 		&req.Status, &req.CreatedAt, &req.UpdatedAt, &expiresAt, &req.DecisionBy,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return runtime.ApprovalRequest{}, runtime.ErrApprovalNotFound
 	}
 	if err != nil {

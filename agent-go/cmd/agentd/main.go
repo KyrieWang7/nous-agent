@@ -15,7 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/repository"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/server"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/acp"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/compaction"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
@@ -35,11 +36,11 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/prompt"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/capability"
+	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/delegation"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle"
 	lifecyclehandlers "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/lifecycle/handlers"
 	runtimeplugin "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/plugin"
 	runtimepostgres "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/postgres"
-	runtimeredis "github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/redis"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/sandbox/aio"
@@ -52,6 +53,11 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool/builtin"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/tool/community"
+	"github.com/KyrieWang7/nous-agent/platform-go/httpx"
+	"github.com/KyrieWang7/nous-agent/platform-go/logging"
+	platformdb "github.com/KyrieWang7/nous-agent/platform-go/postgres"
+	"github.com/KyrieWang7/nous-agent/platform-go/redisclient"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -61,14 +67,23 @@ const (
 	delegatedTaskPrompt = `
 
 <delegated_task>
-You are a delegated subagent. Complete the assigned prompt directly, do not
-create nested tasks, and return concrete findings to the team lead. When Swarm
+You are a delegated subagent. Complete the assigned prompt and return concrete
+findings to your parent. If task and subagent_control are exposed, you may
+delegate focused work within the inherited depth and shared budget limits.
+Wait for delegated work and report its real outcome before finishing. When Swarm
 messaging tools are available, use send_message with to="lead" to report
 or coordinate, and do not change team lifecycle.
 </delegated_task>`
 )
 
 func main() {
+	flush, err := logging.Install(logging.Options{Service: "agentd", Level: os.Getenv("LOG_LEVEL")})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer func() { _ = flush() }()
+
 	if err := run(); err != nil {
 		slog.Error("agentd stopped", "error", err)
 		os.Exit(1)
@@ -83,72 +98,80 @@ func run() error {
 		return err
 	}
 
-	apiOpts := httpapi.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval, Pricer: buildPricer(cfg.Models)}
+	if cfg.Runtime.DatabaseURL == "" {
+		return errors.New("agentd: DATABASE_URL is required for durable execution")
+	}
+	apiOpts := server.Options{HeartbeatInterval: cfg.Runtime.HeartbeatInterval, Pricer: buildPricer(cfg.Models)}
 	apiOpts.Bus = runtime.NewMemoryBus(runtime.BusOptions{
 		RingCapacity:     cfg.Runtime.EventBufferSize,
 		SubscriberBuffer: cfg.Runtime.EventBufferSize,
 	})
 	var taskStore subagent.TaskStore
 	var pool *pgxpool.Pool
-	var postgresEvents runtime.EventStore
+	var database *platformdb.DB
 	if cfg.Runtime.DatabaseURL != "" {
-		pool, err = openPool(cfg.Runtime.DatabaseURL)
+		database, err = platformdb.Open(context.Background(), cfg.Runtime.DatabaseURL)
 		if err != nil {
 			return err
 		}
-		defer pool.Close()
-		apiOpts.Store, err = httpapi.NewPostgresStore(pool)
+		defer database.Close()
+		pool = database.Native
+		apiOpts.Store, err = repository.NewPostgresStore(database)
 		if err != nil {
 			return err
 		}
-		postgresEvents, err = runtimepostgres.NewEventStore(pool)
+		apiOpts.EventStore, err = runtimepostgres.NewEventStore(database)
 		if err != nil {
 			return err
 		}
-		apiOpts.EventStore = postgresEvents
-		apiOpts.MetadataStore, err = runtimepostgres.NewMetadataStore(pool)
+		durableTasks, openErr := runtimepostgres.NewSubagentStore(database)
+		if openErr != nil {
+			return openErr
+		}
+		taskStore = durableTasks
+		apiOpts.Subagents = durableTasks
+		apiOpts.MetadataStore, err = runtimepostgres.NewMetadataStore(database)
 		if err != nil {
 			return err
 		}
-		apiOpts.Snapshots, err = runtimepostgres.NewSnapshotStore(pool)
+		apiOpts.Snapshots, err = runtimepostgres.NewSnapshotStore(database)
 		if err != nil {
 			return err
 		}
 	}
-	if cfg.Runtime.RedisURL != "" {
-		redisOpts, parseErr := redis.ParseURL(cfg.Runtime.RedisURL)
-		if parseErr != nil {
-			return fmt.Errorf("agentd: parsing redis URL: %w", parseErr)
+	instanceID := uuid.NewString()
+	apiOpts.Registry, err = runtime.NewRegistry(context.Background(), runtime.RegistryOptions{
+		Backend: runtimepostgres.NewRegistryBackend(database, instanceID), Owner: instanceID, TTL: cfg.Runtime.EventTTL,
+	})
+	if err != nil {
+		return err
+	}
+	var client *redis.Client
+	if cfg.HTTP.RateLimit.Enabled && cfg.Runtime.RedisURL != "" {
+		var openErr error
+		client, openErr = redisclient.Open(context.Background(), cfg.Runtime.RedisURL)
+		if openErr != nil {
+			return openErr
 		}
-		client := redis.NewClient(redisOpts)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := client.Ping(ctx).Err(); err != nil {
-			cancel()
-			_ = client.Close()
-			return fmt.Errorf("agentd: pinging redis: %w", err)
-		}
-		cancel()
 		defer func() { _ = client.Close() }()
-		taskStore, err = runtimeredis.NewTaskStore(client)
+
+	}
+	if cfg.HTTP.RateLimit.Enabled {
+		if client == nil {
+			return errors.New("agentd: HTTP rate limit requires REDIS_URL")
+		}
+		limiter, err := httpx.RateLimit("agent", client, cfg.HTTP.RateLimit.Requests, cfg.HTTP.RateLimit.Window)
 		if err != nil {
 			return err
 		}
-		redisEvents := runtimeredis.NewEventStore(client, cfg.Runtime.EventTTL)
-		apiOpts.EventStore = redisEvents
-		if postgresEvents != nil {
-			apiOpts.EventStore = runtime.MultiEventStore{Primary: redisEvents, Mirrors: []runtime.EventStore{postgresEvents}}
-		}
-		apiOpts.Registry, err = runtime.NewRegistry(context.Background(), runtime.RegistryOptions{Backend: runtimeredis.NewRegistryBackend(client), Owner: cfg.Server.Address, TTL: cfg.Runtime.EventTTL})
-		if err != nil {
-			return err
-		}
+		apiOpts.Middleware = append(apiOpts.Middleware, limiter)
 	}
 	if apiOpts.Registry != nil {
 		apiOpts.OwnRegistry = true
 	}
 	var approvalStore runtime.ApprovalStore = runtime.NewMemoryApprovalStore()
 	if pool != nil {
-		approvalStore, err = runtimepostgres.NewApprovalStore(pool)
+		approvalStore, err = runtimepostgres.NewApprovalStore(database)
 		if err != nil {
 			return err
 		}
@@ -160,7 +183,7 @@ func run() error {
 	apiOpts.Approvals = approvalManager
 	var questionStore runtime.QuestionStore = runtime.NewMemoryQuestionStore()
 	if pool != nil {
-		questionStore, err = runtimepostgres.NewQuestionStore(pool)
+		questionStore, err = runtimepostgres.NewQuestionStore(database)
 		if err != nil {
 			return err
 		}
@@ -183,44 +206,32 @@ func run() error {
 	}
 	defer reloadable.Close()
 	apiOpts.Agent = reloadable
+	apiOpts.Plugins = reloadable
 	apiOpts.AllowedTools = built.tools
-	api, err := httpapi.New(apiOpts)
+	api, err := server.New(apiOpts)
 	if err != nil {
 		return err
 	}
 	defer api.Close()
 
-	server := &http.Server{Addr: cfg.Server.Address, Handler: api, ReadHeaderTimeout: 10 * time.Second}
+	httpServer := server.HTTP(cfg.Server.Address, api)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx) //nolint:contextcheck // shutdown must outlive the cancelled signal context
+		_ = httpServer.Shutdown(shutdownCtx) //nolint:contextcheck // shutdown must outlive the cancelled signal context
 	}()
 	slog.Info("Nous agent-go listening", "address", cfg.Server.Address, "api", "/api/v1")
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-func openPool(databaseURL string) (*pgxpool.Pool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, databaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("agentd: opening postgres: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("agentd: pinging postgres: %w", err)
-	}
-	return pool, nil
-}
-
 type builtAgent struct {
+	plugins      []string
 	agent        runmanager.Agent
 	tools        []string
 	pricer       *runtime.Pricer
@@ -232,11 +243,18 @@ type builtAgent struct {
 }
 
 func (b builtAgent) Close() {
+	if err := b.dispose(); err != nil {
+		slog.Warn("closing agent dependencies", "error", err)
+	}
+}
+func (b builtAgent) dispose() error {
+	var errs []error
 	for i := len(b.close) - 1; i >= 0; i-- {
 		if err := b.close[i](); err != nil {
-			slog.Warn("closing agent dependency", "error", err)
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.Pool, approvalManagers ...*runtime.ApprovalManager) (builtAgent, error) {
@@ -358,7 +376,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			return builtAgent{}, err
 		}
 	}
-	if err := registry.Register(lifecyclehandlers.ClarificationTool()); err != nil {
+	if err := registry.Register(builtin.AskClarification("interaction.questions")); err != nil {
 		return builtAgent{}, err
 	}
 	if err := registry.Register(builtin.WriteTodos()); err != nil {
@@ -437,9 +455,14 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 		closers = append(closers, client.Close)
 	}
 	var runtimePlugins []runtimeplugin.Plugin
+	var loadedPluginNames []string
 	if cfg.Plugins.Enabled {
 		reserved := append(registry.Names(), "task", "swarm_batch", "team_create", "team_delete", "list_teammates", "send_message", "invoke_acp_agent")
-		contributions, pluginErr := plugin.Load(cfg.Plugins.Directories, reserved)
+		pluginDirs, pluginErr := cfg.Plugins.LoadDirectories()
+		if pluginErr != nil {
+			return builtAgent{}, pluginErr
+		}
+		contributions, pluginErr := plugin.Load(pluginDirs, reserved, cfg.Plugins.States)
 		if pluginErr != nil {
 			return builtAgent{}, pluginErr
 		}
@@ -449,6 +472,9 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			}
 		}
 		runtimePlugins = commandToolPlugins(contributions)
+		for _, p := range runtimePlugins {
+			loadedPluginNames = append(loadedPluginNames, strings.TrimPrefix(p.Name(), "command-tools."))
+		}
 	}
 	if len(cfg.ACPAgents) > 0 {
 		agents := make(map[string]acp.AgentConfig, len(cfg.ACPAgents))
@@ -652,14 +678,13 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 			childLifecycle = append(childLifecycle, lifecyclehandlers.NewSkillActivation("skill.registry", registry, cfg.Skills.Force))
 			childDeclared = append(childDeclared, lifecyclehandlers.NameSkillActivation)
 		}
-		childLifecycle = append(childLifecycle, lifecyclehandlers.NewClarification())
-		childDeclared = append(childDeclared, lifecycle.TerminalName)
 		child, err := harness.New(harness.Options{Sampler: router, Registry: registry, LifecycleHandlers: childLifecycle, DeclaredHandlers: childDeclared, ToolSet: newRestrictedToolSet(toolSet, allowed), Publisher: subagentProgressPublisher{}, Compactor: compactor, Limits: loop.Limits{MaxIterations: def.MaxTurns, Deadline: cfg.Loop.Deadline, MaxTokens: cfg.Loop.TokenBudget, MaxCostMicros: cfg.Loop.CostBudgetMicros, MaxToolCalls: cfg.Loop.ToolCallBudget, MaxSubagents: cfg.Loop.SubagentBudget, StopReinjectionLimit: cfg.Loop.StopReinjectionLimit}, LifecycleTimeout: cfg.Loop.LifecycleTimeout, ToolConcurrency: cfg.Loop.ToolConcurrency, TokenLimit: cfg.Loop.TokenBudget, Capabilities: capabilities, GenerationID: generationID})
 		if err != nil {
 			return subagent.PreparedRunner{}, err
 		}
 		return subagent.PreparedRunner{Runner: child.Runner(), Release: child.Close}, nil
 	}, taskStore, cfg.Subagents.TaskTTL, cfg.Subagents.MaxConcurrent)
+	closers = append(closers, manager.Close)
 	manager.SetHookRunner(hookRunner)
 	if swarmManager != nil {
 		manager.SetLifecycle(newSwarmSubagentLifecycle(swarmManager))
@@ -691,6 +716,9 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	}, manager); err != nil {
 		return builtAgent{}, err
 	}
+	if err := registry.Register(telemetryObserver.InstrumentToolDefinition(manager.ControlTool())); err != nil {
+		return builtAgent{}, err
+	}
 	if err := registry.Register(telemetryObserver.InstrumentToolDefinition(manager.TaskTool())); err != nil {
 		return builtAgent{}, err
 	}
@@ -701,7 +729,12 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Memory.Enabled {
 		var store mem.Store = mem.NewMemoryStore()
 		if pool != nil {
-			store, err = runtimepostgres.NewMemoryStore(pool)
+			memoryDB, openErr := platformdb.FromPool(pool)
+			if openErr != nil {
+				return builtAgent{}, openErr
+			}
+			closers = append(closers, func() error { memoryDB.Close(); return nil })
+			store, err = runtimepostgres.NewMemoryStore(memoryDB)
 			if err != nil {
 				return builtAgent{}, err
 			}
@@ -730,8 +763,7 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	if cfg.Skills.Enabled {
 		chain = append(chain, lifecyclehandlers.NewSkillActivation("skill.registry", registry, cfg.Skills.Force))
 	}
-	chain = append(chain, lifecyclehandlers.NewClarification())
-	declared := append(baseLifecycleNames(cfg, hookHandler != nil, swarmManager != nil), lifecycle.TerminalName)
+	declared := baseLifecycleNames(cfg, hookHandler != nil, swarmManager != nil)
 	if cfg.Memory.Enabled {
 		declared = append(declared, lifecyclehandlers.NameMemory)
 	}
@@ -763,7 +795,10 @@ func buildAgent(cfg config.Config, taskStore subagent.TaskStore, pool *pgxpool.P
 	assembled = true
 	budgetLimits := runtime.BudgetAmount{Tokens: int64(cfg.Loop.TokenBudget), CostMicros: cfg.Loop.CostBudgetMicros, ToolCalls: int64(cfg.Loop.ToolCallBudget), Subagents: int64(cfg.Loop.SubagentBudget)}
 	capabilityNames := h.Runtime().Generation.Capabilities().Names()
-	return builtAgent{agent: harness.Agent{
+	return builtAgent{plugins: loadedPluginNames, agent: harness.Agent{
+		Delegate: func(ctx context.Context, req delegation.Request) (delegation.Result, error) {
+			return manager.Resume(ctx, req)
+		},
 		Runner: h.Runner(), SystemPrompt: promptBuilder(initialValues), SystemPromptBuilder: promptBuilder,
 		InitialValues: initialValues, Capabilities: h.Runtime().Generation.Capabilities(),
 		GenerationID: generationID, SandboxCapability: sandboxCapability, BudgetLimits: budgetLimits, MaxRecursionDepth: cfg.Loop.MaxRecursionDepth,
@@ -903,7 +938,7 @@ func publishModelStreamEvent(ctx context.Context, st *lifecycle.State, ev model.
 	default:
 		return
 	}
-	run.Publish(ctx, event)
+	_, _ = run.Publish(ctx, event) // Progress is trace-only; input/output and terminal events use durable barriers.
 }
 
 type subagentProgressPublisher struct{}
@@ -914,6 +949,7 @@ func (subagentProgressPublisher) PublishReply(ctx context.Context, st *lifecycle
 		return
 	}
 	_, _ = run.Publish(ctx, runtime.MustEvent(run.EventStreamRunID(), run.ThreadID, runtime.EventSubagentProgress, runtime.SubagentProgress{
+		ParentRunID: run.ParentRunID, SessionID: run.SubagentSessionID,
 		TaskID:       run.SubagentTaskID,
 		MessageID:    fmt.Sprintf("%s:%d", st.RunID, st.Iteration),
 		MessageIndex: st.Iteration + 1,

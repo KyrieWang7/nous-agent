@@ -56,7 +56,7 @@ type swarmBatchResult struct {
 // task dispatcher. Every worker remains an independent child run with the same
 // budgets, policy, lifecycle, persistence, and progress events as task.
 func (m *Manager) SwarmBatchTool() tool.Definition {
-	parameters := json.RawMessage(fmt.Sprintf(`{"type":"object","properties":{"objective":{"type":"string"},"items":{"type":"array","minItems":2,"maxItems":%d,"items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}}},"required":["id","name","description","prompt","subagent_type"]}},"review":{"type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"},"subagent_type":{"type":"string"},"prompt":{"type":"string"}}}},"required":["objective","items"]}`, cap(m.sem)))
+	parameters := json.RawMessage(fmt.Sprintf(`{"type":"object","properties":{"objective":{"type":"string"},"items":{"type":"array","minItems":2,"maxItems":%d,"items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"max_turns":{"type":"integer","minimum":1},"restrict_tools":{"type":"array","items":{"type":"string"}}},"required":["id","name","description","prompt","subagent_type"]}},"review":{"type":"object","properties":{"enabled":{"type":"boolean"},"name":{"type":"string"},"subagent_type":{"type":"string"},"prompt":{"type":"string"}}}},"required":["objective","items"]}`, m.concurrency))
 	return tool.Definition{
 		Name:        "swarm_batch",
 		Group:       "swarm",
@@ -101,7 +101,7 @@ func (m *Manager) validateSwarmBatch(args swarmBatchArgs) error {
 	if strings.TrimSpace(args.Objective) == "" {
 		return errors.New("subagent: swarm_batch objective is required")
 	}
-	limit := cap(m.sem)
+	limit := m.concurrency
 	if len(args.Items) < 2 || len(args.Items) > limit {
 		return fmt.Errorf("subagent: swarm_batch requires 2-%d items", limit)
 	}
@@ -154,7 +154,6 @@ func (m *Manager) dispatchSwarmBatch(ctx context.Context, callID string, args sw
 	workers := make([]swarmBatchWorkerResult, len(args.Items))
 	var wg sync.WaitGroup
 	for index, item := range args.Items {
-		index, item := index, item
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

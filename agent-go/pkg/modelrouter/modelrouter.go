@@ -328,12 +328,16 @@ func (r *Router) sampleWithRecovery(
 				r.rebuildInput(st, before)
 			}
 		}
+		prepared, err := model.PrepareCall(ctx, m, *st.ModelInput)
+		if err != nil {
+			return nil, false, err
+		}
 		if st.BeforeModelAttempt != nil {
-			if err := st.BeforeModelAttempt(ctx, model.RequestInfo(m, *st.ModelInput)); err != nil {
+			if err := st.BeforeModelAttempt(ctx, prepared.Info()); err != nil {
 				return nil, false, err
 			}
 		}
-		resp, streamed, err := r.sampleOnce(ctx, m, st)
+		resp, streamed, err := r.sampleOnce(ctx, prepared, st)
 		if err == nil {
 			return resp, streamed, nil
 		}
@@ -382,10 +386,10 @@ func (r *Router) sampleWithRecovery(
 
 // sampleOnce 做一次真实调用。第二个返回值表示是否已有内容流出。
 func (r *Router) sampleOnce(
-	ctx context.Context, m model.Model, st *lifecycle.State,
+	ctx context.Context, m model.PreparedCall, st *lifecycle.State,
 ) (*model.Response, bool, error) {
 	if !r.cfg.Stream {
-		resp, err := m.Complete(ctx, *st.ModelInput)
+		resp, err := m.Complete(ctx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -395,7 +399,7 @@ func (r *Router) sampleOnce(
 		return resp, false, nil
 	}
 
-	reader, err := m.Stream(ctx, *st.ModelInput)
+	reader, err := m.Stream(ctx)
 	if err != nil {
 		return nil, false, err
 	}

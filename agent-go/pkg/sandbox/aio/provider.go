@@ -115,7 +115,7 @@ func (p *Provider) call(ctx context.Context, method, endpoint string, input, out
 	if e != nil {
 		return fmt.Errorf("aio sandbox: %w", e)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, e := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if e != nil {
 		return e
@@ -195,7 +195,7 @@ func (p *Provider) callBase(ctx context.Context, base, method, endpoint string, 
 	if e != nil {
 		return fmt.Errorf("aio sandbox: %w", e)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, e := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if e != nil {
 		return e

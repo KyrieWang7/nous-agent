@@ -1,0 +1,10 @@
+**
+!gateway-go/
+!gateway-go/**
+!platform-go/
+!platform-go/**
+**/.env*
+**/.git
+**/tmp
+**/tmp-sandboxd
+**/.nous-agent

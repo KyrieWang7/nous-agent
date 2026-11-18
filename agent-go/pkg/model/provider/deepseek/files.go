@@ -45,7 +45,7 @@ func (c *Client) filesRequest(ctx context.Context, method, path string, body io.
 	if err != nil {
 		return transportError(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		return providerError(resp.StatusCode, raw)

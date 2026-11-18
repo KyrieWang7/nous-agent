@@ -6,8 +6,8 @@ services:
   # deployed sandbox host implementing the same contract.
   sandboxd:
     build:
-      context: ./agent-go
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: agent-go/Dockerfile.dev
     container_name: nous-agent-sandboxd
     restart: unless-stopped
     command: ["air", "-c", ".air.sandboxd.toml"]
@@ -21,6 +21,7 @@ services:
       SANDBOX_REAP_INTERVAL: "${SANDBOX_REAP_INTERVAL:-1m}"
     volumes:
       - ./agent-go:/app
+      - ./platform-go:/platform-go:ro
       - "${DOCKER_HOST_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
       - "${SANDBOX_HOST_BASE_DIR:-/tmp/nous-agent-sandboxes}:/var/lib/nous-sandbox"
     healthcheck:
@@ -33,20 +34,25 @@ services:
   # Primary Agent Harness. Dockerfile.dev runs Air, so Go and YAML changes reload.
   agent-go:
     build:
-      context: ./agent-go
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: agent-go/Dockerfile.dev
     container_name: nous-agent-go-server
     restart: unless-stopped
     ports:
       - "${AGENT_PORT:-7776}:7776"
     volumes:
       - ./agent-go:/app
+      - ./platform-go:/platform-go:ro
       - ./skills/public:/opt/nous/skills/public:ro
       - gateway_custom_skills:/opt/nous/skills/custom:ro
       - gateway_config:/app/extensions
       - agent_go_data:/app/.nous-agent
     environment:
       NOUS_AGENT_ADDR: ":7776"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      HTTP_RATE_LIMIT_ENABLED: "${HTTP_RATE_LIMIT_ENABLED:-false}"
+      HTTP_RATE_LIMIT_REQUESTS: "${HTTP_RATE_LIMIT_REQUESTS:-60}"
+      HTTP_RATE_LIMIT_WINDOW: "${HTTP_RATE_LIMIT_WINDOW:-1m}"
       DATABASE_URL: "${DATABASE_URL:-}"
       REDIS_URL: "${REDIS_URL:-}"
       NOUS_EXTENSIONS_CONFIG_PATH: /app/extensions/extensions.json
@@ -69,14 +75,19 @@ services:
   # Primary control plane and file conversion service.
   gateway-go:
     build:
-      context: ./gateway-go
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: gateway-go/Dockerfile
     container_name: nous-agent-go-gateway
     restart: unless-stopped
     ports:
       - "${GATEWAY_PORT:-7777}:7777"
     environment:
       GATEWAY_ADDR: ":7777"
+      REDIS_URL: "${REDIS_URL:-}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      HTTP_RATE_LIMIT_ENABLED: "${HTTP_RATE_LIMIT_ENABLED:-false}"
+      HTTP_RATE_LIMIT_REQUESTS: "${HTTP_RATE_LIMIT_REQUESTS:-60}"
+      HTTP_RATE_LIMIT_WINDOW: "${HTTP_RATE_LIMIT_WINDOW:-1m}"
       DATABASE_URL: "${DATABASE_URL:-}"
       NOUS_HARNESS_CONFIG_PATH: /etc/nous-agent/config.yaml
       NOUS_EXTENSIONS_CONFIG_PATH: /config/extensions.json

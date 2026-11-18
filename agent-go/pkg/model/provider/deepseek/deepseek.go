@@ -65,7 +65,11 @@ func New(cfg model.ProviderConfig) (model.Model, error) {
 	if output <= 0 {
 		output = 256000
 	}
-	return &Client{http: &http.Client{Timeout: timeout, Transport: http.DefaultTransport.(*http.Transport).Clone(), CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("deepseek: redirects are disabled") }}, root: base, key: cfg.APIKey, modelID: cfg.Model, temperature: cfg.Temperature, idle: idle, useFiles: cfg.UseFiles, files: map[string]File{}, info: model.Info{Name: cfg.Name, ContextLength: window, MaxOutputTokens: output, SupportsThinking: cfg.SupportsThinking, SupportsReasoningEffort: cfg.SupportsReasoningEffort, SupportsVision: cfg.SupportsVision, SupportsTools: true}}, nil
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("deepseek: default HTTP transport must be *http.Transport")
+	}
+	return &Client{http: &http.Client{Timeout: timeout, Transport: transport.Clone(), CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("deepseek: redirects are disabled") }}, root: base, key: cfg.APIKey, modelID: cfg.Model, temperature: cfg.Temperature, idle: idle, useFiles: cfg.UseFiles, files: map[string]File{}, info: model.Info{Name: cfg.Name, ContextLength: window, MaxOutputTokens: output, SupportsThinking: cfg.SupportsThinking, SupportsReasoningEffort: cfg.SupportsReasoningEffort, SupportsVision: cfg.SupportsVision, SupportsTools: true}}, nil
 }
 func (c *Client) Info() model.Info { return c.info }
 func (c *Client) Close() error     { c.http.CloseIdleConnections(); return nil }
@@ -74,15 +78,18 @@ func (c *Client) Complete(ctx context.Context, req model.Request) (*model.Respon
 	if err != nil {
 		return nil, err
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	return stream.Result()
 }
 func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamReader, error) {
+	raw, err := c.serialize(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return c.streamPrepared(ctx, req, raw)
+}
+func (c *Client) streamPrepared(ctx context.Context, req model.Request, raw []byte) (model.StreamReader, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		raw, err := c.serialize(ctx, req)
-		if err != nil {
-			return nil, err
-		}
 		request, err := c.request(ctx, http.MethodPost, "/messages", bytes.NewReader(raw), "application/json")
 		if err != nil {
 			return nil, err
@@ -95,11 +102,15 @@ func (c *Client) Stream(ctx context.Context, req model.Request) (model.StreamRea
 			return newStream(resp.Body, c.modelID), nil
 		}
 		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if attempt == 0 && c.useFiles && staleFile(resp.StatusCode, rawErr) {
 			c.mu.Lock()
 			clear(c.files)
 			c.mu.Unlock()
+			raw, err = c.serialize(ctx, req)
+			if err != nil {
+				return nil, err
+			}
 			continue
 		}
 		return nil, providerError(resp.StatusCode, rawErr)
@@ -164,4 +175,28 @@ func staleFile(status int, raw []byte) bool {
 		}
 	}
 	return false
+}
+
+func (c *Client) PrepareCall(ctx context.Context, req model.Request) (model.PreparedCall, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := c.request(ctx, http.MethodPost, "/messages", nil, "application/json"); err != nil {
+		return nil, err
+	}
+	raw, err := c.serialize(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	stream := func(ctx context.Context) (model.StreamReader, error) { return c.streamPrepared(ctx, req, raw) }
+	return model.BoundCall{ModelInfo: model.RequestInfo(c, req), StreamFunc: stream,
+		CompleteFunc: func(ctx context.Context) (*model.Response, error) {
+			reader, err := stream(ctx)
+			if err != nil {
+				return nil, err
+			}
+			defer func() { _ = reader.Close() }()
+			return reader.Result()
+		},
+	}, nil
 }

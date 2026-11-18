@@ -273,12 +273,12 @@ func (c *connection) handleIncoming(message rpcMessage) {
 			}
 		}
 		c.mu.Lock()
-		_ = c.writeLocked(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(message.ID), "result": result})
+		_ = c.writeLocked(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": result})
 		c.mu.Unlock()
 		return
 	}
 	c.mu.Lock()
-	_ = c.writeLocked(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(message.ID), "error": map[string]any{"code": -32601, "message": "Method not found"}})
+	_ = c.writeLocked(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32601, "message": "Method not found"}})
 	c.mu.Unlock()
 }
 

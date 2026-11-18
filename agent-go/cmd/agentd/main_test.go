@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KyrieWang7/nous-agent/agent-go/internal/transport/httpapi"
+	"github.com/KyrieWang7/nous-agent/agent-go/internal/server"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/harness"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/message"
@@ -53,7 +53,7 @@ func TestAgentHTTPStreamEndToEnd(t *testing.T) {
 	if got := built.chain.StageOrder(lifecycle.StageAfterModel); !slices.Equal(got, wantAfterModel) {
 		t.Fatalf("after-model order = %v, want %v", got, wantAfterModel)
 	}
-	api, err := httpapi.New(httpapi.Options{Agent: built.agent, AllowedTools: built.tools})
+	api, err := server.New(server.Options{Agent: built.agent, AllowedTools: built.tools})
 	if err != nil {
 		t.Fatal(err)
 	}

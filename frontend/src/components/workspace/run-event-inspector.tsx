@@ -1,8 +1,15 @@
 "use client";
 
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { ListFilterIcon, RefreshCwIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { GitBranchIcon, ListFilterIcon, RefreshCwIcon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -16,6 +23,7 @@ import { useI18n } from "@/core/i18n/hooks";
 import {
   fetchInspectableRuns,
   fetchRunEvents,
+  forkCompletedRun,
   type RuntimeEvent,
 } from "@/core/threads/run-events";
 
@@ -48,6 +56,9 @@ export function RunEventInspector({ threadId }: { threadId: string }) {
 
 function InspectorContent({ threadId }: { threadId: string }) {
   const { t } = useI18n();
+  const router = useRouter();
+  const client = useQueryClient();
+  const forkIds = useRef(new Map<string, string>());
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const runs = useQuery({
     queryKey: ["inspectable-runs", threadId],
@@ -61,6 +72,21 @@ function InspectorContent({ threadId }: { threadId: string }) {
     [runs.data],
   );
   const runId = selectedRun ?? orderedRuns[0]?.run_id ?? "";
+  const canFork = orderedRuns.some(
+    (run) => run.run_id === runId && run.status === "success",
+  );
+  const fork = useMutation({
+    mutationFn: (runId: string) => {
+      const destination = forkIds.current.get(runId) ?? crypto.randomUUID();
+      forkIds.current.set(runId, destination);
+      return forkCompletedRun(threadId, runId, destination);
+    },
+    onSuccess: (id) => {
+      void client.invalidateQueries({ queryKey: ["gateway-threads"] });
+      router.push(`/workspace/chats/${encodeURIComponent(id)}`);
+    },
+    onError: (error) => toast.error(error.message),
+  });
   return (
     <>
       <label className="flex min-w-0 items-center gap-3 text-sm">
@@ -99,6 +125,19 @@ function InspectorContent({ threadId }: { threadId: string }) {
         <p role="alert" className="text-destructive text-sm">
           {t.inspector.failed}
         </p>
+      )}
+      {canFork && (
+        <Button
+          className="self-start"
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={fork.isPending}
+          onClick={() => fork.mutate(runId)}
+        >
+          <GitBranchIcon className="size-4" />
+          {t.sessionInbox.fork}
+        </Button>
       )}
       {runId && <EventTable key={runId} threadId={threadId} runId={runId} />}
     </>

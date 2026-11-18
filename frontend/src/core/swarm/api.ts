@@ -1,17 +1,12 @@
 import { getBackendBaseURL } from "../config";
-import { env } from "@/env";
 
 import type { SwarmTeam, SwarmTeamMember } from "./types";
 
-function getGatewayBaseURL(): string {
-  return env.NEXT_PUBLIC_BACKEND_BASE_URL || "http://127.0.0.1:7777";
-}
-
-export async function getTeamsByThread(
-  threadId: string,
-): Promise<SwarmTeam[]> {
+export async function getTeamsByThread(threadId: string): Promise<SwarmTeam[]> {
   const base = getBackendBaseURL();
-  const res = await fetch(`${base}/api/swarm/teams?thread_id=${threadId}`);
+  const res = await fetch(
+    `${base}/api/swarm/teams?thread_id=${encodeURIComponent(threadId)}`,
+  );
   if (!res.ok) throw new Error(`Failed to fetch teams: ${res.status}`);
   const data = await res.json();
   return data.teams;
@@ -28,6 +23,6 @@ export async function getTeamMembers(
 }
 
 export function getSwarmStreamURL(teamId: string): string {
-  const gateway = getGatewayBaseURL();
-  return `${gateway}/api/swarm/teams/${teamId}/stream`;
+  const gateway = getBackendBaseURL();
+  return `${gateway}/api/swarm/teams/${encodeURIComponent(teamId)}/stream`;
 }

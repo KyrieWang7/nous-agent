@@ -1,6 +1,3 @@
-import type { Message } from "@/core/types";
-import type { ThreadStream } from "@/core/types/thread";
-
 import {
   Conversation,
   ConversationContent,
@@ -17,9 +14,11 @@ import {
 } from "@/core/messages/utils";
 import { useRehypeSplitWordsIntoSpans } from "@/core/rehype";
 import type { Subtask } from "@/core/tasks";
-import { useUpdateSubtask } from "@/core/tasks/context";
+import { useSubtaskContext } from "@/core/tasks/context";
 import { resolveSubagentStatus } from "@/core/tasks/status-contract";
 import type { AgentThreadState } from "@/core/threads";
+import type { Message } from "@/core/types";
+import type { ThreadStream } from "@/core/types/thread";
 import { cn } from "@/lib/utils";
 
 import { ArtifactFileList } from "../artifacts/artifact-file-list";
@@ -47,7 +46,7 @@ export function MessageList({
 }) {
   const { t } = useI18n();
   const rehypePlugins = useRehypeSplitWordsIntoSpans(thread.isLoading);
-  const updateSubtask = useUpdateSubtask();
+  const { tasks: liveTasks } = useSubtaskContext();
   const messages = messagesOverride ?? thread.messages;
   if (thread.isThreadLoading) {
     return <MessageListSkeleton />;
@@ -101,7 +100,7 @@ export function MessageList({
               </div>
             );
           } else if (group.type === "assistant:subagent") {
-            const tasks = new Set<Subtask>();
+            const tasks = new Map<string, Subtask>();
             for (const message of group.messages) {
               if (message.type === "ai") {
                 for (const toolCall of message.tool_calls ?? []) {
@@ -113,25 +112,37 @@ export function MessageList({
                       prompt: toolCall.args.prompt,
                       status: "in_progress",
                     };
-                    updateSubtask(task);
-                    tasks.add(task);
+                    tasks.set(task.id, {
+                      ...task,
+                      ...liveTasks[task.id],
+                      description: task.description,
+                      prompt: task.prompt,
+                    });
                   }
                 }
               } else if (message.type === "tool") {
                 const taskId = message.tool_call_id;
-                if (taskId) {
+                if (taskId && tasks.has(taskId)) {
                   const result = extractTextFromMessage(message);
                   const { status, error } = resolveSubagentStatus(
                     message.additional_kwargs,
                     result,
                   );
                   if (status === "completed") {
-                    updateSubtask({
+                    tasks.set(taskId, {
+                      ...tasks.get(taskId)!,
                       id: taskId,
+                      session_id:
+                        typeof message.additional_kwargs
+                          ?.subagent_session_id === "string"
+                          ? message.additional_kwargs.subagent_session_id
+                          : undefined,
                       status: "completed",
+                      final_status: "completed",
                       result: result
                         .split("Task Succeeded. Result:")[1]
-                        ?.trim(),
+                        ?.replace(/\nSession ID: [^\n]+$/, "")
+                        .trim(),
                     });
                   } else if (
                     status === "failed" ||
@@ -139,14 +150,30 @@ export function MessageList({
                     status === "polling_timed_out" ||
                     status === "cancelled"
                   ) {
-                    updateSubtask({
+                    tasks.set(taskId, {
+                      ...tasks.get(taskId)!,
                       id: taskId,
+                      session_id:
+                        typeof message.additional_kwargs
+                          ?.subagent_session_id === "string"
+                          ? message.additional_kwargs.subagent_session_id
+                          : undefined,
                       status: "failed",
-                      error: error ?? result.split("Task failed.")[1]?.trim() ?? result,
+                      final_status: status,
+                      error:
+                        error ??
+                        result.split("Task failed.")[1]?.trim() ??
+                        result,
                     });
                   } else {
-                    updateSubtask({
+                    tasks.set(taskId, {
+                      ...tasks.get(taskId)!,
                       id: taskId,
+                      session_id:
+                        typeof message.additional_kwargs
+                          ?.subagent_session_id === "string"
+                          ? message.additional_kwargs.subagent_session_id
+                          : undefined,
                       status: "in_progress",
                     });
                   }
@@ -178,10 +205,12 @@ export function MessageList({
                 (toolCall) => toolCall.id,
               );
               for (const taskId of taskIds ?? []) {
+                const task = tasks.get(taskId ?? "");
+                if (!task) continue;
                 results.push(
                   <SubtaskCard
                     key={"task-group-" + taskId}
-                    taskId={taskId!}
+                    task={task}
                     isLoading={thread.isLoading}
                   />,
                 );

@@ -995,7 +995,7 @@ func TestContextRunnerFactoryReceivesTrustedParentContext(t *testing.T) {
 			t.Fatalf("parent run context was not propagated")
 		}
 		gotRunID, gotType = parent.RunID, req.SubagentType
-		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("context child"))})
+		h, err := harness.New(harness.Options{Model: faux.New(faux.Text("context child"))}) //nolint:contextcheck // assembly accepts no request context
 		if err != nil {
 			return nil, err
 		}

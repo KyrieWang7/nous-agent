@@ -51,3 +51,26 @@ export function fetchRunEvents(
     signal,
   );
 }
+
+export async function forkCompletedRun(
+  threadId: string,
+  runId: string,
+  destinationId: string,
+) {
+  const response = await fetch(
+    `${getAgentAPIBaseURL()}/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/fork`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: destinationId }),
+    },
+  );
+  const result = (await response.json()) as {
+    thread_id?: string;
+    detail?: string;
+  };
+  if (!response.ok || !result.thread_id)
+    throw new Error(result.detail ?? `Could not fork run (${response.status})`);
+  return result.thread_id;
+}

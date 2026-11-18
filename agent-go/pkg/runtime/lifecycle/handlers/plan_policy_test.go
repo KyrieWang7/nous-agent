@@ -62,8 +62,8 @@ func TestPlanPolicyBlocksExitUntilReviewAndTodoCompletion(t *testing.T) {
 	state := lifecycle.NewState(lifecycle.StateInit{})
 	state.SetValue("mode", "pro")
 	state.SetValue("is_plan_mode", true)
-	if reason, err := policy.Evaluate(context.Background(), "stop", state); err != nil || !strings.Contains(reason, "write_todos") {
-		t.Fatalf("empty plan gate = %q, err=%v", reason, err)
+	if reason, err := policy.Evaluate(context.Background(), "stop", state); err != nil || reason != "" {
+		t.Fatalf("empty plan gate = %q, err=%v; simple/clarification turns should be allowed", reason, err)
 	}
 	state.SetValue("todos", []map[string]string{{"content": "Inspect", "status": "pending"}})
 	if reason, err := policy.Evaluate(context.Background(), "stop", state); err != nil || !strings.Contains(reason, "exit_plan_mode") {

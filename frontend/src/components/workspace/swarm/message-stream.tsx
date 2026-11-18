@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { useI18n } from "@/core/i18n/hooks";
 import type { SwarmMessage } from "@/core/swarm/types";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +36,7 @@ export function MessageStream({
   filter,
   className,
 }: MessageStreamProps) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const prevIdsRef = useRef<Set<number>>(new Set());
   const [enteringIds, setEnteringIds] = useState<Set<number>>(new Set());
@@ -72,14 +74,14 @@ export function MessageStream({
     <div
       ref={containerRef}
       className={cn(
-        "min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-2",
+        "min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2 py-2",
         className,
       )}
     >
       <div className="flex flex-col gap-2">
         {filtered.length === 0 ? (
           <p className="text-muted-foreground py-6 text-center text-sm">
-            No messages yet.
+            {t.workbenchPanel.noMessages}
           </p>
         ) : (
           filtered.map((msg) => {
@@ -100,7 +102,12 @@ export function MessageStream({
                   className="my-2 flex items-center gap-3 text-xs"
                 >
                   <div className="border-border h-px flex-1 border-t border-dashed" />
-                  <span className={cn("max-w-[min(100%,280px)] shrink text-center font-medium", systemStyle)}>
+                  <span
+                    className={cn(
+                      "max-w-[min(100%,280px)] shrink text-center font-medium",
+                      systemStyle,
+                    )}
+                  >
                     {msg.content}
                   </span>
                   <div className="border-border h-px flex-1 border-t border-dashed" />
@@ -122,7 +129,7 @@ export function MessageStream({
                   <p className="text-muted-foreground mb-1 text-[11px] leading-tight">
                     {msg.from} → {msg.to}
                   </p>
-                  <p className="text-foreground text-sm leading-snug whitespace-pre-wrap break-words">
+                  <p className="text-foreground text-sm leading-snug break-words whitespace-pre-wrap">
                     {msg.content}
                   </p>
                   <p className="text-muted-foreground mt-1 text-[11px]">
