@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/config"
+	gatewaymiddleware "github.com/KyrieWang7/nous-agent/gateway-go/internal/middleware"
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/repository"
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/repository/catalog"
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/repository/files"
+	"github.com/KyrieWang7/nous-agent/gateway-go/internal/router"
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/server"
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/service"
 	"github.com/KyrieWang7/nous-agent/platform-go/httpx"
@@ -60,6 +62,15 @@ func main() {
 		middleware = append(middleware, limiter)
 	}
 	handler := server.New(service.Options{Catalog: catalog.New(cfg.HarnessConfig, cfg.ExtensionsConfig, cfg.SkillsRoot), Files: files.New(cfg.WorkspaceRoot, cfg.SkillsRoot), Repository: database, Swarm: database}, cfg.CORSOrigins, middleware...)
+	frontend, manager, err := gatewaymiddleware.NewWebUpstreams(gatewaymiddleware.WebUpstreams{
+		FrontendURL: cfg.FrontendURL, ManagerURL: cfg.ManagerURL,
+		ManagerToken: cfg.ManagerToken, PublicOrigin: cfg.PublicOrigin,
+	})
+	if err != nil {
+		slog.Error("configuring gateway routes", "error", err)
+		os.Exit(1)
+	}
+	handler = router.WithWeb(handler, frontend, manager)
 	httpServer := server.HTTP(cfg.Address, handler)
 	go func() {
 		slog.Info("Go Gateway listening", "address", cfg.Address)

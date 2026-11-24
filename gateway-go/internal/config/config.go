@@ -20,6 +20,10 @@ type Config struct {
 	SkillsRoot       string                   `yaml:"skills_root"`
 	WorkspaceRoot    string                   `yaml:"workspace_root"`
 	CORSOrigins      []string                 `yaml:"cors_origins"`
+	FrontendURL      string                   `yaml:"frontend_url"`
+	ManagerURL       string                   `yaml:"manager_url"`
+	ManagerToken     string                   `yaml:"manager_token"`
+	PublicOrigin     string                   `yaml:"public_origin"`
 }
 
 func Load() (Config, error) {
@@ -27,6 +31,7 @@ func Load() (Config, error) {
 	v, err := platformconfig.LoadYAML(os.Getenv("NOUS_GATEWAY_CONFIG_PATH"), &cfg, map[string]string{
 		"redis_url": "REDIS_URL", "rate_limit.enabled": "HTTP_RATE_LIMIT_ENABLED", "rate_limit.requests": "HTTP_RATE_LIMIT_REQUESTS", "rate_limit.window": "HTTP_RATE_LIMIT_WINDOW",
 		"address": "GATEWAY_ADDR", "database_url": "DATABASE_URL", "harness_config": "NOUS_HARNESS_CONFIG_PATH", "extensions_config": "NOUS_EXTENSIONS_CONFIG_PATH", "skills_root": "NOUS_SKILLS_ROOT", "workspace_root": "NOUS_WORKSPACE_ROOT", "cors_origins": "CORS_ORIGINS",
+		"frontend_url": "FRONTEND_BASE_URL", "manager_url": "MANAGER_BASE_URL", "manager_token": "MANAGER_GATEWAY_TOKEN", "public_origin": "PUBLIC_WEB_ORIGIN",
 	})
 	if err != nil {
 		return Config{}, err
@@ -41,6 +46,10 @@ func Load() (Config, error) {
 	cfg.ExtensionsConfig = platformconfig.Env(v, "extensions_config", cfg.ExtensionsConfig)
 	cfg.SkillsRoot = platformconfig.Env(v, "skills_root", cfg.SkillsRoot)
 	cfg.WorkspaceRoot = platformconfig.Env(v, "workspace_root", cfg.WorkspaceRoot)
+	cfg.FrontendURL = platformconfig.Env(v, "frontend_url", cfg.FrontendURL)
+	cfg.ManagerURL = platformconfig.Env(v, "manager_url", cfg.ManagerURL)
+	cfg.ManagerToken = platformconfig.Env(v, "manager_token", cfg.ManagerToken)
+	cfg.PublicOrigin = platformconfig.Env(v, "public_origin", cfg.PublicOrigin)
 	if value := os.Getenv("CORS_ORIGINS"); strings.TrimSpace(value) != "" {
 		cfg.CORSOrigins = split(v.GetString("cors_origins"))
 	}

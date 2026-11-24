@@ -1,0 +1,16 @@
+**
+!manager/
+!manager/legacy_app.py
+!manager/start.sh
+!manager/manager_service/
+!manager/manager_service/**
+!platform-go/
+!platform-go/**
+!third_party/
+!third_party/easel/
+!third_party/easel/**
+**/.env
+**/.env.local
+**/__pycache__
+**/node_modules
+**/dist

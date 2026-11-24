@@ -134,6 +134,20 @@ make migrate
 make migrate-current
 ```
 
+## Manager 内容工作台
+
+Manager 是独立的 Go 服务和发布单元。正式入口由 Gin、Uber Fx、Viper、Zap 和 GORM/PostgreSQL 组成。选题由原生 Go 用例处理，其余 Easel Web 功能通过 Manager 内部兼容进程提供。Manager 的 PostgreSQL 保存选题，`manager_data` 卷保存 Easel 工件、配置、画像、会话和账号状态。模型和账号在 Manager 页面配置。
+
+统一入口由 `gateway-go` 提供。访问 `/` 进入 Nous 首页，`/workspace/` 进入 Nous 会话，`/creative/` 进入 Manager。Manager API 与工作台同源，位于 `/creative/api/`。
+
+Web 部署配置使用 Docker Compose 2.24.4 或更高版本的 `!override`。在 `.env` 中设置 `MANAGER_GATEWAY_TOKEN` 和 Manager 独立数据库的 `MANAGER_DATABASE_URL`，并配置 Nous 原有的 PostgreSQL 和模型。以下命令构建并启动统一入口。[Docker Compose 合并规则](https://docs.docker.com/reference/compose-file/merge/#replace-value)
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
+```
+
+本地打开 [http://127.0.0.1:7777](http://127.0.0.1:7777)。服务器可在反向代理中绑定 HTTPS 和访问控制，并把 `PUBLIC_WEB_ORIGIN` 设为浏览器访问的完整 Origin。Compose 默认只在宿主机回环地址发布 Gateway 端口。Manager 默认启用手动发布包，平台操作使用 Manager 中配置的授权。[Manager 架构和迁移边界](manager/README.md) · [Easel 源码和许可](third_party/easel/SOURCE.md)。
+
 ## Subagent 与 Swarm
 
 Subagent 与 Swarm 以 Go 实现为准。Subagent 使用受限并发的子 Harness，子任务事件通过现有 `custom` 事件投影为 `task_started`、`task_running`、`task_completed`、`task_failed` 或 `task_timed_out`。

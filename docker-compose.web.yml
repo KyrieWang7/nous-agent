@@ -1,0 +1,51 @@
+# Merge with docker-compose.yml to serve both applications through gateway-go.
+services:
+  gateway-go:
+    ports: !override
+      - "${NOUS_WEB_BIND_HOST:-127.0.0.1}:${GATEWAY_PORT:-7777}:7777"
+    environment:
+      FRONTEND_BASE_URL: http://frontend:7775
+      MANAGER_BASE_URL: http://manager:7860
+      MANAGER_GATEWAY_TOKEN: "${MANAGER_GATEWAY_TOKEN:?Set MANAGER_GATEWAY_TOKEN}"
+      PUBLIC_WEB_ORIGIN: "${PUBLIC_WEB_ORIGIN:-}"
+    depends_on:
+      frontend:
+        condition: service_started
+      manager:
+        condition: service_started
+
+  agent-go:
+    ports: !reset []
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    environment:
+      HARNESS_BASE_URL: http://agent-go:7776
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7775/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  manager:
+    build:
+      context: .
+      dockerfile: manager/Dockerfile
+    restart: unless-stopped
+    init: true
+    shm_size: 512m
+    environment:
+      MANAGER_GATEWAY_TOKEN: "${MANAGER_GATEWAY_TOKEN:?Set MANAGER_GATEWAY_TOKEN}"
+      MANAGER_DATABASE_URL: "${MANAGER_DATABASE_URL:?Set MANAGER_DATABASE_URL}"
+      EASEL_PUBLISH_MODE: "${MANAGER_PUBLISH_MODE:-manual}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - manager_data:/var/lib/manager
+
+volumes:
+  manager_data:

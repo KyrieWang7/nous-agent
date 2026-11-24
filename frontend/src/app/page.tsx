@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import { ModuleLauncher } from "@/components/landing/module-launcher";
 
 export default function RootPage() {
-  redirect("/workspace/chats/new");
+  return <ModuleLauncher />;
 }
