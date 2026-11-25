@@ -19,6 +19,7 @@ export function Welcome({
 }) {
   const { t } = useI18n();
   const searchParams = useSearchParams();
+  const creatingSkill = searchParams.get("mode") === "skill";
   const isUltra = useMemo(() => mode === "ultra", [mode]);
   const colors = useMemo(() => {
     if (isUltra) {
@@ -27,51 +28,34 @@ export function Welcome({
     return ["var(--color-foreground)"];
   }, [isUltra]);
 
-  const greeting = useMemo(() => {
-    return t.welcome.greeting;
-  }, [t.welcome.greeting]);
-
   useEffect(() => {
     waved = true;
   }, []);
   return (
     <div
       className={cn(
-        "mx-auto flex w-full flex-col items-center justify-center gap-3 px-8 py-4 text-center",
+        "mx-auto flex w-full flex-col items-center gap-2 px-2 text-center sm:gap-3",
         className,
       )}
     >
-      <div className="animate-slide-up-fade text-2xl font-medium text-foreground">
-        {searchParams.get("mode") === "skill" ? (
-          `✨ ${t.welcome.createYourOwnSkill} ✨`
+      <h1 className="animate-slide-up-fade text-foreground text-2xl font-semibold tracking-tight sm:text-3xl">
+        {creatingSkill ? (
+          <>
+            <span aria-hidden="true">✨ </span>
+            {t.welcome.createYourOwnSkill}
+          </>
         ) : (
-          <div className="flex items-center gap-3">
-            <div className={cn("inline-block text-2xl", !waved ? "animate-wave" : "")}>
+          <>
+            <span aria-hidden="true" className={cn("mr-2 inline-block", !waved && "animate-wave")}>
               {isUltra ? "🚀" : "👋"}
-            </div>
-            <AuroraText colors={colors}>{greeting}</AuroraText>
-          </div>
+            </span>
+            <AuroraText colors={colors}>{t.welcome.greeting}</AuroraText>
+          </>
         )}
-      </div>
-      {searchParams.get("mode") === "skill" ? (
-        <div className="animate-slide-up-fade text-muted-foreground max-w-lg text-sm leading-relaxed opacity-0 [animation-delay:150ms]">
-          {t.welcome.createYourOwnSkillDescription.includes("\n") ? (
-            <pre className="font-sans whitespace-pre">
-              {t.welcome.createYourOwnSkillDescription}
-            </pre>
-          ) : (
-            <p>{t.welcome.createYourOwnSkillDescription}</p>
-          )}
-        </div>
-      ) : (
-        <div className="animate-slide-up-fade text-muted-foreground max-w-lg text-sm leading-relaxed opacity-0 [animation-delay:150ms]">
-          {t.welcome.description.includes("\n") ? (
-            <pre className="whitespace-pre">{t.welcome.description}</pre>
-          ) : (
-            <p>{t.welcome.description}</p>
-          )}
-        </div>
-      )}
+      </h1>
+      <p className="animate-slide-up-fade text-muted-foreground max-w-lg text-sm leading-relaxed text-pretty opacity-0 [animation-delay:150ms] motion-reduce:animate-none motion-reduce:opacity-100">
+        {creatingSkill ? t.welcome.createYourOwnSkillDescription : t.welcome.description}
+      </p>
     </div>
   );
 }

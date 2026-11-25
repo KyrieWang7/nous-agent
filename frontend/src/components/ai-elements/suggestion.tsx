@@ -1,41 +1,36 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { Icon } from "@radix-ui/react-select";
 import type { LucideIcon } from "lucide-react";
 import { Children, type ComponentProps } from "react";
 
 const STAGGER_DELAY_MS = 60;
 const STAGGER_DELAY_MS_OFFSET = 250;
 
-export type SuggestionsProps = ComponentProps<typeof ScrollArea>;
+export type SuggestionsProps = ComponentProps<"div">;
 
 export const Suggestions = ({
   className,
   children,
   ...props
 }: SuggestionsProps) => (
-  <ScrollArea className="overflow-x-auto whitespace-nowrap" {...props}>
-    <div className={cn("flex w-max flex-nowrap items-center gap-2", className)}>
-      {Children.map(children, (child, index) =>
-        child != null ? (
-          <span
-            className="animate-fade-in-up inline-block opacity-0"
-            style={{
-              animationDelay: `${STAGGER_DELAY_MS_OFFSET + index * STAGGER_DELAY_MS}ms`,
-            }}
-          >
-            {child}
-          </span>
-        ) : (
-          child
-        ),
-      )}
-    </div>
-    <ScrollBar className="hidden" orientation="horizontal" />
-  </ScrollArea>
+  <div className={cn("flex flex-wrap items-center gap-2", className)} {...props}>
+    {Children.map(children, (child, index) =>
+      child != null ? (
+        <span
+          className="animate-fade-in-up inline-block opacity-0"
+          style={{
+            animationDelay: `${STAGGER_DELAY_MS_OFFSET + index * STAGGER_DELAY_MS}ms`,
+          }}
+        >
+          {child}
+        </span>
+      ) : (
+        child
+      ),
+    )}
+  </div>
 );
 
 export type SuggestionProps = Omit<ComponentProps<typeof Button>, "onClick"> & {

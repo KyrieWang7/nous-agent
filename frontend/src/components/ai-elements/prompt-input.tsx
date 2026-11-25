@@ -858,14 +858,15 @@ export const PromptInputTextarea = ({
   const [isComposing, setIsComposing] = useState(false);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
+    if (e.key === "Enter" && (isComposing || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)) {
+      return;
+    }
+
     // Call external onKeyDown first (e.g. skill picker)
     onKeyDownProp?.(e);
 
     if (e.key === "Enter") {
-      if (isComposing || e.nativeEvent.isComposing) {
-        return;
-      }
-      if (e.shiftKey) {
+      if (e.shiftKey || e.altKey || (e.ctrlKey && e.metaKey) || e.getModifierState("AltGraph")) {
         return;
       }
       // If external handler already prevented default (e.g. skill picker selected), skip submit

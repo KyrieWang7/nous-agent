@@ -1,4 +1,4 @@
-export { login, logout, register, getMe } from "./api";
+export { logout } from "./api";
 export { useAuthBootstrap, useAuthHydrated } from "./hooks";
-export { useAuthStore, getAuthToken } from "./store";
-export type { User, TokenResponse, LoginRequest, RegisterRequest } from "./types";
+export { useAuthStore } from "./store";
+export type { User } from "./types";

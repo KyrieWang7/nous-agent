@@ -62,15 +62,15 @@ func main() {
 		middleware = append(middleware, limiter)
 	}
 	handler := server.New(service.Options{Catalog: catalog.New(cfg.HarnessConfig, cfg.ExtensionsConfig, cfg.SkillsRoot), Files: files.New(cfg.WorkspaceRoot, cfg.SkillsRoot), Repository: database, Swarm: database}, cfg.CORSOrigins, middleware...)
-	frontend, manager, err := gatewaymiddleware.NewWebUpstreams(gatewaymiddleware.WebUpstreams{
-		FrontendURL: cfg.FrontendURL, ManagerURL: cfg.ManagerURL,
-		ManagerToken: cfg.ManagerToken, PublicOrigin: cfg.PublicOrigin,
+	frontend, creative, err := gatewaymiddleware.NewWebUpstreams(gatewaymiddleware.WebUpstreams{
+		FrontendURL: cfg.FrontendURL, CreativeURL: cfg.CreativeURL,
+		CreativeWebURL: cfg.CreativeWebURL, PublicOrigin: cfg.PublicOrigin,
 	})
 	if err != nil {
 		slog.Error("configuring gateway routes", "error", err)
 		os.Exit(1)
 	}
-	handler = router.WithWeb(handler, frontend, manager)
+	handler = router.WithWeb(handler, frontend, creative)
 	httpServer := server.HTTP(cfg.Address, handler)
 	go func() {
 		slog.Info("Go Gateway listening", "address", cfg.Address)

@@ -921,11 +921,9 @@ export function useSubmitThread({
   threadContext,
   isNewThread,
   afterSubmit,
-  enqueueDelivery,
   submissionDraft,
 }: {
   submissionDraft?: { text: string; attachmentIds: string[] };
-  enqueueDelivery?: InputDelivery;
   isNewThread: boolean;
   threadId: string | null | undefined;
   thread: ThreadStream<AgentThreadState>;
@@ -934,7 +932,7 @@ export function useSubmitThread({
 }) {
   const queryClient = useQueryClient();
   const callback = useCallback(
-    async (message: PromptInputMessage) => {
+    async (message: PromptInputMessage, enqueueDelivery?: InputDelivery) => {
       if (enqueueDelivery && threadId && pendingInputSnapshot(threadId))
         throw new Error(
           "Resolve the unconfirmed message before sending another one.",
@@ -1097,7 +1095,6 @@ export function useSubmitThread({
       threadContext,
       queryClient,
       afterSubmit,
-      enqueueDelivery,
       submissionDraft,
     ],
   );

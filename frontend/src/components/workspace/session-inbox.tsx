@@ -1,7 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { ArrowRightIcon, ChevronDownIcon, PencilIcon, RotateCwIcon, XIcon } from "lucide-react";
+import { useId, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -46,6 +47,8 @@ export function SessionInbox({
   const { t } = useI18n();
   const copy = t.sessionInbox;
   const client = useQueryClient();
+  const listId = useId();
+  const [expanded, setExpanded] = useState(false);
   const [edit, setEdit] = useState<{
     id: string;
     revision: string;
@@ -77,16 +80,8 @@ export function SessionInbox({
     () => isInputSending(threadId),
     () => false,
   );
-  const visible = useMemo(
-    () =>
-      entries.filter(
-        (e, i) =>
-          e.status === "pending" ||
-          e.status === "claimed" ||
-          i >= entries.length - 4,
-      ),
-    [entries],
-  );
+  const visible = entries.filter((entry) => entry.status === "pending" || entry.status === "claimed");
+  const showList = visible.length === 1 || expanded;
   const cancel = useMutation({
     mutationFn: (id: string) => cancelSessionInput(threadId, id),
     retry: false,
@@ -102,27 +97,35 @@ export function SessionInbox({
     },
     onError: (e) => toast.error(e.message),
   });
-  if (!visible.length && !raw && !error) return null;
+  if (!visible.length && (!raw || sending) && !error) return null;
   return (
     <section
       aria-label={copy.title}
-      className="bg-muted/25 mb-2 max-h-48 overflow-y-auto rounded-lg border px-3 py-2 text-xs"
+      className="bg-muted/25 mb-2 max-h-[min(12rem,32dvh)] overflow-y-auto rounded-xl border px-2.5 py-1 text-xs"
     >
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="font-medium">{copy.title}</span>
-        <Button type="button" size="sm" variant="ghost" onClick={onRefresh}>
-          {t.subagentWorkspace.refresh}
+      {visible.length > 1 && (
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          aria-expanded={showList}
+          aria-controls={listId}
+          className="h-7 w-full justify-between px-1 text-xs"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {copy.queuedCount.replace("{count}", String(visible.length))}
+          <ChevronDownIcon className={showList ? "rotate-180" : undefined} />
         </Button>
-      </div>
-      {error && (
-        <p role="alert" className="text-destructive mb-2">
-          {copy.loadError} · {error.message}
-        </p>
       )}
-      {raw && sending && (
-        <p className="mb-2" role="status">
-          {t.subagentWorkspace.sending}
-        </p>
+      {error && (
+        <div className="flex items-center justify-between gap-2">
+          <p role="alert" className="text-destructive min-w-0 break-words">
+            {copy.loadError} · {error.message}
+          </p>
+          <Button type="button" size="icon-sm" variant="ghost" onClick={onRefresh} aria-label={t.subagentWorkspace.refresh} title={t.subagentWorkspace.refresh}>
+            <RotateCwIcon />
+          </Button>
+        </div>
       )}
       {raw && !sending && (
         <div role="alert" className="mb-2 flex items-center gap-2">
@@ -138,7 +141,7 @@ export function SessionInbox({
           </Button>
         </div>
       )}
-      <ol className="space-y-1">
+      <ol id={listId} hidden={!showList} className="divide-y">
         {visible.map((e) => {
           const editing = edit?.id === e.id ? edit : null;
           const stale =
@@ -151,27 +154,23 @@ export function SessionInbox({
             <li
               key={e.id}
               data-inbox-id={e.id}
-              className="flex flex-wrap items-start gap-2 border-t py-1.5"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 py-1"
             >
-              <span className="text-muted-foreground shrink-0">
-                {e.delivery === "next_step" ? copy.nextStep : copy.nextTurn}
-              </span>
-              <span className="line-clamp-2 min-w-0 flex-1 break-words whitespace-pre-wrap">
+              <span className="line-clamp-2 min-w-0 flex-1 break-words whitespace-pre-wrap" title={e.input.prompt}>
                 {e.input.prompt || copy.attachment}
               </span>
-              <span className="text-muted-foreground shrink-0" title={e.error}>
-                {copy.statuses[e.status]}
-                {e.status === "admitted" && e.run_status
-                  ? ` · ${t.subagentWorkspace.statuses[({ success: "completed", error: "failed" }[e.run_status] ?? e.run_status) as keyof typeof t.subagentWorkspace.statuses] ?? e.run_status}`
-                  : ""}
+              <span className="text-muted-foreground shrink-0">
+                {e.status === "claimed" ? copy.statuses.claimed : e.delivery === "next_step" ? copy.nextStep : copy.statuses.pending}
               </span>
               {e.status === "pending" && !editing && (
                 <div className="flex flex-wrap gap-1">
                   {textOnly && (
                     <Button
                       type="button"
-                      size="sm"
+                      size="icon-sm"
                       variant="ghost"
+                      aria-label={copy.edit}
+                      title={copy.edit}
                       disabled={change.isPending || cancel.isPending}
                       onClick={() =>
                         setEdit({
@@ -181,14 +180,16 @@ export function SessionInbox({
                         })
                       }
                     >
-                      {copy.edit}
+                      <PencilIcon />
                     </Button>
                   )}
                   {e.delivery === "next_turn" && activeRunId && (
                     <Button
                       type="button"
-                      size="sm"
+                      size="icon-sm"
                       variant="ghost"
+                      aria-label={copy.steer}
+                      title={copy.steer}
                       disabled={change.isPending || cancel.isPending}
                       onClick={() =>
                         change.mutate({
@@ -197,17 +198,19 @@ export function SessionInbox({
                         })
                       }
                     >
-                      {copy.steer}
+                      <ArrowRightIcon />
                     </Button>
                   )}
                   <Button
                     type="button"
-                    size="sm"
+                    size="icon-sm"
                     variant="ghost"
+                    aria-label={copy.withdraw}
+                    title={copy.withdraw}
                     disabled={cancel.isPending || change.isPending}
                     onClick={() => cancel.mutate(e.id)}
                   >
-                    {copy.withdraw}
+                    <XIcon />
                   </Button>
                 </div>
               )}

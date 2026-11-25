@@ -1,11 +1,53 @@
 "use client";
 
 import { useId, useRef, useState } from "react";
+import { MessageCircleQuestionMarkIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useI18n } from "@/core/i18n/hooks";
 import type { PendingUserQuestion } from "@/core/threads/types";
+
+export function ClarificationSummary({
+  question,
+  result,
+}: {
+  question?: string;
+  result: string;
+}) {
+  const { t } = useI18n();
+  const skipped = result.startsWith("The user skipped the question.");
+  let answer = "";
+  if (result.startsWith("User answer: ")) {
+    try {
+      const payload = JSON.parse(result.slice("User answer: ".length)) as {
+        selected?: unknown;
+        custom?: unknown;
+      } | null;
+      const selected = Array.isArray(payload?.selected)
+        ? payload.selected.filter((value): value is string => typeof value === "string")
+        : [];
+      answer = [...selected, typeof payload?.custom === "string" ? payload.custom : ""]
+        .filter(Boolean)
+        .join(" · ");
+    } catch {
+      // Older or incomplete tool results can still display the question.
+    }
+  }
+  return (
+    <section aria-label={t.questionReply.summary} className="bg-muted/30 rounded-lg border px-3 py-2.5 text-sm">
+      <div className="flex items-start gap-2">
+        <MessageCircleQuestionMarkIcon className="text-muted-foreground mt-0.5 size-4 shrink-0" aria-hidden />
+        <div className="min-w-0 break-words">
+          <p className="font-medium">{question || t.questionReply.summary}</p>
+          <p className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
+            {skipped ? t.questionReply.skipped : answer || t.questionReply.closed}
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
 
 export function QuestionReply({
   question,

@@ -1,7 +1,6 @@
 "use client";
 
 import { ChevronRightIcon } from "lucide-react";
-import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { FlickeringGrid } from "@/components/ui/flickering-grid";
@@ -68,7 +67,7 @@ export function Hero({ className }: { className?: string }) {
           <br />
           different levels of tasks that could take minutes to hours.
         </p>
-        <Link href="/workspace/chats/new">
+        <a href="/workspace/chats/new">
           <Button
             className="group relative mt-12 overflow-hidden rounded-full bg-white px-12 py-8 text-black transition-all duration-300 hover:scale-[1.02] hover:bg-zinc-100 hover:shadow-[0_0_40px_rgba(255,255,255,0.4)]"
             size="lg"
@@ -78,10 +77,10 @@ export function Hero({ className }: { className?: string }) {
               <ChevronRightIcon className="size-8 transition-transform group-hover:translate-x-2" />
             </span>
           </Button>
-        </Link>
-        <Link href="/creative/" className="mt-5 rounded-md px-3 py-2 text-base text-white/75 underline-offset-4 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-4">
+        </a>
+        <a href="/creative/" className="mt-5 rounded-md px-3 py-2 text-base text-white/75 underline-offset-4 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-4">
           进入内容工作台
-        </Link>
+        </a>
       </div>
     </div>
   );

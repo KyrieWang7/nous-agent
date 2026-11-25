@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { useArtifacts } from "@/components/workspace/artifacts";
 import { WorkspaceFilePanel } from "@/components/workspace/artifacts/workspace-file-panel";
-import { InputBox } from "@/components/workspace/input-box";
+import { InputBox, SuggestionList } from "@/components/workspace/input-box";
 import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
 import { PlanReview } from "@/components/workspace/plan-review";
@@ -339,7 +339,8 @@ export default function ChatPage() {
     }
   }, [artifactsOpen]);
   const inbox = useSessionInbox(threadId, !isNewThread);
-  const [delivery, setDelivery] = useState<InputDelivery>("next_turn");
+  const running = !isNewThread && thread.isLoading && Boolean(thread.runId);
+  const canSteer = running && !thread.isStopping && !thread.pendingQuestion;
   const latestInboxRun = [...(inbox.data ?? [])]
     .filter((e) => e.run_id)
     .sort(
@@ -385,7 +386,6 @@ export default function ChatPage() {
     threadId,
   ]);
   const _handleSubmit = useSubmitThread({
-    enqueueDelivery: delivery,
     submissionDraft: {
       text: promptInputController.textInput.value,
       attachmentIds: promptInputController.attachments.files.map((f) => f.id),
@@ -411,14 +411,17 @@ export default function ChatPage() {
     },
   });
   const handleSubmit = useCallback(
-    async (message: Parameters<typeof _handleSubmit>[0]) => {
+    async (
+      message: Parameters<typeof _handleSubmit>[0],
+      delivery: InputDelivery,
+    ) => {
       if (submissionPending.current)
         throw new Error("A message is already being submitted.");
       submissionPending.current = true;
       const submittedText = promptInputController.textInput.value;
       setIsStreaming(true);
       try {
-        await _handleSubmit(message);
+        await _handleSubmit(message, canSteer ? delivery : "next_turn");
         if (
           threadId &&
           readDraft(browserDraftStorage(), threadId) === submittedText
@@ -438,7 +441,7 @@ export default function ChatPage() {
         setIsStreaming(false);
       }
     },
-    [_handleSubmit, promptInputController.textInput.value, threadId],
+    [_handleSubmit, canSteer, promptInputController.textInput.value, threadId],
   );
   const handleStop = useCallback(() => {
     thread.stop();
@@ -474,7 +477,7 @@ export default function ChatPage() {
                   data-workspace-navigation
                   className="mr-2 md:hidden"
                 />
-                {title !== "Untitled" && (
+                {!isNewThread && (
                   <ThreadTitle threadId={threadId} threadTitle={title} />
                 )}
               </div>
@@ -557,7 +560,10 @@ export default function ChatPage() {
               </div>
             </header>
             <main
-              className="flex min-h-0 max-w-full flex-1 flex-col"
+              className={cn(
+                "flex min-h-0 max-w-full flex-1 flex-col",
+                isNewThread && "overflow-y-auto pt-14 pb-6 sm:pt-16 sm:pb-10",
+              )}
               onKeyDown={(event) => {
                 if (
                   event.key !== "Escape" ||
@@ -600,57 +606,44 @@ export default function ChatPage() {
                 }
               }}
             >
-              <div className="flex min-h-0 flex-1 justify-center">
-                <MessageList
-                  className={cn("size-full", !isNewThread && "pt-10")}
-                  threadId={threadId}
-                  thread={thread}
-                  paddingBottom={
-                    isNewThread ? (todoListCollapsed ? 160 : 280) : 24
-                  }
-                />
-              </div>
+              {!isNewThread && (
+                <div className="flex min-h-0 flex-1 justify-center">
+                  <MessageList
+                    className="size-full pt-10"
+                    threadId={threadId}
+                    thread={thread}
+                    paddingBottom={24}
+                  />
+                </div>
+              )}
               <div
                 className={cn(
-                  "right-0 bottom-0 left-0 z-30 flex justify-center px-4",
-                  isNewThread ? "absolute pb-4" : "relative shrink-0 pb-4",
+                  "relative z-10 flex shrink-0 justify-center px-4",
+                  isNewThread ? "my-auto" : "pb-4",
                 )}
               >
                 <div
                   className={cn(
                     "relative w-full",
-                    isNewThread && "-translate-y-[calc(50vh-96px)]",
                     isNewThread
                       ? "max-w-(--container-width-sm)"
                       : "max-w-(--container-width-md)",
                   )}
                 >
-                  <div
-                    className={cn(
-                      "right-0 left-0 z-0",
-                      isNewThread ? "absolute -top-4" : "relative",
-                    )}
-                  >
-                    <div
-                      className={cn(
-                        "right-0 bottom-0 left-0",
-                        isNewThread ? "absolute" : "relative",
-                      )}
-                    >
-                      <TodoList
-                        className="bg-white/80"
-                        todos={thread.values.todos ?? []}
-                        collapsed={todoListCollapsed}
-                        hidden={
-                          !thread.values.todos ||
-                          thread.values.todos.length === 0
-                        }
-                        onToggle={() =>
-                          setTodoListCollapsed(!todoListCollapsed)
-                        }
-                      />
-                    </div>
-                  </div>
+                  {isNewThread && (
+                    <Welcome
+                      className="mb-5 sm:mb-7"
+                      mode={settings.context.mode}
+                    />
+                  )}
+                  {!!thread.values.todos?.length && (
+                    <TodoList
+                      className="bg-white/80"
+                      todos={thread.values.todos}
+                      collapsed={todoListCollapsed}
+                      onToggle={() => setTodoListCollapsed(!todoListCollapsed)}
+                    />
+                  )}
                   {thread.isLoading && !thread.isStopping && (
                     <p
                       className="text-muted-foreground mb-1 px-2 text-[11px]"
@@ -708,31 +701,23 @@ export default function ChatPage() {
                       }}
                     />
                   )}
-                  <div className="text-muted-foreground mb-1 flex flex-wrap items-center gap-2 px-1 text-xs">
-                    <label htmlFor="input-delivery">
-                      {t.sessionInbox.title}
-                    </label>
-                    <select
-                      id="input-delivery"
-                      aria-label={t.sessionInbox.title}
-                      value={delivery}
-                      disabled={isStreaming}
-                      onChange={(e) =>
-                        setDelivery(e.target.value as InputDelivery)
-                      }
-                      className="bg-background rounded border px-2 py-1"
-                    >
-                      <option value="next_turn">
-                        {t.sessionInbox.nextTurn}
-                      </option>
-                      <option value="next_step">
-                        {t.sessionInbox.nextStep}
-                      </option>
-                    </select>
-                    <span className="min-w-0 flex-1">
-                      {t.sessionInbox.hint}
-                    </span>
-                  </div>
+                  {running &&
+                    !thread.pendingQuestion &&
+                    thread.values.is_plan_mode === true && (
+                      <button
+                        type="button"
+                        className="bg-muted/40 text-muted-foreground hover:bg-muted mb-2 flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs"
+                        onClick={() => {
+                          setExecutionTab("plan");
+                          setPanelRequested(true);
+                          setSubagentPanelDismissed(false);
+                          setArtifactsOpen(false);
+                        }}
+                      >
+                        <ClipboardListIcon className="size-3" />
+                        {t.subagentWorkspace.planMode}
+                      </button>
+                    )}
                   {thread.pendingQuestion ? (
                     <div className="space-y-2">
                       {thread.pendingQuestion.intent === "plan-review" ? (
@@ -761,36 +746,12 @@ export default function ChatPage() {
                     </div>
                   ) : (
                     <InputBox
-                      allowBusySubmit
-                      className={cn("w-full")}
-                      isNewThread={isNewThread}
                       autoFocus={isNewThread}
-                      status={
-                        thread.isLoading || childCommandPending
-                          ? "streaming"
-                          : "ready"
-                      }
+                      running={running}
+                      canSteer={canSteer}
+                      stopping={thread.isStopping}
+                      submitting={isStreaming}
                       context={settings.context}
-                      extraHeader={
-                        isNewThread ? (
-                          <Welcome mode={settings.context.mode} />
-                        ) : thread.isLoading &&
-                          thread.values.is_plan_mode === true ? (
-                          <button
-                            type="button"
-                            className="bg-muted/40 text-muted-foreground mx-2 flex items-center gap-1.5 rounded border px-2 py-1 text-xs"
-                            onClick={() => {
-                              setExecutionTab("plan");
-                              setPanelRequested(true);
-                              setSubagentPanelDismissed(false);
-                              setArtifactsOpen(false);
-                            }}
-                          >
-                            <ClipboardListIcon className="size-3" />
-                            {t.subagentWorkspace.planMode}
-                          </button>
-                        ) : undefined
-                      }
                       disabled={
                         env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" ||
                         childCommandPending ||
@@ -804,8 +765,15 @@ export default function ChatPage() {
                       onStop={handleStop}
                     />
                   )}
+                  {isNewThread &&
+                    !thread.pendingQuestion &&
+                    searchParams.get("mode") !== "skill" && (
+                      <div className="mt-4 sm:mt-6">
+                        <SuggestionList />
+                      </div>
+                    )}
                   {env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" && (
-                    <div className="text-muted-foreground/67 w-full translate-y-12 text-center text-xs">
+                    <div className="text-muted-foreground/67 mt-3 w-full text-center text-xs">
                       {t.common.notAvailableInDemoMode}
                     </div>
                   )}

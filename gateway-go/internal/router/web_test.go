@@ -10,85 +10,139 @@ import (
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/middleware"
 )
 
-func TestWebRoutes(t *testing.T) {
+func TestCreativeWebRoutes(t *testing.T) {
+	public := "http://127.0.0.1:7777"
+	canvas := "http://127.0.0.1:3000"
 	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie("open_ai_canvas_session"); err == nil {
+			t.Error("forwarded shared session to the frontend")
+		}
 		fmt.Fprintf(w, "frontend %s", r.URL.RequestURI())
 	}))
 	defer frontend.Close()
-	manager := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Nous-Manager-Token") != "test-gateway-token" {
-			t.Error("manager request lacks the gateway token")
+	identity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie("unrelated"); err == nil {
+			t.Error("forwarded unrelated cookie to authentication")
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/media/") {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/auth/nous-session":
+			cookie, err := r.Cookie("open_ai_canvas_session")
+			if err != nil {
+				t.Error("authentication called without a session")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			switch cookie.Value {
+			case "unavailable":
+				w.WriteHeader(http.StatusInternalServerError)
+			case "admin", "user":
+				fmt.Fprintf(w, `{"code":0,"data":{"user":{"id":"test","role":%q,"status":"active"}}}`, cookie.Value)
+			default:
+				w.WriteHeader(http.StatusUnauthorized)
+			}
+		case "/api/auth/logout":
+			http.SetCookie(w, &http.Cookie{Name: "open_ai_canvas_session", MaxAge: -1, Path: "/", HttpOnly: true})
+			fmt.Fprint(w, `{"code":0}`)
+		default:
+			t.Errorf("unexpected authentication route: %s", r.URL.Path)
+			http.NotFound(w, r)
 		}
-		if r.URL.Path == "/api/ideas/" {
-			http.Redirect(w, r, "/api/ideas?"+r.URL.RawQuery, http.StatusTemporaryRedirect)
-			return
-		}
-		fmt.Fprintf(w, "manager %s", r.URL.RequestURI())
 	}))
-	defer manager.Close()
+	defer identity.Close()
+
+	canvasWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Forwarded-Host") != "127.0.0.1:7777" || r.Header.Get("X-Forwarded-Proto") != "http" {
+			t.Error("creative request lost its public origin")
+		}
+		switch r.URL.Path {
+		case "/api/ideas":
+			http.NotFound(w, r)
+		case "/api/auth/callback":
+			http.Redirect(w, r, "/login?next=%2Fcanvas%2Fone", http.StatusFound)
+		case "/api/external":
+			http.Redirect(w, r, "https://provider.example/authorize", http.StatusFound)
+		default:
+			fmt.Fprintf(w, "creative %s", r.URL.RequestURI())
+		}
+	}))
+	defer canvasWeb.Close()
 
 	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "api %s", r.URL.RequestURI())
 	})
-	frontendProxy, managerProxy, err := middleware.NewWebUpstreams(middleware.WebUpstreams{FrontendURL: frontend.URL, ManagerURL: manager.URL,
-		ManagerToken: "test-gateway-token", PublicOrigin: "https://nous.example"})
+	web, creative, err := middleware.NewWebUpstreams(middleware.WebUpstreams{
+		FrontendURL: frontend.URL, CreativeURL: identity.URL,
+		CreativeWebURL: canvasWeb.URL, PublicOrigin: public,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	handler := WithWeb(api, web, creative)
 
-	handler := WithWeb(api, frontendProxy, managerProxy)
-
-	for _, test := range []struct {
-		method string
-		path   string
-		origin string
-		status int
-		body   string
+	for _, tc := range []struct {
+		method, path, session, origin string
+		status                        int
+		body, location                string
 	}{
-		{"GET", "/", "", 200, "frontend /"},
-		{"GET", "/_next/static/chunk.js", "", 200, "frontend /_next/static/chunk.js"},
-		{"GET", "/api/models", "", 200, "api /api/models"},
-		{"POST", "/api/agent/threads", "", 200, "frontend /api/agent/threads"},
-		{"GET", "/health", "", 200, "api /health"},
-		{"GET", "/creative", "", 308, ""},
-		{"GET", "/workspace/creative?from=old", "", 308, ""},
-		{"GET", "/creative/", "", 200, "manager /"},
-		{"GET", "/creative/assets/index.js", "", 200, "manager /assets/index.js"},
-		{"GET", "/creative/api/trends?limit=3", "", 200, "manager /api/trends?limit=3"},
-		{"GET", "/creative/api/ideas/?keep=1", "", 307, ""},
-		{"POST", "/creative/api/schedule", "https://nous.example", 200, "manager /api/schedule"},
-		{"POST", "/creative/api/schedule", "https://elsewhere.example", 403, ""},
-		{"GET", "/creative/api/media/example.html", "", 200, "manager /api/media/example.html"},
+		{"GET", "/", "", "", 200, "frontend /", ""},
+		{"GET", "/health", "", "", 200, "api /health", ""},
+		{"GET", "/creative", "", "", 303, "", "/creative/"},
+		{"GET", "/workspace/creative?ref=one", "", "", 303, "", "/creative/?ref=one"},
+		{"GET", "/creative/", "", "", 200, "creative /", ""},
+		{"GET", "/creative/canvas/one", "user", "", 200, "creative /canvas/one", ""},
+		{"GET", "/creative/api/ideas", "", "", 404, "", ""},
+		{"GET", "/creative/api/auth/nous-session", "user", "", 404, "", ""},
+		{"GET", "/creative/api/auth/callback", "", "", 302, "", "/creative/login?next=%2Fcanvas%2Fone"},
+		{"GET", "/creative/api/external", "", "", 302, "", "https://provider.example/authorize"},
+		{"POST", "/creative/api/auth/login", "", canvas, 403, "", ""},
+		{"POST", "/creative/api/auth/login", "", public, 200, "creative /api/auth/login", ""},
+		{"GET", "/login", "", "", 303, "", "/creative/login?next=%2Fnous%2Freturn"},
+		{"GET", "/register?ref=one", "", "", 303, "", "/creative/register?next=%2Fnous%2Freturn&ref=one"},
+		{"GET", "/workspace/chats/new", "", "", 303, "", "/login"},
+		{"GET", "/api/agent/threads", "", "", 401, "", ""},
+		{"GET", "/api/agent/threads", "user", "", 403, "", ""},
+		{"GET", "/api/agent/threads", "admin", "", 200, "frontend /api/agent/threads", ""},
+		{"GET", "/api/models", "admin", "", 200, "api /api/models", ""},
+		{"GET", "/api/models", "expired", "", 401, "", ""},
+		{"GET", "/api/models", "unavailable", "", 503, "", ""},
+		{"POST", "/api/agent/threads", "admin", canvas, 403, "", ""},
+		{"POST", "/api/agent/threads", "admin", public, 200, "frontend /api/agent/threads", ""},
+		{"GET", "/api/auth/session", "user", "", 200, `"role":"user"`, ""},
+		{"GET", "/api/auth/session", "", "", 200, `"user":null`, ""},
+		{"POST", "/api/auth/logout", "admin", public, 204, "", ""},
 	} {
-		t.Run(test.method+" "+test.path+" "+test.origin, func(t *testing.T) {
-			req := httptest.NewRequest(test.method, "https://nous.example"+test.path, nil)
-			if test.origin != "" {
-				req.Header.Set("Origin", test.origin)
+		t.Run(tc.method+" "+tc.path+"/"+tc.session+"/"+tc.origin, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, public+tc.path, nil)
+			req.AddCookie(&http.Cookie{Name: "unrelated", Value: "test"})
+			if tc.session != "" {
+				req.AddCookie(&http.Cookie{Name: "open_ai_canvas_session", Value: tc.session})
 			}
-			req.Header.Set("X-Nous-Manager-Token", "untrusted-client-value")
-			res := httptest.NewRecorder()
-			handler.ServeHTTP(res, req)
-			if res.Code != test.status || (test.body != "" && res.Body.String() != test.body) {
-				t.Fatalf("response = %d %q, want %d %q", res.Code, res.Body.String(), test.status, test.body)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
 			}
-			if test.status == 308 {
-				want := "/creative/"
-				if req.URL.RawQuery != "" {
-					want += "?" + req.URL.RawQuery
+			req.Header.Set("X-Nous-Role", "admin")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.body) || rec.Header().Get("Location") != tc.location {
+				t.Fatalf("got HTTP %d, body %q, Location %q", rec.Code, rec.Body.String(), rec.Header().Get("Location"))
+			}
+			if tc.path == "/api/auth/logout" {
+				cookies := rec.Result().Cookies()
+				if len(cookies) != 1 || cookies[0].Name != "open_ai_canvas_session" || cookies[0].MaxAge != -1 {
+					t.Fatalf("shared session was not cleared: %v", cookies)
 				}
-				if got := res.Header().Get("Location"); got != want {
-					t.Fatalf("Location = %q, want %q", got, want)
-				}
-			}
-			if test.status == 307 && res.Header().Get("Location") != "/creative/api/ideas?keep=1" {
-				t.Fatalf("Manager redirect Location = %q", res.Header().Get("Location"))
-			}
-			if strings.Contains(test.path, "/api/media/") && res.Header().Get("Content-Security-Policy") != "sandbox allow-scripts" {
-				t.Fatal("active media was not isolated")
 			}
 		})
+	}
+}
+
+func TestStandaloneWebHasNoSharedAuth(t *testing.T) {
+	handler := WithWeb(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }), nil, nil)
+	for path, status := range map[string]int{"/api/models": 200, "/creative/": 503, "/api/auth/session": 200} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != status {
+			t.Errorf("%s: HTTP %d, want %d", path, rec.Code, status)
+		}
 	}
 }

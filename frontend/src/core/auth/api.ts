@@ -1,17 +1,12 @@
-import type { LoginRequest, RegisterRequest, TokenResponse, User } from "./types";
+import type { Session } from "./types";
 
-export async function login(_data: LoginRequest): Promise<TokenResponse> {
-    return { access_token: "", token_type: "bearer" } as TokenResponse;
-}
-
-export async function register(_data: RegisterRequest): Promise<TokenResponse> {
-    return { access_token: "", token_type: "bearer" } as TokenResponse;
+export async function getSession(signal?: AbortSignal): Promise<Session> {
+  const response = await fetch("/api/auth/session", { cache: "no-store", signal });
+  if (!response.ok) throw new Error("Unable to verify the shared session");
+  return (await response.json()) as Session;
 }
 
 export async function logout(): Promise<void> {
-    // No-op
-}
-
-export async function getMe(_token?: string | null): Promise<User> {
-    return { id: "local", email: "local@nous-agent", username: "user" } as User;
+  const response = await fetch("/api/auth/logout", { method: "POST" });
+  if (!response.ok) throw new Error("Unable to sign out");
 }

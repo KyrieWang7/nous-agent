@@ -66,12 +66,17 @@ export const enUS: Translations = {
       "Could not load the new configuration. The existing runtime was preserved:",
   },
   questionReply: {
+    summary: "Clarification",
+    skipped: "Skipped",
+    closed: "Closed",
     options: "Answer options",
     answer: "Write an answer",
     skip: "Skip",
     submit: "Send answer",
   },
   sessionInbox: {
+    queueSend: "Queue message",
+    queuedCount: "{count} messages queued",
     fork: "Fork from this run",
     edit: "Edit queued message",
     save: "Save changes",
@@ -79,9 +84,7 @@ export const enUS: Translations = {
     changed:
       "This message has changed. You can copy your edits before closing.",
     title: "Session inbox",
-    nextTurn: "Next turn",
     nextStep: "Guide current task",
-    hint: "Guidance is admitted at the next model call, or starts a new turn if idle. Stopping a run preserves independent queued tasks.",
     unconfirmed:
       "The last delivery is unconfirmed. Check acceptance before retrying with the same message ID.",
     recover: "Check delivery",
@@ -208,11 +211,11 @@ export const enUS: Translations = {
   welcome: {
     greeting: "Hello, again!",
     description:
-      "Welcome to Nous, a super agent. With built-in and custom skills, Nous helps you search on the web, analyze data, and generate artifacts like slides, web pages and do almost anything.",
+      "Search the web, analyze data, or create slides, images, videos, and web pages with Nous.",
 
     createYourOwnSkill: "Create Your Own Skill",
     createYourOwnSkillDescription:
-      "Create your own skill to release the power of Nous. With customized skills,\nNous can help you search on the web, analyze data, and generate\n artifacts like slides, web pages and do almost anything.",
+      "Describe a task you want Nous to handle and turn your workflow into a reusable skill.",
   },
 
   // Clipboard
@@ -304,6 +307,7 @@ export const enUS: Translations = {
     recentChats: "Recent chats",
     demoChats: "Demo chats",
     agents: "Agents",
+    creative: "Creative workspace",
     search: "Search",
     library: "Library",
     projects: "Projects",
@@ -417,11 +421,32 @@ export const enUS: Translations = {
     description: "Adjust how Nous looks and behaves for you.",
     sections: {
       appearance: "Appearance",
+      models: "Models",
       memory: "Memory",
       tools: "Tools",
       skills: "Skills",
       notification: "Notification",
       about: "About",
+    },
+    models: {
+      title: "Model configuration",
+      add: "Add model",
+      edit: "Edit",
+      name: "Model name",
+      displayName: "Display name",
+      provider: "API protocol",
+      modelId: "Provider model ID",
+      baseUrl: "API base URL",
+      apiKey: "API key",
+      keepApiKey: "Leave blank to keep the current key",
+      setDefault: "Set as default model",
+      defaultBadge: "Default",
+      empty: "No models configured",
+      duplicate: "A model with this name already exists.",
+      missing: "This model was removed. Select another model.",
+      required: "Enter a model name and provider model ID.",
+      saved: "Model configuration saved",
+      failed: "Could not save model configuration.",
     },
     memory: {
       title: "Memory",

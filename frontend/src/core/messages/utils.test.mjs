@@ -77,6 +77,38 @@ test("starts a new processing group after the next human turn", () => {
   assert.equal(processing.length, 2);
 });
 
+test("keeps clarification in order between work before and after the answer", () => {
+  const messages = [
+    {
+      id: "ask",
+      type: "ai",
+      content: "",
+      tool_calls: [{ id: "question", name: "ask_clarification", args: {} }],
+    },
+    {
+      id: "answer",
+      type: "tool",
+      name: "ask_clarification",
+      tool_call_id: "question",
+      content: 'User answer: {"selected":["Web"]}',
+    },
+    {
+      id: "continue",
+      type: "ai",
+      content: "",
+      tool_calls: [{ id: "search", name: "web_search", args: {} }],
+    },
+  ];
+  assert.deepEqual(
+    groupMessages(messages, ({ type, messages }) => [type, messages.map(({ id }) => id)]),
+    [
+      ["assistant:processing", ["ask", "answer"]],
+      ["assistant:clarification", ["answer"]],
+      ["assistant:processing", ["continue"]],
+    ],
+  );
+});
+
 test("unfinished task and artifact calls remain ordinary preparation activity", () => {
   for (const name of ["task", "present_files"]) {
     const message = {

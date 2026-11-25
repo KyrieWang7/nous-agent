@@ -61,21 +61,24 @@ export const zhCN: Translations = {
     loadFailed: "新配置加载失败，已有环境未被替换：",
   },
   questionReply: {
+    summary: "澄清问题",
+    skipped: "已跳过",
+    closed: "已结束",
     options: "回答选项",
     answer: "填写回答",
     skip: "跳过",
     submit: "提交回答",
   },
   sessionInbox: {
+    queueSend: "加入队列",
+    queuedCount: "{count} 条消息等待发送",
     fork: "从此轮分叉会话",
     edit: "编辑排队消息",
     save: "保存修改",
     steer: "转为当前轮补充",
     changed: "消息已变化。你可以复制编辑内容，再关闭编辑。",
     title: "会话消息队列",
-    nextTurn: "下一轮任务",
     nextStep: "补充当前任务",
-    hint: "补充会在下一次模型调用时接纳；当前运行已结束时转为下一轮。停止当前运行会保留独立排队任务。",
     unconfirmed:
       "上次发送结果未确认，内容已保留。先查询接收状态，未接收时使用相同消息 ID 重试。",
     recover: "确认发送状态",
@@ -196,11 +199,11 @@ export const zhCN: Translations = {
   welcome: {
     greeting: "你好，欢迎回来！",
     description:
-      "欢迎使用 Nous，一个超级智能体。通过内置和自定义的 Skills，\nNous 可以帮你搜索网络、分析数据，还能为你生成幻灯片、\n图片、视频、播客及网页等，几乎可以做任何事情。",
+      "用 Nous 搜索资料、分析数据，或创作幻灯片、图片、视频和网页。",
 
-    createYourOwnSkill: "创建你自己的 Agent SKill",
+    createYourOwnSkill: "创建你的 Agent Skill",
     createYourOwnSkillDescription:
-      "创建你的 Agent Skill 来释放 Nous 的潜力。通过自定义技能，Nous\n可以帮你搜索网络、分析数据，还能为你生成幻灯片、\n网页等作品，几乎可以做任何事情。",
+      "描述想交给 Nous 的任务，把你的工作流程变成可重复使用的技能。",
   },
 
   // Clipboard
@@ -289,6 +292,7 @@ export const zhCN: Translations = {
     recentChats: "最近的对话",
     demoChats: "演示对话",
     agents: "Agents",
+    creative: "内容创作",
     search: "搜索",
     library: "库",
     projects: "项目",
@@ -399,11 +403,32 @@ export const zhCN: Translations = {
     description: "根据你的偏好调整 Nous 的界面和行为。",
     sections: {
       appearance: "外观",
+      models: "模型",
       memory: "记忆",
       tools: "工具",
       skills: "技能",
       notification: "通知",
       about: "关于",
+    },
+    models: {
+      title: "模型配置",
+      add: "添加模型",
+      edit: "编辑",
+      name: "模型名称",
+      displayName: "显示名称",
+      provider: "接口协议",
+      modelId: "服务商模型 ID",
+      baseUrl: "API 地址",
+      apiKey: "API Key",
+      keepApiKey: "留空保留当前密钥",
+      setDefault: "设为默认模型",
+      defaultBadge: "默认",
+      empty: "暂无模型",
+      duplicate: "已有同名模型。",
+      missing: "该模型已被移除，请重新选择。",
+      required: "请填写模型名称和服务商模型 ID。",
+      saved: "模型配置已保存",
+      failed: "无法保存模型配置。",
     },
     memory: {
       title: "记忆",

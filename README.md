@@ -136,19 +136,19 @@ make migrate-current
 
 模型连接也可通过 Gateway 的 `GET/PUT /api/models/config` 配置，支持模型地址、API Key 和默认模型；保存后在下一次 run 生效。[接口说明](gateway-go/README.md#model-configuration-api)。
 
-## Manager 内容工作台
+## 内容工作台
 
-Manager 是独立的 Go 服务和发布单元。正式入口由 Gin、Uber Fx、Viper、Zap 和 GORM/PostgreSQL 组成。选题由原生 Go 用例处理，其余 Easel Web 功能通过 Manager 内部兼容进程提供。Manager 的 PostgreSQL 保存选题，`manager_data` 卷保存 Easel 工件、配置、画像、会话和账号状态。模型和账号在 Manager 页面配置。
+Nous 首页和 Agent 工作区由 Gateway 提供。`/creative/` 是同一个站点的内容创作入口。影策源码位于本仓库的 [modules/open-ai-canvas](modules/open-ai-canvas)，导入基于上游 `536771c69485e6f0b5e8474692add33519183ab3` 与本地的 Nous 登录集成。两个前端独立构建。创作微服务继续运行创作任务、画布和素材库，使用专用 PostgreSQL 数据库、Redis 逻辑库及数据卷。旧版 Easel 内容和选题保留在原有 `manager_data` 与 Manager 数据库中。
 
-统一入口由 `gateway-go` 提供。访问 `/` 进入 Nous 首页，`/workspace/` 进入 Nous 会话，`/creative/` 进入 Manager。Manager API 与工作台同源，位于 `/creative/api/`。
+`/login` 和 `/register` 进入两个工作台共用的账号界面。账号、密码和会话由同一个认证后端管理，两个工作台共享同源 HttpOnly Cookie。创作接口经 `/creative/api/` 代理。Agent 工作区和全局配置接口仅对管理员开放，因为该工作区目前共享会话、工具配置及文件。
 
-Web 部署配置使用 Docker Compose 2.24.4 或更高版本的 `!override`。在 `.env` 中设置 `MANAGER_GATEWAY_TOKEN` 和 Manager 独立数据库的 `MANAGER_DATABASE_URL`，并配置 Nous 原有的 PostgreSQL 和模型。以下命令构建并启动统一入口。[Docker Compose 合并规则](https://docs.docker.com/reference/compose-file/merge/#replace-value)
+启动前在 `.env` 中配置 `CREATIVE_DATABASE_URL` 和 `CREATIVE_REDIS_URL`。站点公网地址由 `PUBLIC_WEB_ORIGIN` 指定，地址只填写协议、主机和端口。
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.web.yml up -d --build
 ```
 
-本地打开 [http://127.0.0.1:7777](http://127.0.0.1:7777)。服务器可在反向代理中绑定 HTTPS 和访问控制，并把 `PUBLIC_WEB_ORIGIN` 设为浏览器访问的完整 Origin。Compose 默认只在宿主机回环地址发布 Gateway 端口。Manager 默认启用手动发布包，平台操作使用 Manager 中配置的授权。[Manager 架构和迁移边界](manager/README.md) · [Easel 源码和许可](third_party/easel/SOURCE.md)。
+本地打开 [Nous](http://127.0.0.1:7777) 或 [内容工作台](http://127.0.0.1:7777/creative/)。空数据库可在本机首次注册管理员。使用公网 HTTPS 时，在开放网络访问之前先完成管理员初始化。
 
 ## Subagent 与 Swarm
 

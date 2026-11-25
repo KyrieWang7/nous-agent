@@ -1,0 +1,983 @@
+import { useEffect, useRef, useState } from "react";
+import { App, Button, Form, Input, InputNumber } from "antd";
+import { AdminDrawer, AdminModal } from "@/pages/admin/ui/overlays";
+import type { ColumnsType } from "antd/es/table";
+import { BadgeCheck, Coins, Plus, RefreshCw, Search, Trash2, Undo2 } from "lucide-react";
+
+import { PaginationBar } from "@/pages/admin/components/admin-ui";
+import { formatCredits } from "@/constant/credits";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
+import { listAdminUsers, type AdminReferenceData, type AdminUser } from "@/services/api/auth";
+import { adjustAdminUserCredits, getAdminCreditPolicy, listAdminBillingOrders, resolveAdminBillingOrder, resolveAdminBillingOrders, updateAdminCreditPolicy, type BillingOrder, type CreditPolicy } from "@/services/api/wallet";
+
+import { AdminBatchBar, AdminDataTable, AdminRowActions, AdminStatusBadge, AdminTableEmpty } from "./admin-ui";
+import { Select } from "@/components/ui/base/select";
+
+export type CreditOperation = "policy" | "adjustment" | null;
+
+type AdjustmentFormValues = { userId: string; amount: number; note: string };
+type ResolutionFormValues = { note: string };
+type PolicyMultiplierRow = { model?: string; multiplier?: number };
+type PolicyFormValues = { signupBonus: number; checkinBonus: number; defaultMultiplier: number; modelMultipliers: PolicyMultiplierRow[] };
+type BillingResolutionAction = "settle" | "refund";
+type AdjustmentUser = AdminReferenceData["users"][number] & Partial<Pick<AdminUser, "email" | "availableMicrocredits" | "reservedMicrocredits">>;
+type BillingResolutionTarget = { kind: "single"; order: BillingOrder; action: BillingResolutionAction } | { kind: "batch"; orders: BillingOrder[]; action: BillingResolutionAction };
+
+const billingStatusLabels = {
+    uncertain: "待核对",
+    running: "运行中",
+    reserved: "已预授权",
+    settled: "已结算",
+    refunded: "已退款",
+} satisfies Record<BillingOrder["status"], string>;
+
+export default function CreditOperationsPanel({ users, activeOperation, onOperationChange }: { users: AdminReferenceData["users"]; activeOperation: CreditOperation; onOperationChange: (operation: CreditOperation) => void }) {
+    const { message } = App.useApp();
+    const [orders, setOrders] = useState<BillingOrder[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [loadingPolicy, setLoadingPolicy] = useState(false);
+    const [savingPolicy, setSavingPolicy] = useState(false);
+    const [adjusting, setAdjusting] = useState(false);
+    const [resolving, setResolving] = useState(false);
+    const [keyword, setKeyword] = useState("");
+    const debouncedKeyword = useDebouncedValue(keyword);
+    const [orderStatus, setOrderStatus] = useState<"review" | "all" | BillingOrder["status"]>("review");
+    const [page, setPage] = useState(1);
+    const [pageSize, setPageSize] = useState(20);
+    const [total, setTotal] = useState(0);
+    const [adjustmentUsers, setAdjustmentUsers] = useState<AdjustmentUser[]>(users);
+    const [adjustmentSearch, setAdjustmentSearch] = useState("");
+    const debouncedAdjustmentSearch = useDebouncedValue(adjustmentSearch);
+    const [searchingUsers, setSearchingUsers] = useState(false);
+    const [pendingAdjustment, setPendingAdjustment] = useState<AdjustmentFormValues | null>(null);
+    const [pendingPolicy, setPendingPolicy] = useState<PolicyFormValues | null>(null);
+    const [policy, setPolicy] = useState<CreditPolicy | null>(null);
+    const [policyLoaded, setPolicyLoaded] = useState(false);
+    const [policyLoadError, setPolicyLoadError] = useState(false);
+    const [policyReloadKey, setPolicyReloadKey] = useState(0);
+    const [selectedOrderIds, setSelectedOrderIds] = useState<string[]>([]);
+    const [resolutionTarget, setResolutionTarget] = useState<BillingResolutionTarget | null>(null);
+    const [stoppingGifts, setStoppingGifts] = useState(false);
+    const [adjustmentForm] = Form.useForm<AdjustmentFormValues>();
+    const [resolutionForm] = Form.useForm<ResolutionFormValues>();
+    const [policyForm] = Form.useForm<PolicyFormValues>();
+    const ordersRequestRef = useRef(0);
+    const userSearchRequestRef = useRef(0);
+    const policyLoadedRef = useRef(false);
+    const selectedAdjustmentUserId = Form.useWatch("userId", adjustmentForm);
+
+    const selectedAdjustmentUser = adjustmentUsers.find((user) => user.id === selectedAdjustmentUserId);
+    const pendingAdjustmentUser = adjustmentUsers.find((user) => user.id === pendingAdjustment?.userId);
+
+    const reload = async (targetPage = page, targetPageSize = pageSize) => {
+        const requestId = ++ordersRequestRef.current;
+        setLoading(true);
+        try {
+            const result = await listAdminBillingOrders({
+                keyword: debouncedKeyword || undefined,
+                status: orderStatus,
+                page: targetPage,
+                pageSize: targetPageSize,
+            });
+            if (requestId !== ordersRequestRef.current) return;
+            if (targetPage > 1 && result.total > 0 && result.orders.length === 0) {
+                setPage(1);
+                return;
+            }
+            setOrders(result.orders);
+            setTotal(result.total);
+            setSelectedOrderIds([]);
+        } catch (error) {
+            if (requestId === ordersRequestRef.current) message.error(error instanceof Error ? error.message : "读取待核对计费失败");
+        } finally {
+            if (requestId === ordersRequestRef.current) setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        void reload(page, pageSize);
+    }, [debouncedKeyword, orderStatus, page, pageSize]);
+
+    useEffect(() => {
+        if (policyLoadedRef.current && activeOperation !== "policy") return;
+        let active = true;
+        setLoadingPolicy(true);
+        setPolicyLoaded(false);
+        policyLoadedRef.current = false;
+        setPolicyLoadError(false);
+        void getAdminCreditPolicy()
+            .then(({ policy }) => {
+                if (!active) return;
+                setPolicy(policy);
+                setPolicyLoaded(true);
+                policyLoadedRef.current = true;
+                policyForm.setFieldsValue(toPolicyFormValues(policy));
+            })
+            .catch((error) => {
+                if (active) {
+                    setPolicyLoadError(true);
+                    message.error(error instanceof Error ? error.message : "读取积分策略失败");
+                }
+            })
+            .finally(() => {
+                if (active) setLoadingPolicy(false);
+            });
+        return () => {
+            active = false;
+        };
+    }, [activeOperation, message, policyForm, policyReloadKey]);
+
+    useEffect(() => {
+        if (activeOperation !== "adjustment") return;
+        adjustmentForm.resetFields();
+        setPendingAdjustment(null);
+        setAdjustmentSearch("");
+        setAdjustmentUsers(users);
+    }, [activeOperation, adjustmentForm, users]);
+
+    useEffect(() => {
+        if (activeOperation !== "adjustment") return;
+        const requestId = ++userSearchRequestRef.current;
+        setSearchingUsers(true);
+        void listAdminUsers({ keyword: debouncedAdjustmentSearch.trim() || undefined, page: 1, pageSize: 50 })
+            .then((result) => {
+                if (requestId !== userSearchRequestRef.current) return;
+                const selectedId = adjustmentForm.getFieldValue("userId");
+                setAdjustmentUsers((current) => {
+                    const selected = current.find((user) => user.id === selectedId);
+                    if (selected && !result.users.some((user) => user.id === selected.id)) return [selected, ...result.users];
+                    return result.users;
+                });
+            })
+            .catch((error) => {
+                if (requestId === userSearchRequestRef.current) message.error(error instanceof Error ? error.message : "搜索用户失败");
+            })
+            .finally(() => {
+                if (requestId === userSearchRequestRef.current) setSearchingUsers(false);
+            });
+    }, [activeOperation, adjustmentForm, debouncedAdjustmentSearch, message]);
+
+    const savePolicy = async (values: PolicyFormValues) => {
+        if (!policyLoaded || loadingPolicy) {
+            message.error("积分策略尚未成功读取，未保存任何变更");
+            return false;
+        }
+        const modelMultiplierBasisPoints: Record<string, number> = {};
+        for (const row of values.modelMultipliers || []) {
+            const model = String(row.model || "").trim();
+            const multiplier = Number(row.multiplier);
+            if (!model || !Number.isFinite(multiplier) || multiplier < 0.0001 || multiplier > 100) {
+                message.error("请完整填写模型标识与 0.0001–100 之间的倍率");
+                return false;
+            }
+            if (model in modelMultiplierBasisPoints) {
+                message.error(`模型“${model}”配置了重复倍率`);
+                return false;
+            }
+            modelMultiplierBasisPoints[model] = Math.round(multiplier * 10_000);
+        }
+        setSavingPolicy(true);
+        try {
+            const result = await updateAdminCreditPolicy({
+                signupBonusMicrocredits: toMicrocredits(values.signupBonus),
+                checkinBonusMicrocredits: toMicrocredits(values.checkinBonus),
+                defaultMultiplierBasisPoints: Math.round(values.defaultMultiplier * 10_000),
+                modelMultiplierBasisPoints,
+            });
+            setPolicy(result.policy);
+            setPolicyLoaded(true);
+            policyLoadedRef.current = true;
+            policyForm.setFieldsValue(toPolicyFormValues(result.policy));
+            setPendingPolicy(null);
+            message.success("积分策略已保存；赠送额度只作用于后续注册和签到，不会追溯或收回历史积分");
+            onOperationChange(null);
+            return true;
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "保存积分策略失败");
+            return false;
+        } finally {
+            setSavingPolicy(false);
+        }
+    };
+
+    const submitPolicy = (values: PolicyFormValues) => {
+        if (!policyLoaded || loadingPolicy) {
+            message.error("积分策略尚未成功读取，未保存任何变更");
+            return;
+        }
+        if (values.signupBonus > 0 || values.checkinBonus > 0) {
+            setPendingPolicy(values);
+            return;
+        }
+        void savePolicy(values);
+    };
+
+    const stopGiftsNow = async () => {
+        if (!policy || !policyLoaded || loadingPolicy || savingPolicy || stoppingGifts) return;
+        if (policy.signupBonusMicrocredits === 0 && policy.checkinBonusMicrocredits === 0) return;
+        setPendingPolicy(null);
+        setLoadingPolicy(true);
+        setPolicyLoaded(false);
+        policyLoadedRef.current = false;
+        setPolicyLoadError(false);
+        setStoppingGifts(true);
+        try {
+            let latestPolicy: CreditPolicy;
+            try {
+                ({ policy: latestPolicy } = await getAdminCreditPolicy());
+            } catch (error) {
+                setPolicyLoadError(true);
+                message.error(error instanceof Error ? error.message : "读取积分策略失败，未执行停赠");
+                return;
+            }
+            setPolicy(latestPolicy);
+            policyForm.setFieldsValue(toPolicyFormValues(latestPolicy));
+            setPolicyLoaded(true);
+            policyLoadedRef.current = true;
+            if (latestPolicy.signupBonusMicrocredits === 0 && latestPolicy.checkinBonusMicrocredits === 0) {
+                message.info("注册与签到赠送已经停止");
+                return;
+            }
+            const result = await updateAdminCreditPolicy({
+                ...latestPolicy,
+                signupBonusMicrocredits: 0,
+                checkinBonusMicrocredits: 0,
+            });
+            setPolicy(result.policy);
+            policyForm.setFieldsValue(toPolicyFormValues(result.policy));
+            message.success("已停止后续注册和签到赠送；不会收回已发放的历史积分");
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "停止注册和签到赠送失败");
+        } finally {
+            setLoadingPolicy(false);
+            setStoppingGifts(false);
+        }
+    };
+
+    const previewAdjustment = (values: AdjustmentFormValues) => {
+        const amount = Number(values.amount);
+        if (!Number.isFinite(amount) || amount === 0) {
+            message.error("积分变化不能为 0");
+            return;
+        }
+        try {
+            toMicrocredits(amount);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "积分变化超出可处理范围");
+            return;
+        }
+        const user = adjustmentUsers.find((item) => item.id === values.userId);
+        if (amount < 0 && hasCreditBalance(user) && user.availableMicrocredits + toMicrocredits(amount) < 0) {
+            message.error("扣减后可用积分不能低于 0");
+            return;
+        }
+        setPendingAdjustment({ ...values, amount, note: values.note.trim() });
+    };
+
+    const applyAdjustment = async () => {
+        if (!pendingAdjustment) return;
+        setAdjusting(true);
+        try {
+            const result = await adjustAdminUserCredits(pendingAdjustment.userId, {
+                amountMicrocredits: toMicrocredits(pendingAdjustment.amount),
+                note: pendingAdjustment.note,
+            });
+            setAdjustmentUsers((current) =>
+                current.map((user) =>
+                    user.id === result.account.userId
+                        ? {
+                              ...user,
+                              availableMicrocredits: result.account.availableMicrocredits,
+                              reservedMicrocredits: result.account.reservedMicrocredits,
+                          }
+                        : user,
+                ),
+            );
+            adjustmentForm.resetFields();
+            setPendingAdjustment(null);
+            onOperationChange(null);
+            message.success(`用户积分已调整，当前可用积分 ${formatCredits(result.account.availableMicrocredits)}`);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "调整积分失败");
+        } finally {
+            setAdjusting(false);
+        }
+    };
+
+    const resolveBilling = async () => {
+        if (!resolutionTarget) return;
+        let values: ResolutionFormValues;
+        try {
+            values = await resolutionForm.validateFields();
+        } catch {
+            return;
+        }
+        const note = values.note.trim();
+        setResolving(true);
+        try {
+            if (resolutionTarget.kind === "single") {
+                await resolveAdminBillingOrder(resolutionTarget.order.id, { action: resolutionTarget.action, note });
+                message.success(resolutionTarget.action === "settle" ? "计费订单已结算" : "预授权积分已退回");
+            } else {
+                const result = await resolveAdminBillingOrders({
+                    ids: resolutionTarget.orders.map((order) => order.id),
+                    action: resolutionTarget.action,
+                    note,
+                });
+                if (result.failed.length > 0) {
+                    const failedIds = new Set(result.failed.map((item) => item.id));
+                    const failedOrders = resolutionTarget.orders.filter((order) => failedIds.has(order.id));
+                    const detail = result.failed[0]?.message ? `：${result.failed[0].message}` : "";
+                    if (result.resolvedCount > 0) message.warning(`已处理 ${result.resolvedCount} 条，仍有 ${result.failed.length} 条失败${detail}`);
+                    else message.error(`所选 ${result.failed.length} 条订单均处理失败${detail}`);
+                    setResolutionTarget({ ...resolutionTarget, orders: failedOrders.length > 0 ? failedOrders : resolutionTarget.orders });
+                    await reload(page, pageSize);
+                    return;
+                }
+                message.success(resolutionTarget.action === "settle" ? `已结算 ${result.resolvedCount} 条订单` : `已退回 ${result.resolvedCount} 条订单的预授权积分`);
+            }
+            setResolutionTarget(null);
+            resolutionForm.resetFields();
+            await reload(page, pageSize);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "处理计费订单失败");
+        } finally {
+            setResolving(false);
+        }
+    };
+
+    const openSingleResolution = (order: BillingOrder, action: BillingResolutionAction) => {
+        setResolutionTarget({ kind: "single", order, action });
+        resolutionForm.resetFields();
+    };
+
+    const openBatchResolution = (action: BillingResolutionAction) => {
+        const selectedOrders = orders.filter((order) => selectedOrderIds.includes(order.id) && canResolveBillingOrder(order));
+        if (selectedOrders.length === 0) return;
+        setResolutionTarget({ kind: "batch", orders: selectedOrders, action });
+        resolutionForm.resetFields();
+    };
+
+    const columns: ColumnsType<BillingOrder> = [
+        { title: "创建时间", dataIndex: "createdAt", width: 170, align: "center", render: formatTime },
+        {
+            title: "用户",
+            dataIndex: "userId",
+            width: 150,
+            render: (id: string, order) => (
+                <div>
+                    <div className="font-medium">{billingOrderUserLabel(order) || "未知用户"}</div>
+                    <div className="mt-0.5 truncate text-xs text-foreground/50" title={id}>
+                        {order.userAccount ? `@${order.userAccount}` : id}
+                    </div>
+                </div>
+            ),
+        },
+        {
+            title: "模型 / 场景",
+            width: 220,
+            render: (_, order) => (
+                <div>
+                    <div className="font-medium">{order.model}</div>
+                    <div className="mt-0.5 text-xs text-foreground/50">{order.scene || order.capability}</div>
+                </div>
+            ),
+        },
+        {
+            title: "预授权积分",
+            width: 125,
+            align: "center",
+            render: (_, order) => <span className="font-medium tabular-nums">{formatCredits(getReservedAmount(order))}</span>,
+        },
+        {
+            title: "实际结算 / 用量",
+            width: 205,
+            align: "center",
+            render: (_, order) =>
+                order.billingMode === "image_usage" ? (
+                    <div className="text-xs leading-5">
+                        <div className="font-medium tabular-nums">{order.status === "settled" ? `${formatCredits(order.actualAmountMicrocredits)} 积分` : "等待图片用量结算"}</div>
+                        <div className="text-foreground/50">{order.imageUsage ? `输入 ${order.imageUsage.inputImages} 张 · 输出 ${order.imageUsage.outputs.length} 张` : `预留最多 ${order.imageMaxOutputImages ?? order.quantity} 张`}</div>
+                        {order.imageUsage ? (
+                            <div className="text-foreground/50">
+                                {order.imageUsage.outputs
+                                    .slice(0, 3)
+                                    .map((image) => `${image.width}×${image.height}`)
+                                    .join("、")}
+                                {order.imageUsage.outputs.length > 3 ? "…" : ""}
+                            </div>
+                        ) : null}
+                    </div>
+                ) : order.billingMode === "token" ? (
+                    <div className="text-xs leading-5">
+                        <div className="font-medium tabular-nums">{order.status === "settled" ? `${formatCredits(order.actualAmountMicrocredits)} 积分` : "等待用量结算"}</div>
+                        <div className="text-foreground/50">
+                            {order.usageSource === "video_formula"
+                                ? `公式结算 · ${order.outputTokens.toLocaleString()} 视频 Token`
+                                : order.capability === "video"
+                                  ? `上游用量 · ${order.outputTokens.toLocaleString()} 视频 Token`
+                                  : `输入 ${order.inputTokens} · 输出 ${order.outputTokens} · 缓存命中 ${order.cachedTokens}${order.cacheWriteTokens ? ` · 缓存写入 ${order.cacheWriteTokens}` : ""}`}
+                        </div>
+                    </div>
+                ) : (
+                    <span className="tabular-nums">{order.status === "settled" ? formatCredits(order.actualAmountMicrocredits) : "--"}</span>
+                ),
+        },
+        {
+            title: "状态",
+            dataIndex: "status",
+            width: 110,
+            align: "center",
+            render: (value: BillingOrder["status"]) => <AdminStatusBadge label={billingStatusLabels[value]} tone={value === "settled" ? "success" : value === "refunded" ? "neutral" : "warning"} />,
+        },
+        { title: "上游请求", dataIndex: "providerRequestId", width: 180, ellipsis: true, render: (value) => value || "未获取" },
+        { title: "核对原因", dataIndex: "error", width: 260, ellipsis: true, render: (value) => value || "费用状态不明确" },
+        {
+            title: "操作",
+            width: 190,
+            align: "center",
+            fixed: "right",
+            render: (_, order) =>
+                !canResolveBillingOrder(order) ? (
+                    <span className="text-xs text-foreground/45">处理完成</span>
+                ) : (
+                    <div className="flex justify-center">
+                        <AdminRowActions primary={{ label: "确认结算", onClick: () => openSingleResolution(order, "settle") }} actions={[{ key: "refund", label: "退回预授权", danger: true, onClick: () => openSingleResolution(order, "refund") }]} />
+                    </div>
+                ),
+        },
+    ];
+
+    const hasFilters = Boolean(keyword || orderStatus !== "review");
+    const resolutionOrders = resolutionTarget?.kind === "batch" ? resolutionTarget.orders : resolutionTarget ? [resolutionTarget.order] : [];
+    const resolutionReservedTotal = resolutionOrders.reduce((sum, order) => sum + getReservedAmount(order), 0);
+    const resolutionTitle = resolutionTarget ? (resolutionTarget.action === "settle" ? (resolutionTarget.kind === "batch" ? "批量确认结算" : "确认结算计费订单") : resolutionTarget.kind === "batch" ? "批量退回预授权积分" : "确认退回预授权积分") : "";
+    const signupGrantForecast = pendingPolicy ? toMicrocredits(pendingPolicy.signupBonus) * 1_000 : 0;
+    const checkinGrantForecast = pendingPolicy ? toMicrocredits(pendingPolicy.checkinBonus) * 1_000 : 0;
+    const totalGrantForecast = signupGrantForecast + checkinGrantForecast;
+
+    return (
+        <div className="admin-credit-operations flex min-h-0 flex-1 flex-col">
+            <section className="mb-3 border border-amber-500/30 bg-amber-500/5 p-3" aria-labelledby="credit-gift-policy-heading">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                        <h2 id="credit-gift-policy-heading" className="text-sm font-semibold">
+                            注册与签到赠送
+                        </h2>
+                        {policyLoaded && policy ? (
+                            <>
+                                <p className="mt-1 text-sm text-foreground/75">
+                                    注册赠送 <strong className="tabular-nums">{formatCredits(policy.signupBonusMicrocredits)} 积分 / 新用户</strong>
+                                    <span className="mx-2 text-foreground/35">·</span>
+                                    每日签到 <strong className="tabular-nums">{formatCredits(policy.checkinBonusMicrocredits)} 积分 / 用户每日</strong>
+                                </p>
+                                <p className="mt-1 text-xs leading-5 text-foreground/60">
+                                    {policy.signupBonusMicrocredits > 0 || policy.checkinBonusMicrocredits > 0
+                                        ? "当前赠送会随新注册人数与签到天数持续累积；设为 0 可关闭对应赠送，只影响后续发放，不会收回历史积分。"
+                                        : "当前注册与签到赠送均已关闭；设为 0 关闭对应赠送，只影响后续发放，不会收回历史积分。"}
+                                </p>
+                            </>
+                        ) : policyLoadError ? (
+                            <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-foreground/65">
+                                <span>当前积分策略读取失败，写入操作已禁用。</span>
+                                <Button type="link" size="small" className="h-auto p-0" onClick={() => setPolicyReloadKey((key) => key + 1)}>
+                                    重新读取
+                                </Button>
+                            </div>
+                        ) : (
+                            <p className="mt-1 text-sm text-foreground/55" role="status">
+                                正在读取当前赠送额度…
+                            </p>
+                        )}
+                    </div>
+                    <Button
+                        danger
+                        icon={<Coins className="size-3.5" />}
+                        loading={stoppingGifts}
+                        disabled={!policyLoaded || loadingPolicy || !policy || savingPolicy || (policy.signupBonusMicrocredits === 0 && policy.checkinBonusMicrocredits === 0)}
+                        onClick={() => void stopGiftsNow()}
+                    >
+                        {policyLoaded && policy?.signupBonusMicrocredits === 0 && policy?.checkinBonusMicrocredits === 0 ? "注册和签到赠送已停止" : "停止注册和签到赠送"}
+                    </Button>
+                </div>
+            </section>
+            <section className="admin-credit-operations-table-region flex min-h-0 flex-1" aria-labelledby="credit-review-heading">
+                <h2 id="credit-review-heading" className="sr-only">
+                    异常计费核对
+                </h2>
+                <AdminDataTable
+                    toolbar={
+                        <Input
+                            allowClear
+                            aria-label="搜索计费订单"
+                            className="app-list-search"
+                            prefix={<Search className="size-4 text-foreground/40" />}
+                            value={keyword}
+                            placeholder="搜索用户、模型、场景或请求号"
+                            onChange={(event) => {
+                                setKeyword(event.target.value);
+                                setPage(1);
+                            }}
+                        />
+                    }
+                    toolbarActive={hasFilters}
+                    toolbarFilters={
+                        <Select
+                            aria-label="筛选计费队列"
+                            className="w-40"
+                            value={orderStatus}
+                            onChange={(value) => {
+                                setOrderStatus(value);
+                                setPage(1);
+                            }}
+                            options={[
+                                { label: "待核对队列", value: "review" },
+                                { label: "全部历史", value: "all" },
+                                { label: "费用待核对", value: "uncertain" },
+                                { label: "运行中", value: "running" },
+                                { label: "已预授权", value: "reserved" },
+                                { label: "已结算", value: "settled" },
+                                { label: "已退款", value: "refunded" },
+                            ]}
+                        />
+                    }
+                    onReset={() => {
+                        setKeyword("");
+                        setOrderStatus("review");
+                        setPage(1);
+                    }}
+                    trailing={
+                        <Button type="text" size="small" icon={<RefreshCw className="size-3.5" />} loading={loading} onClick={() => void reload()}>
+                            刷新
+                        </Button>
+                    }
+                    batchActions={
+                        <AdminBatchBar count={selectedOrderIds.length} onClear={() => setSelectedOrderIds([])}>
+                            <Button size="small" type="primary" icon={<BadgeCheck className="size-3.5" />} onClick={() => openBatchResolution("settle")}>
+                                批量确认结算
+                            </Button>
+                            <Button size="small" danger icon={<Undo2 className="size-3.5" />} onClick={() => openBatchResolution("refund")}>
+                                批量退回预授权
+                            </Button>
+                        </AdminBatchBar>
+                    }
+                    table={{
+                        className: "app-data-table",
+                        rowKey: "id",
+                        size: "small",
+                        loading,
+                        pagination: false,
+                        columns,
+                        dataSource: orders,
+                        rowSelection: {
+                            selectedRowKeys: selectedOrderIds,
+                            preserveSelectedRowKeys: false,
+                            onChange: (keys) => setSelectedOrderIds(keys.map(String)),
+                            getCheckboxProps: (order) => ({
+                                disabled: !canResolveBillingOrder(order),
+                                name: `${order.model} ${order.scene || order.capability}`,
+                            }),
+                        },
+                        scroll: { x: 1510 },
+                    }}
+                    empty={<AdminTableEmpty filtered={hasFilters} title={!hasFilters ? "当前没有待核对订单" : undefined} description={!hasFilters ? "新的异常计费订单会自动出现在这里。" : undefined} />}
+                    footer={
+                        <PaginationBar
+                            alwaysShow
+                            current={page}
+                            pageSize={pageSize}
+                            total={total}
+                            onChange={(nextPage, nextPageSize) => {
+                                setPage(nextPageSize !== pageSize ? 1 : nextPage);
+                                setPageSize(nextPageSize);
+                            }}
+                        />
+                    }
+                />
+            </section>
+
+            <AdminModal
+                title="确认注册与签到赠送额度"
+                open={Boolean(pendingPolicy)}
+                okText="确认并保存赠送策略"
+                cancelText="返回修改"
+                onCancel={() => {
+                    if (!savingPolicy) setPendingPolicy(null);
+                }}
+                onOk={() => {
+                    if (pendingPolicy && policyLoaded && !loadingPolicy && !savingPolicy) void savePolicy(pendingPolicy);
+                }}
+                confirmLoading={savingPolicy}
+                okButtonProps={{ disabled: !pendingPolicy || !policyLoaded || loadingPolicy || savingPolicy }}
+                mask={{ closable: !savingPolicy }}
+                closable={!savingPolicy}
+                destroyOnHidden
+            >
+                {pendingPolicy ? (
+                    <div className="space-y-3">
+                        <p className="text-sm leading-6 text-foreground/70">本次保存包含正数赠送，以下按 1000 个新注册账号与 1000 次签到展示对应发放量；实际发放会随注册和签到持续累积。</p>
+                        <dl className="grid grid-cols-2 gap-2 border-y border-border/60 py-3 text-sm">
+                            <dt className="text-foreground/60">1000 个新账号</dt>
+                            <dd className="text-right tabular-nums">{formatCredits(signupGrantForecast)} 积分</dd>
+                            <dt className="text-foreground/60">1000 次签到</dt>
+                            <dd className="text-right tabular-nums">{formatCredits(checkinGrantForecast)} 积分</dd>
+                            <dt className="font-semibold">对应发放总额</dt>
+                            <dd className="text-right font-semibold tabular-nums">{formatCredits(totalGrantForecast)} 积分</dd>
+                        </dl>
+                        <p className="text-xs leading-5 text-foreground/55">设为 0 可关闭对应赠送；策略只影响后续注册和签到，不会修改或收回历史积分。此处为积分发放额，不等同于现金成本，现金支出取决于积分后续使用的模型及成本。</p>
+                    </div>
+                ) : null}
+            </AdminModal>
+
+            <AdminDrawer
+                title="积分策略"
+                open={activeOperation === "policy"}
+                size="min(700px, 100vw)"
+                onClose={() => {
+                    if (!savingPolicy && !loadingPolicy && !pendingPolicy) onOperationChange(null);
+                }}
+                rootClassName="admin-credit-drawer"
+                destroyOnHidden
+                mask={{ closable: !savingPolicy && !loadingPolicy && !pendingPolicy }}
+                keyboard={!savingPolicy && !loadingPolicy && !pendingPolicy}
+                footer={
+                    <div className="flex justify-end gap-2">
+                        <Button disabled={savingPolicy || loadingPolicy || Boolean(pendingPolicy)} onClick={() => onOperationChange(null)}>
+                            取消
+                        </Button>
+                        <Button type="primary" loading={savingPolicy} disabled={!policyLoaded || loadingPolicy || savingPolicy} onClick={() => policyForm.submit()}>
+                            保存策略
+                        </Button>
+                    </div>
+                }
+            >
+                <div className="admin-credit-drawer-intro">
+                    <strong>注册与签到赠送、积分计费倍率</strong>
+                    <p>赠送值只影响后续注册与签到发放，倍率只影响后续计费；不会调整或收回任何历史积分或订单。</p>
+                </div>
+                {loadingPolicy ? (
+                    <div className="admin-credit-drawer-loading" role="status">
+                        正在读取积分策略…
+                    </div>
+                ) : (
+                    <Form form={policyForm} layout="vertical" requiredMark={false} initialValues={{ modelMultipliers: [] }} onFinish={submitPolicy}>
+                        <section className="admin-credit-drawer-section">
+                            <div className="admin-credit-drawer-section-heading">
+                                <h3>基础规则</h3>
+                                <p>积分支持最多 6 位小数，倍率支持最多 4 位小数。</p>
+                            </div>
+                            <div className="admin-credit-policy-grid">
+                                <Form.Item
+                                    name="signupBonus"
+                                    label="注册赠送积分"
+                                    rules={[
+                                        { required: true, message: "请填写注册积分" },
+                                        { type: "number", min: 0, max: 1_000_000, message: "请输入 0–1,000,000" },
+                                    ]}
+                                >
+                                    <InputNumber className="w-full" min={0} max={1_000_000} precision={6} />
+                                </Form.Item>
+                                <Form.Item
+                                    name="checkinBonus"
+                                    label="每日签到积分"
+                                    rules={[
+                                        { required: true, message: "请填写签到积分" },
+                                        { type: "number", min: 0, max: 100_000, message: "请输入 0–100,000" },
+                                    ]}
+                                >
+                                    <InputNumber className="w-full" min={0} max={100_000} precision={6} />
+                                </Form.Item>
+                                <Form.Item
+                                    name="defaultMultiplier"
+                                    label="默认计费倍率"
+                                    rules={[
+                                        { required: true, message: "请填写默认倍率" },
+                                        { type: "number", min: 0.0001, max: 100, message: "请输入 0.0001–100" },
+                                    ]}
+                                >
+                                    <InputNumber className="w-full" min={0.0001} max={100} precision={4} />
+                                </Form.Item>
+                            </div>
+                        </section>
+
+                        <section className="admin-credit-drawer-section">
+                            <Form.List name="modelMultipliers">
+                                {(fields, { add, remove }) => (
+                                    <>
+                                        <div className="admin-credit-drawer-section-heading admin-credit-drawer-section-heading-with-action">
+                                            <div>
+                                                <h3>模型独立倍率</h3>
+                                                <p>仅为需要覆盖默认倍率的模型添加规则。</p>
+                                            </div>
+                                            <Button type="text" size="small" icon={<Plus className="size-3.5" />} onClick={() => add({ model: "", multiplier: 1 })}>
+                                                添加模型
+                                            </Button>
+                                        </div>
+                                        {fields.length > 0 ? (
+                                            <div className="admin-credit-multiplier-list">
+                                                <div className="admin-credit-multiplier-header" aria-hidden="true">
+                                                    <span>模型标识</span>
+                                                    <span>倍率</span>
+                                                    <span>操作</span>
+                                                </div>
+                                                {fields.map((field, index) => (
+                                                    <div className="admin-credit-multiplier-row" key={field.key}>
+                                                        <Form.Item name={[field.name, "model"]} rules={[{ required: true, whitespace: true, message: "请填写模型标识" }]}>
+                                                            <Input aria-label={`第 ${index + 1} 行模型标识`} placeholder="例如 gpt-image-1" />
+                                                        </Form.Item>
+                                                        <Form.Item
+                                                            name={[field.name, "multiplier"]}
+                                                            rules={[
+                                                                { required: true, message: "请填写倍率" },
+                                                                { type: "number", min: 0.0001, max: 100, message: "请输入 0.0001–100" },
+                                                            ]}
+                                                        >
+                                                            <InputNumber aria-label={`第 ${index + 1} 行倍率`} className="w-full" min={0.0001} max={100} precision={4} />
+                                                        </Form.Item>
+                                                        <Button type="text" danger className="admin-credit-multiplier-remove" icon={<Trash2 className="size-4" />} aria-label={`删除第 ${index + 1} 条模型倍率`} onClick={() => remove(field.name)} />
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <div className="admin-credit-multiplier-empty">暂无模型独立倍率，所有模型使用默认倍率。</div>
+                                        )}
+                                    </>
+                                )}
+                            </Form.List>
+                        </section>
+                    </Form>
+                )}
+            </AdminDrawer>
+
+            <AdminDrawer
+                title="人工调账"
+                open={activeOperation === "adjustment"}
+                size="min(580px, 100vw)"
+                onClose={() => {
+                    if (adjusting || pendingAdjustment) return;
+                    onOperationChange(null);
+                }}
+                rootClassName="admin-credit-drawer"
+                destroyOnHidden
+                mask={{ closable: !adjusting && !pendingAdjustment }}
+                keyboard={!adjusting && !pendingAdjustment}
+                footer={
+                    <div className="flex justify-end gap-2">
+                        <Button disabled={adjusting} onClick={() => onOperationChange(null)}>
+                            取消
+                        </Button>
+                        <Button type="primary" disabled={adjusting} onClick={() => adjustmentForm.submit()}>
+                            核对并继续
+                        </Button>
+                    </div>
+                }
+            >
+                <div className="admin-credit-drawer-intro is-warning">
+                    <strong>账务写入操作</strong>
+                    <p>提交后会立即写入积分流水和管理员审计记录，请填写可追溯的处理依据。</p>
+                </div>
+                <Form form={adjustmentForm} layout="vertical" requiredMark={false} onFinish={previewAdjustment}>
+                    <section className="admin-credit-drawer-section">
+                        <Form.Item name="userId" label="目标用户" rules={[{ required: true, message: "请选择用户" }]}>
+                            <Select
+                                showSearch
+                                filterOption={false}
+                                loading={searchingUsers}
+                                aria-label="搜索并选择调账用户"
+                                placeholder="搜索用户名、显示名称或邮箱"
+                                onSearch={setAdjustmentSearch}
+                                options={adjustmentUsers.map((user) => ({
+                                    label: `${user.displayName || user.username} · @${user.username}`,
+                                    value: user.id,
+                                }))}
+                            />
+                        </Form.Item>
+                        {selectedAdjustmentUser ? <CreditAccountSummary user={selectedAdjustmentUser} /> : null}
+                        <Form.Item
+                            name="amount"
+                            label="积分变化"
+                            extra="正数增加，负数扣减；扣减只能使用可用积分。"
+                            rules={[
+                                { required: true, message: "请填写积分变化" },
+                                {
+                                    validator: (_, value) => (typeof value === "number" && Number.isFinite(value) && value !== 0 ? Promise.resolve() : Promise.reject(new Error("积分变化不能为 0"))),
+                                },
+                            ]}
+                        >
+                            <InputNumber className="w-full" precision={6} prefix={<Coins className="size-3.5 text-foreground/45" />} placeholder="例如 10 或 -2" />
+                        </Form.Item>
+                        <Form.Item name="note" label="调整原因" rules={[{ required: true, whitespace: true, message: "请填写工单号或处理依据" }]}>
+                            <Input.TextArea rows={4} maxLength={500} showCount placeholder="例如：工单 YC-20260828，补偿失败任务费用" />
+                        </Form.Item>
+                    </section>
+                </Form>
+            </AdminDrawer>
+
+            <AdminModal
+                title={pendingAdjustment?.amount && pendingAdjustment.amount < 0 ? "确认扣减用户积分" : "确认增加用户积分"}
+                open={Boolean(pendingAdjustment)}
+                okText={pendingAdjustment?.amount && pendingAdjustment.amount < 0 ? "确认扣减" : "确认增加"}
+                cancelText="返回修改"
+                onCancel={() => {
+                    if (!adjusting) setPendingAdjustment(null);
+                }}
+                onOk={() => void applyAdjustment()}
+                confirmLoading={adjusting}
+                mask={{ closable: !adjusting }}
+                closable={!adjusting}
+                destroyOnHidden
+                okButtonProps={{ danger: Boolean(pendingAdjustment && pendingAdjustment.amount < 0) }}
+            >
+                {pendingAdjustment ? (
+                    <div className="admin-operation-confirmation">
+                        <p className="admin-operation-confirmation-copy">请再次核对用户、积分变化和处理依据。确认后将立即写入账务流水。</p>
+                        <dl className="admin-operation-confirmation-grid">
+                            <div>
+                                <dt>目标用户</dt>
+                                <dd>{formatUserLabel(pendingAdjustmentUser, pendingAdjustment.userId)}</dd>
+                            </div>
+                            <div>
+                                <dt>积分变化</dt>
+                                <dd className={pendingAdjustment.amount < 0 ? "is-negative" : "is-positive"}>
+                                    {pendingAdjustment.amount > 0 ? "+" : ""}
+                                    {formatCredits(toMicrocredits(pendingAdjustment.amount))}
+                                </dd>
+                            </div>
+                            {hasCreditBalance(pendingAdjustmentUser) ? (
+                                <>
+                                    <div>
+                                        <dt>当前可用</dt>
+                                        <dd>{formatCredits(pendingAdjustmentUser.availableMicrocredits)}</dd>
+                                    </div>
+                                    <div>
+                                        <dt>预计可用</dt>
+                                        <dd>{formatCredits(pendingAdjustmentUser.availableMicrocredits + toMicrocredits(pendingAdjustment.amount))}</dd>
+                                    </div>
+                                </>
+                            ) : null}
+                            <div className="is-wide">
+                                <dt>处理依据</dt>
+                                <dd>{pendingAdjustment.note}</dd>
+                            </div>
+                        </dl>
+                    </div>
+                ) : null}
+            </AdminModal>
+
+            <AdminModal
+                title={resolutionTitle}
+                open={Boolean(resolutionTarget)}
+                okText={resolutionTarget?.action === "settle" ? "确认结算" : "退回预授权"}
+                cancelText="取消"
+                onCancel={() => {
+                    if (resolving) return;
+                    setResolutionTarget(null);
+                    resolutionForm.resetFields();
+                }}
+                onOk={() => void resolveBilling()}
+                confirmLoading={resolving}
+                mask={{ closable: !resolving }}
+                closable={!resolving}
+                destroyOnHidden
+                okButtonProps={{ danger: resolutionTarget?.action === "refund" }}
+            >
+                {resolutionTarget ? (
+                    <div className="admin-operation-confirmation">
+                        <p className="admin-operation-confirmation-copy">{resolutionTarget.action === "settle" ? "结算会依据订单计费方式确认实际费用；Token 订单可能退回差额，也可能补扣可用积分。" : "退回操作只会释放尚未结算订单的预授权积分。"}</p>
+                        <dl className="admin-operation-confirmation-grid">
+                            <div>
+                                <dt>订单数量</dt>
+                                <dd>{resolutionOrders.length} 条</dd>
+                            </div>
+                            <div>
+                                <dt>预授权总额</dt>
+                                <dd>{formatCredits(resolutionReservedTotal)} 积分</dd>
+                            </div>
+                            {resolutionTarget.kind === "single" ? (
+                                <>
+                                    <div>
+                                        <dt>用户</dt>
+                                        <dd>{billingOrderUserLabel(resolutionTarget.order) || resolutionTarget.order.userId}</dd>
+                                    </div>
+                                    <div>
+                                        <dt>模型 / 场景</dt>
+                                        <dd>
+                                            {resolutionTarget.order.model} · {resolutionTarget.order.scene || resolutionTarget.order.capability}
+                                        </dd>
+                                    </div>
+                                    <div className="is-wide">
+                                        <dt>订单编号</dt>
+                                        <dd className="admin-monospace">{resolutionTarget.order.id}</dd>
+                                    </div>
+                                </>
+                            ) : null}
+                        </dl>
+                    </div>
+                ) : null}
+                <Form form={resolutionForm} layout="vertical" requiredMark={false}>
+                    <Form.Item name="note" label="核对依据" rules={[{ required: true, whitespace: true, message: "请填写供应商账单、任务状态或处理依据" }]}>
+                        <Input.TextArea rows={4} maxLength={500} showCount placeholder="例如：供应商后台确认任务未产生费用" />
+                    </Form.Item>
+                </Form>
+            </AdminModal>
+        </div>
+    );
+}
+
+function CreditAccountSummary({ user }: { user: AdjustmentUser }) {
+    if (!hasCreditBalance(user)) {
+        return <div className="admin-credit-account-summary is-unavailable">选择远程搜索结果后可核对当前可用与冻结积分。</div>;
+    }
+    return (
+        <dl className="admin-credit-account-summary">
+            <div>
+                <dt>当前可用</dt>
+                <dd>{formatCredits(user.availableMicrocredits)}</dd>
+            </div>
+            <div>
+                <dt>当前冻结</dt>
+                <dd>{formatCredits(user.reservedMicrocredits)}</dd>
+            </div>
+        </dl>
+    );
+}
+
+// 用户名由计费订单列表接口按当前页返回，不再从只含最近注册用户的引用数据里查。
+function billingOrderUserLabel(order: BillingOrder) {
+    return order.userDisplayName || order.userAccount || "";
+}
+
+function canResolveBillingOrder(order: BillingOrder) {
+    return order.status === "uncertain" || order.status === "running" || order.status === "reserved";
+}
+
+function getReservedAmount(order: BillingOrder) {
+    return order.reservedAmountMicrocredits || order.amountMicrocredits;
+}
+
+function hasCreditBalance(user?: AdjustmentUser): user is AdjustmentUser & Pick<AdminUser, "availableMicrocredits" | "reservedMicrocredits"> {
+    return Boolean(user && typeof user.availableMicrocredits === "number" && typeof user.reservedMicrocredits === "number");
+}
+
+function formatUserLabel(user: AdjustmentUser | undefined, fallback: string) {
+    return user ? `${user.displayName || user.username} · @${user.username}` : fallback;
+}
+
+function toMicrocredits(value: number) {
+    const result = Math.round(Number(value) * 1_000_000);
+    if (!Number.isSafeInteger(result)) throw new Error("积分变化超出可处理范围");
+    return result;
+}
+
+function toPolicyFormValues(policy: CreditPolicy): PolicyFormValues {
+    return {
+        signupBonus: policy.signupBonusMicrocredits / 1_000_000,
+        checkinBonus: policy.checkinBonusMicrocredits / 1_000_000,
+        defaultMultiplier: policy.defaultMultiplierBasisPoints / 10_000,
+        modelMultipliers: Object.entries(policy.modelMultiplierBasisPoints).map(([model, value]) => ({ model, multiplier: value / 10_000 })),
+    };
+}
+
+function formatTime(value?: string) {
+    return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "--";
+}

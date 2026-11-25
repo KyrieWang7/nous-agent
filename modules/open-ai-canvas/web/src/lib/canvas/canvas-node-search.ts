@@ -1,0 +1,114 @@
+import { getNodeListLabel } from "@/lib/canvas/node-registry";
+import { producedModelLabel, producedModelSearchTerms } from "@/lib/canvas/produced-model";
+import type { AiConfig } from "@/stores/use-config-store";
+import { canvasNodeCreatedAt, canvasNodeUpdatedAt } from "@/lib/canvas/canvas-node-timestamps";
+import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+import { nodeGenerationPrompt } from "@/lib/canvas/generation-contract";
+const searchTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+});
+
+export function searchCanvasNodes(nodes: CanvasNodeData[], query: string, limit = 80, config?: AiConfig) {
+    const keyword = query.trim().toLocaleLowerCase();
+    return nodes
+        .filter((node) => !keyword || canvasNodeSearchTerms(node, config).some((value) => value.toLocaleLowerCase().includes(keyword)))
+        .toSorted((left, right) => timestampValue(canvasNodeUpdatedAt(right)) - timestampValue(canvasNodeUpdatedAt(left)))
+        .slice(0, keyword ? limit : Math.min(limit, 40));
+}
+
+export function canvasNodeSearchContext(node: CanvasNodeData) {
+    const location = [node.metadata?.chapterTitle, typeof node.metadata?.shotIndex === "number" ? `镜头 ${node.metadata.shotIndex + 1}` : ""].filter(Boolean).join(" · ");
+    const textContent = node.type === CanvasNodeType.Text || node.type === CanvasNodeType.Script || node.type === CanvasNodeType.Skill ? node.metadata?.content : undefined;
+    return location || nodeGenerationPrompt(node) || node.metadata?.workflowDescription || textContent || getNodeListLabel(node.type);
+}
+
+export function canvasNodeMaterialSummary(node: CanvasNodeData, config?: AiConfig) {
+    const details = [getNodeListLabel(node.type)];
+    const width = node.metadata?.naturalWidth;
+    const height = node.metadata?.naturalHeight;
+    if (width && height) details.push(`${width}×${height}`);
+    if (node.metadata?.durationMs) details.push(formatDuration(node.metadata.durationMs));
+    if (node.metadata?.bytes) details.push(formatBytes(node.metadata.bytes));
+    const producedModel = node.metadata?.producedModel;
+    if (producedModel) details.splice(1, 0, config ? producedModelLabel(config, producedModel) : producedModel);
+    return details.slice(0, 3).join(" · ");
+}
+
+export type CanvasNodeSearchKind = "image" | "video" | "audio" | "text" | "drawing" | "layout" | "workflow" | "other";
+
+/** Stable type metadata used by search results and other node lists. */
+export function canvasNodeSearchType(node: CanvasNodeData): { kind: CanvasNodeSearchKind; label: string } {
+    if (node.type === CanvasNodeType.Image || node.type === CanvasNodeType.Panorama || node.type === CanvasNodeType.ColorGrade) return { kind: "image", label: "图片" };
+    if (node.type === CanvasNodeType.Video) return { kind: "video", label: "视频" };
+    if (node.type === CanvasNodeType.Audio) return { kind: "audio", label: "音频" };
+    if (node.type === CanvasNodeType.Text || node.type === CanvasNodeType.Script || node.type === CanvasNodeType.Skill) return { kind: "text", label: "文本" };
+    if (node.type === CanvasNodeType.Drawing) return { kind: "drawing", label: "绘图" };
+    if (node.type === CanvasNodeType.Frame || node.type === CanvasNodeType.BatchTable) return { kind: "layout", label: "画布" };
+    if (node.type === CanvasNodeType.Config || node.type === CanvasNodeType.MediaConversion) return { kind: "workflow", label: "工作流" };
+    return { kind: "other", label: getNodeListLabel(node.type) };
+}
+
+export function canvasNodeSearchTimes(node: CanvasNodeData) {
+    const createdAt = canvasNodeCreatedAt(node);
+    const updatedAt = canvasNodeUpdatedAt(node);
+    return {
+        createdAt,
+        updatedAt,
+        createdLabel: createdAt ? searchTimeFormatter.format(new Date(createdAt)) : "未记录",
+        updatedLabel: updatedAt ? searchTimeFormatter.format(new Date(updatedAt)) : "未记录",
+    };
+}
+
+function canvasNodeSearchTerms(node: CanvasNodeData, config?: AiConfig) {
+    return [
+        node.title,
+        node.type,
+        getNodeListLabel(node.type),
+        nodeGenerationPrompt(node),
+        node.metadata?.model,
+        ...producedModelSearchTerms(node.metadata, config),
+        node.metadata?.chapterTitle,
+        node.metadata?.workflowTitle,
+        node.metadata?.workflowDescription,
+        typeof node.metadata?.shotIndex === "number" ? `镜头 ${node.metadata.shotIndex + 1}` : "",
+        ...(node.metadata?.assetTags || []),
+        // 分镜单元格文本：搜索占位符承诺可搜「镜头」，镜头提示词与台词必须可命中。
+        ...storyboardCellSearchTerms(node),
+    ].filter((value): value is string => typeof value === "string" && Boolean(value));
+}
+
+function storyboardCellSearchTerms(node: CanvasNodeData) {
+    // 分镜表（批量表节点）：每镜提示词在 batchTable.rows[].prompt；标准分镜结构与
+    // 单元格文本分别在 storyboardRows 与 cells。
+    const table = node.metadata?.batchTable;
+    const batchTerms = table ? [...table.rows.map((row) => row.prompt), ...(table.contentKind === "storyboard" ? (table.storyboardRows || []).flatMap(storyboardRowSearchTerms) : []), ...table.rows.flatMap((row) => Object.values(row.cells ?? {}))] : [];
+    // 分镜脚本节点的标准分镜结构：镜头视频提示词（videoMotionPrompt）、台词等单元格文本。
+    const scriptRows = node.metadata?.storyboard?.rows || [];
+    const scriptTerms = scriptRows.flatMap(storyboardRowSearchTerms);
+    return [...batchTerms, ...scriptTerms];
+}
+
+function storyboardRowSearchTerms(row: { plotDescription?: string; dialogue?: string; narrativeIntent?: string; performanceBlocking?: string; videoMotionPrompt?: string; imageGenerationPrompt?: string }) {
+    return [row.videoMotionPrompt, row.plotDescription, row.dialogue, row.imageGenerationPrompt, row.narrativeIntent, row.performanceBlocking];
+}
+
+function timestampValue(value?: string) {
+    const timestamp = value ? Date.parse(value) : 0;
+    return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function formatDuration(durationMs: number) {
+    const seconds = Math.max(0, Math.round(durationMs / 1000));
+    if (seconds < 60) return `${seconds}秒`;
+    return `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
+}
+
+function formatBytes(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}

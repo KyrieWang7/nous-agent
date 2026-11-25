@@ -7,6 +7,7 @@ import {
   FolderPlus,
   PlusCircle,
   MessageSquarePlus,
+  PenLine,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -50,6 +51,14 @@ export function WorkspaceNavChatList() {
                   新
                 </span>
               </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild>
+              <a href="/creative/">
+                <PenLine />
+                <span>{t.sidebar.creative}</span>
+              </a>
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>

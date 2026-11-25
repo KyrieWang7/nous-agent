@@ -1,58 +1,106 @@
 package middleware
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"mime"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strings"
+	"time"
 )
 
+const creativeSessionCookie = "open_ai_canvas_session"
+const CreativePrefix = "/creative"
+
 type WebUpstreams struct {
-	FrontendURL  string
-	ManagerURL   string
-	ManagerToken string
-	PublicOrigin string
+	FrontendURL    string
+	CreativeURL    string
+	CreativeWebURL string
+	PublicOrigin   string
 }
 
-var extensionOrigin = regexp.MustCompile(`^chrome-extension://[a-p]{32}$`)
+type CreativeWeb struct {
+	web          http.Handler
+	publicOrigin string
+	api          *url.URL
+	client       *http.Client
+}
 
-func NewWebUpstreams(cfg WebUpstreams) (frontendHandler, managerHandler http.Handler, err error) {
+func NewWebUpstreams(cfg WebUpstreams) (http.Handler, *CreativeWeb, error) {
 	frontend, err := upstream(cfg.FrontendURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("frontend: %w", err)
 	}
-	manager, err := upstream(cfg.ManagerURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("manager: %w", err)
-	}
-	if (manager == nil) != (cfg.ManagerToken == "") {
-		return nil, nil, errors.New("manager URL and gateway token must be configured together")
-	}
-	if cfg.PublicOrigin != "" {
-		origin, err := upstream(cfg.PublicOrigin)
-		if err != nil || origin.String() != cfg.PublicOrigin || origin.Path != "" {
-			return nil, nil, errors.New("public origin must be an HTTP(S) origin without a path")
-		}
-	}
-
+	var frontendHandler http.Handler
 	if frontend != nil {
-		frontendHandler = reverseProxy(frontend, "")
-	}
-	if manager != nil {
-		proxy := reverseProxy(manager, cfg.ManagerToken)
-		managerHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !managerOriginAllowed(r, cfg.PublicOrigin) {
-				http.Error(w, "Manager requires a same-origin request", http.StatusForbidden)
-				return
+		frontendHandler = &httputil.ReverseProxy{Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(frontend)
+			req.SetXForwarded()
+			cookies := req.Out.Cookies()
+			req.Out.Header.Del("Cookie")
+			for _, cookie := range cookies {
+				if cookie.Name != creativeSessionCookie {
+					req.Out.AddCookie(cookie)
+				}
 			}
-			proxy.ServeHTTP(w, r)
-		})
+		}}
 	}
-	return frontendHandler, managerHandler, nil
+	if cfg.CreativeURL == "" && cfg.CreativeWebURL == "" {
+		return frontendHandler, nil, nil
+	}
+	creative, err := upstream(cfg.CreativeURL)
+	if err != nil || creative == nil {
+		return nil, nil, errors.New("CREATIVE_API_URL must be an HTTP(S) origin")
+	}
+	web, err := upstream(cfg.CreativeWebURL)
+	if err != nil || web == nil {
+		return nil, nil, errors.New("CREATIVE_WEB_URL must be an HTTP(S) origin")
+	}
+	public, err := upstream(cfg.PublicOrigin)
+	if err != nil || public == nil {
+		return nil, nil, errors.New("PUBLIC_WEB_ORIGIN must be an HTTP(S) origin")
+	}
+	public.Path = ""
+	creativeProxy := &httputil.ReverseProxy{
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(web)
+			req.Out.Host = public.Host
+			req.SetXForwarded()
+			req.Out.Header.Set("X-Forwarded-Host", public.Host)
+			req.Out.Header.Set("X-Forwarded-Proto", public.Scheme)
+		},
+		ModifyResponse: func(response *http.Response) error {
+			if response.StatusCode < 300 || response.StatusCode >= 400 {
+				return nil
+			}
+			location, err := url.Parse(response.Header.Get("Location"))
+			if err != nil || location.Path == "" || !strings.HasPrefix(location.Path, "/") {
+				return nil
+			}
+			if location.Host != "" &&
+				(!strings.EqualFold(location.Host, public.Host) || location.Scheme != public.Scheme) {
+				return nil
+			}
+			if location.Path != CreativePrefix && !strings.HasPrefix(location.Path, CreativePrefix+"/") {
+				if location.RawPath != "" {
+					location.RawPath = CreativePrefix + location.RawPath
+				}
+				location.Path = CreativePrefix + location.Path
+				response.Header.Set("Location", location.String())
+			}
+			return nil
+		},
+	}
+	return frontendHandler, &CreativeWeb{
+		web: http.StripPrefix(CreativePrefix, creativeProxy), publicOrigin: public.String(), api: creative,
+		client: &http.Client{
+			Timeout:       8 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}, nil
 }
 
 func upstream(raw string) (*url.URL, error) {
@@ -71,67 +119,167 @@ func upstream(raw string) (*url.URL, error) {
 	return target, nil
 }
 
-func managerOriginAllowed(r *http.Request, publicOrigin string) bool {
+func (c *CreativeWeb) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == CreativePrefix+"/api/auth/nous-session" {
+		http.NotFound(w, r)
+		return
+	}
+	if !c.validateOrigin(r) {
+		http.Error(w, "Same-origin request required", http.StatusForbidden)
+		return
+	}
+	c.web.ServeHTTP(w, r)
+}
+
+func (c *CreativeWeb) Login(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	query.Set("next", "/nous/return")
+	http.Redirect(w, r, CreativePrefix+r.URL.Path+"?"+query.Encode(), http.StatusSeeOther)
+}
+
+func (c *CreativeWeb) Session(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	user, err := c.session(r)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"enabled": true, "user": user})
+}
+
+func (c *CreativeWeb) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !c.validateOrigin(r) {
+		http.Error(w, "Same-origin request required", http.StatusForbidden)
+		return
+	}
+	response, err := c.request(r, http.MethodPost, "/api/auth/logout")
+	if err != nil {
+		http.Error(w, "Authentication service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		http.Error(w, "Could not end session", http.StatusBadGateway)
+		return
+	}
+	var result struct {
+		Code *int `json:"code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 32<<10)).Decode(&result); err != nil || result.Code == nil || *result.Code != 0 {
+		http.Error(w, "Could not end session", http.StatusBadGateway)
+		return
+	}
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == creativeSessionCookie {
+			http.SetCookie(w, cookie)
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *CreativeWeb) AuthorizeWorkspace(w http.ResponseWriter, r *http.Request, isAPI bool) bool {
+	if !c.validateOrigin(r) {
+		http.Error(w, "Same-origin request required", http.StatusForbidden)
+		return false
+	}
+	user, err := c.session(r)
+	if err != nil {
+		http.Error(w, "Authentication service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	if user == nil {
+		if !isAPI && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+		} else {
+			http.Error(w, "Sign in required", http.StatusUnauthorized)
+		}
+		return false
+	}
+	if user.Role != "admin" {
+		http.Error(w, "The Nous Agent workspace requires an administrator account", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+type creativeUser struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Email       string `json:"email,omitempty"`
+	DisplayName string `json:"displayName"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+}
+
+func (c *CreativeWeb) session(r *http.Request) (*creativeUser, error) {
+	if _, err := r.Cookie(creativeSessionCookie); err != nil {
+		return nil, nil
+	}
+	response, err := c.request(r, http.MethodGet, "/api/auth/nous-session")
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, nil
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("session lookup returned HTTP %d", response.StatusCode)
+	}
+	var result struct {
+		Code *int `json:"code"`
+		Data struct {
+			User *creativeUser `json:"user"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
+		return nil, err
+	}
+	if result.Code == nil || *result.Code != 0 {
+		return nil, errors.New("session lookup failed")
+	}
+	user := result.Data.User
+	if user == nil || user.ID == "" || user.Status != "active" {
+		return nil, nil
+	}
+	return user, nil
+}
+
+func (c *CreativeWeb) request(r *http.Request, method, path string) (*http.Response, error) {
+	endpoint := *c.api
+	endpoint.Path = path
+	req, err := http.NewRequestWithContext(r.Context(), method, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if cookie, err := r.Cookie(creativeSessionCookie); err == nil {
+		req.AddCookie(cookie)
+	}
+	if strings.HasPrefix(c.publicOrigin, "https://") {
+		req.Header.Set("X-Forwarded-Proto", "https")
+	}
+	return c.client.Do(req)
+}
+
+func (c *CreativeWeb) validateOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
-	if r.URL.Path == "/api/clipper" && extensionOrigin.MatchString(origin) {
-		return true
+	if origin != "" {
+		return origin == c.publicOrigin
 	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 		return true
 	}
-	if origin == "" {
-		// A browser with Fetch Metadata must come from the exact origin. Local
-		// HTTP clients behind the same authenticated ingress can omit Origin.
-		return r.Header.Get("Sec-Fetch-Site") == ""
-	}
-	if publicOrigin == "" {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		publicOrigin = scheme + "://" + r.Host
-	}
-	return origin == publicOrigin
-}
-
-func reverseProxy(target *url.URL, managerToken string) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
-		Rewrite: func(req *httputil.ProxyRequest) {
-			req.SetURL(target)
-			req.SetXForwarded()
-			if managerToken != "" {
-				req.Out.Header.Set("X-Nous-Manager-Token", managerToken)
-				req.Out.Header.Del("Cookie")
-				if req.Out.URL.Path != "/api/clipper" {
-					req.Out.Header.Del("Authorization")
-				}
-			}
-		},
-		ModifyResponse: func(res *http.Response) error {
-			if managerToken == "" {
-				return nil
-			}
-			res.Header.Del("X-Nous-Manager-Token")
-			location, err := url.Parse(res.Header.Get("Location"))
-			if err == nil && location.Scheme == "" && location.Host == "" && strings.HasPrefix(location.Path, "/") {
-				location.Path = "/creative" + location.Path
-				if location.RawPath != "" {
-					location.RawPath = "/creative" + location.RawPath
-				}
-				res.Header.Set("Location", location.String())
-			}
-			if strings.HasPrefix(res.Request.URL.Path, "/api/media/") {
-				mediaType, _, _ := mime.ParseMediaType(res.Header.Get("Content-Type"))
-				switch mediaType {
-				case "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml":
-					res.Header.Add("Content-Security-Policy", "sandbox allow-scripts")
-				}
-				res.Header.Set("X-Content-Type-Options", "nosniff")
-			}
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "Upstream service is unavailable", http.StatusBadGateway)
-		},
-	}
+	site := r.Header.Get("Sec-Fetch-Site")
+	return site == "" || site == "same-origin"
 }

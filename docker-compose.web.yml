@@ -1,17 +1,22 @@
-# Merge with docker-compose.yml to serve both applications through gateway-go.
+# Merge with docker-compose.yml to start the Nous and Creative workbenches.
 services:
   gateway-go:
     ports: !override
       - "${NOUS_WEB_BIND_HOST:-127.0.0.1}:${GATEWAY_PORT:-7777}:7777"
     environment:
       FRONTEND_BASE_URL: http://frontend:7775
-      MANAGER_BASE_URL: http://manager:7860
-      MANAGER_GATEWAY_TOKEN: "${MANAGER_GATEWAY_TOKEN:?Set MANAGER_GATEWAY_TOKEN}"
-      PUBLIC_WEB_ORIGIN: "${PUBLIC_WEB_ORIGIN:-}"
+      CREATIVE_API_URL: http://creative-backend:8080
+      CREATIVE_WEB_URL: http://creative-web:3000
+      PUBLIC_WEB_ORIGIN: "${PUBLIC_WEB_ORIGIN:-http://127.0.0.1:7777}"
+    networks:
+      - default
+      - creative
     depends_on:
       frontend:
         condition: service_started
-      manager:
+      creative-backend:
+        condition: service_started
+      creative-web:
         condition: service_started
 
   agent-go:
@@ -31,21 +36,59 @@ services:
       retries: 6
       start_period: 20s
 
-  manager:
+  creative-backend:
+    image: nous-creative-backend:local
     build:
-      context: .
-      dockerfile: manager/Dockerfile
+      context: ./modules/open-ai-canvas
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
-    init: true
-    shm_size: 512m
     environment:
-      MANAGER_GATEWAY_TOKEN: "${MANAGER_GATEWAY_TOKEN:?Set MANAGER_GATEWAY_TOKEN}"
-      MANAGER_DATABASE_URL: "${MANAGER_DATABASE_URL:?Set MANAGER_DATABASE_URL}"
-      EASEL_PUBLISH_MODE: "${MANAGER_PUBLISH_MODE:-manual}"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      CANVAS_BACKEND_ADDR: ":8080"
+      CANVAS_BACKEND_DATA_DIR: /data
+      CANVAS_DATABASE_DRIVER: postgres
+      DATABASE_URL: "${CREATIVE_DATABASE_URL:?Set CREATIVE_DATABASE_URL}"
+      REDIS_URL: "${CREATIVE_REDIS_URL:?Set CREATIVE_REDIS_URL}"
+      CANVAS_CORS_ORIGINS: "${PUBLIC_WEB_ORIGIN:-http://127.0.0.1:7777}"
+      CANVAS_PUBLIC_BASE_URL: "${PUBLIC_WEB_ORIGIN:-http://127.0.0.1:7777}/creative"
+      CANVAS_REGISTRATION_ENABLED: "${CREATIVE_REGISTRATION_ENABLED:-false}"
     volumes:
-      - manager_data:/var/lib/manager
+      - creative_data:/data
+    networks:
+      default: {}
+      creative:
+        aliases:
+          - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8080/api/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 20s
+
+  creative-web:
+    image: nous-creative-web:local
+    build:
+      context: ./modules/open-ai-canvas
+      dockerfile: Dockerfile
+      args:
+        VITE_CANVAS_BASE_PATH: /creative/
+    restart: unless-stopped
+    volumes:
+      - creative_web_data:/usr/share/nginx/html
+    networks:
+      - creative
+    depends_on:
+      creative-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+networks:
+  creative:
 
 volumes:
-  manager_data:
+  creative_data:
+  creative_web_data:

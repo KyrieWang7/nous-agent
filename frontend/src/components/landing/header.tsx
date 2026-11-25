@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { useState } from "react";
 import { LayoutDashboard, LogOut } from "lucide-react";
 
 import { logout as logoutRequest } from "@/core/auth";
@@ -25,15 +25,19 @@ const navLinks = [
 ];
 
 export function Header() {
-  const { isLoggedIn, user, logout } = useAuthStore();
-  const displayName = user?.display_name || user?.username || "U";
+  const { enabled, hydrated, user, logout } = useAuthStore();
+  const [logoutError, setLogoutError] = useState(false);
+  const displayName = user?.displayName || user?.username || "U";
   const avatarFallback = displayName.charAt(0).toUpperCase();
 
   async function handleLogout() {
+    setLogoutError(false);
     try {
       await logoutRequest();
-    } finally {
       logout();
+      window.location.assign("/");
+    } catch {
+      setLogoutError(true);
     }
   }
 
@@ -48,19 +52,20 @@ export function Header() {
 
           <nav className="hidden md:flex items-center gap-8">
             {navLinks.map((link) => (
-              <Link
+              <a
                 key={link.label}
                 href={link.href}
                 className="text-base md:text-lg font-medium tracking-wide text-white/60 hover:text-white transition-colors duration-200 hover:text-shadow-sm"
               >
                 {link.label}
-              </Link>
+              </a>
             ))}
           </nav>
         </div>
 
         <div className="flex items-center gap-4">
-          {isLoggedIn ? (
+          {logoutError && <span role="alert" className="text-sm text-red-400">退出登录失败，请重试</span>}
+          {hydrated && enabled && (user ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -68,7 +73,7 @@ export function Header() {
                   className="rounded-full outline-none transition-transform hover:scale-105 active:scale-95 focus-visible:ring-2 focus-visible:ring-white/20"
                 >
                   <Avatar className="size-10 md:size-11 border border-white/10 shadow-lg shadow-black/20">
-                    <AvatarImage src={user?.avatar_url ?? undefined} alt={displayName} />
+                    <AvatarImage alt={displayName} />
                     <AvatarFallback className="bg-primary/10 text-primary font-semibold">
                       {avatarFallback}
                     </AvatarFallback>
@@ -90,10 +95,10 @@ export function Header() {
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator className="bg-white/10 mx-1" />
                 <DropdownMenuItem asChild className="cursor-pointer rounded-xl focus:bg-white/10 focus:text-white px-2.5 py-2 mt-1">
-                  <Link href="/workspace" className="flex items-center gap-3">
+                  <a href={user.role === "admin" ? "/workspace" : "/creative/"} className="flex items-center gap-3">
                     <LayoutDashboard className="size-4 opacity-70" />
                     <span>前往工作台</span>
-                  </Link>
+                  </a>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator className="bg-white/10 mx-1" />
                 <DropdownMenuItem
@@ -111,23 +116,23 @@ export function Header() {
             </DropdownMenu>
           ) : (
             <>
-              <Link href="/login">
+              <a href="/login">
                 <Button
                   variant="ghost"
                   className="text-white/70 hover:text-white hover:bg-white/10 hidden sm:inline-flex font-medium text-base tracking-wide rounded-full px-6 py-5"
                 >
                   登录
                 </Button>
-              </Link>
-              <Link href="/login">
+              </a>
+              <a href="/register">
                 <Button
                   className="bg-white text-black hover:bg-gray-200 font-semibold text-base tracking-wide rounded-full px-6 py-5 shadow-lg shadow-white/10 transition-all hover:shadow-white/20 active:scale-95"
                 >
                   注册
                 </Button>
-              </Link>
+              </a>
             </>
-          )}
+          ))}
         </div>
       </div>
     </header>

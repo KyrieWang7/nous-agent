@@ -1,0 +1,71 @@
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+function source(path: string) {
+    return readFileSync(resolve(import.meta.dir, path), "utf8");
+}
+
+describe("media fallback", () => {
+    test("replaces failed image and video elements with an unavailable state", () => {
+        const preview = source("../src/components/media-preview.tsx");
+
+        expect(preview).toContain("failedSrc === src");
+        expect(preview).toContain("onError={handleUnavailable}");
+        expect(preview).toContain("预览不可用，素材可能已删除");
+        expect(preview).toContain("<ImageOff");
+    });
+
+    test("uses the fallback in list, grid, detail and enlarged previews", () => {
+        const list = source("../src/pages/tasks/task-list-row.tsx");
+        const grid = source("../src/pages/tasks/task-grid-card.tsx");
+        const page = source("../src/pages/tasks/index.tsx");
+        const detail = source("../src/pages/tasks/task-detail-modal.tsx");
+
+        expect(list).toContain("<MediaPreview");
+        expect(list).toContain("disabled={previewUnavailable}");
+        expect(grid).toContain("<MediaPreview");
+        // 放大预览留在页面；详情弹窗的结果大图和缩略图各用一次。
+        expect(page.match(/<MediaPreview/g)).toHaveLength(1);
+        expect(page).toContain('fallbackClassName="task-center-preview-unavailable"');
+        expect(detail.match(/<MediaPreview/g)).toHaveLength(2);
+        expect(detail).toContain('fallbackClassName="task-detail-stage-unavailable"');
+    });
+
+    test("uses the fallback in admin log thumbnails and enlarged previews", () => {
+        const page = source("../src/pages/admin/logs/logs-page.tsx");
+
+        expect(page.match(/<MediaPreview/g)).toHaveLength(2);
+        expect(page).toContain("disabled={previewUnavailable}");
+        expect(page).toContain("onUnavailable={() => setUnavailableUrl(url)}");
+    });
+});
+
+describe("task cancellation policy", () => {
+    test("does not expose cancellation after a task is created", () => {
+        const list = source("../src/pages/tasks/task-list-row.tsx");
+        const grid = source("../src/pages/tasks/task-grid-card.tsx");
+        const page = source("../src/pages/tasks/index.tsx");
+        const detail = source("../src/pages/tasks/task-detail-modal.tsx");
+
+        expect(detail).not.toContain("cancelGenerationTask");
+        expect(list).not.toContain("isTaskCancellable");
+        expect(list).not.toContain("取消任务");
+        expect(grid).not.toContain("isTaskCancellable");
+        expect(grid).not.toContain("取消任务");
+        expect(page).not.toContain("cancelGenerationTask");
+        expect(page).not.toContain('runAction(detailTask.id, "cancel")');
+        // 进行中统计按「非终态」兜底：后端可能出现枚举外的中间态（如 Agent 控制面超时任务），
+        // 白名单匹配会让这些任务不在任何 tab 里，导致总数对不上。
+        expect(page).toContain('if (task.status === "succeeded") succeeded += 1;');
+        expect(page).toContain('task.status !== "succeeded" && task.status !== "failed" && task.status !== "cancelled"');
+    });
+
+    test("batch stop only applies to items still waiting locally", () => {
+        const batches = source("../src/pages/canvas/use-canvas-generation-batches.ts");
+
+        expect(batches).toContain('item.status === "waiting" && !nodeById.get(item.nodeId)?.metadata?.taskId');
+        expect(batches).toContain('item.status === "waiting" && stoppableItems.some((candidate) => candidate.id === item.id)');
+        expect(batches).not.toContain('item.status === "waiting" || item.status === "submitting"');
+    });
+});

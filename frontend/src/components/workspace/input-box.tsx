@@ -1,7 +1,7 @@
 "use client";
 
-import type { ChatStatus } from "ai";
 import {
+  ArrowRightIcon,
   CheckIcon,
   SquareIcon,
   GraduationCapIcon,
@@ -14,7 +14,6 @@ import {
   XIcon,
   ZapIcon,
 } from "lucide-react";
-import { useSearchParams } from "next/navigation";
 import {
   useCallback,
   useEffect,
@@ -22,6 +21,7 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  type FormEvent,
 } from "react";
 
 import {
@@ -53,6 +53,7 @@ import { useModels } from "@/core/models/hooks";
 import { useSkills } from "@/core/skills/hooks";
 import type { Skill } from "@/core/skills/type";
 import type { AgentRunIntent } from "@/core/threads";
+import type { InputDelivery } from "@/core/threads/inbox";
 import type { TokenUsage } from "@/core/types/thread";
 import { cn } from "@/lib/utils";
 
@@ -97,33 +98,44 @@ export function InputBox({
   className,
   disabled,
   autoFocus,
-  status = "ready",
+  running = false,
+  canSteer = false,
+  stopping = false,
+  submitting = false,
   context,
-  extraHeader,
-  isNewThread,
   initialValue,
   tokenUsage,
   onContextChange,
   onSubmit,
   onStop,
-  allowBusySubmit = false,
   ...props
 }: Omit<ComponentProps<typeof PromptInput>, "onSubmit"> & {
-  allowBusySubmit?: boolean;
   assistantId?: string | null;
-  status?: ChatStatus;
+  running?: boolean;
+  canSteer?: boolean;
+  stopping?: boolean;
+  submitting?: boolean;
   disabled?: boolean;
   context: AgentRunIntent;
-  extraHeader?: React.ReactNode;
-  isNewThread?: boolean;
   initialValue?: string;
   onContextChange?: (context: AgentRunIntent) => void;
   tokenUsage?: TokenUsage | null;
-  onSubmit?: (message: PromptInputMessage) => void | Promise<void>;
+  onSubmit?: (
+    message: PromptInputMessage,
+    delivery: InputDelivery,
+  ) => void | Promise<void>;
   onStop?: () => void;
 }) {
   const { t } = useI18n();
-  const searchParams = useSearchParams();
+  const { textInput, attachments } = usePromptInputController();
+  const hasDraft = Boolean(textInput.value.trim() || attachments.files.length);
+  const canSend = hasDraft && !disabled && !submitting;
+  const showSteer = canSteer && hasDraft;
+  const primaryStops = running && (!hasDraft || disabled) && !submitting;
+  const sendLabel = running ? t.sessionInbox.queueSend : t.subagentWorkspace.mainSend;
+  const stopLabel = t.subagentWorkspace.mainStop;
+  const stopHint = stopLabel + " (Esc Esc)";
+  const steerButton = useRef<HTMLButtonElement>(null);
 
   const [selectedSkills, setSelectedSkills] = useState<Skill[]>([]);
   const [showSkillPicker, setShowSkillPicker] = useState(false);
@@ -252,15 +264,11 @@ export function InputBox({
   );
 
   const handleSubmit = useCallback(
-    async (message: PromptInputMessage) => {
-      if (status === "streaming" && !allowBusySubmit) {
-        throw new Error(
-          "A run is already active; keep this input until it finishes.",
-        );
-      }
-      if (!message.text && !message.files?.length) {
-        return;
-      }
+    async (message: PromptInputMessage, event: FormEvent<HTMLFormElement>) => {
+      if (!message.text.trim() && !message.files?.length) return;
+      const delivery = (event.nativeEvent as SubmitEvent).submitter?.getAttribute(
+        "data-delivery",
+      );
 
       let finalText = message.text;
       if (selectedSkills.length > 0) {
@@ -268,10 +276,13 @@ export function InputBox({
         finalText = `[请使用以下技能完成此任务: ${skillNames}]\n\n${finalText}`;
       }
 
-      await onSubmit?.({ ...message, text: finalText });
+      await onSubmit?.(
+        { ...message, text: finalText },
+        canSteer && delivery === "next_step" ? "next_step" : "next_turn",
+      );
       setSelectedSkills([]);
     },
-    [onSubmit, status, selectedSkills, allowBusySubmit],
+    [onSubmit, canSteer, selectedSkills],
   );
 
   const handleTextareaChange = useCallback(
@@ -310,6 +321,16 @@ export function InputBox({
 
   const handleTextareaKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey || e.altKey)) {
+        if (e.shiftKey || e.altKey || e.getModifierState("AltGraph") || (e.ctrlKey && e.metaKey)) {
+          return;
+        }
+        if (canSend && showSteer && steerButton.current) {
+          e.preventDefault();
+          e.currentTarget.form?.requestSubmit(steerButton.current);
+        }
+        return;
+      }
       if (!showSkillPicker) return;
 
       if (e.key === "ArrowDown") {
@@ -335,16 +356,18 @@ export function InputBox({
       filteredSkills,
       skillPickerIndex,
       handleSelectSkillFromPicker,
+      canSend,
+      showSteer,
     ],
   );
 
   return (
     <PromptInput
       className={cn(
-        "rounded-[22px] bg-white shadow-[0_16px_48px_rgba(38,38,34,0.08),0_1px_2px_rgba(38,38,34,0.08)] backdrop-blur-md transition-all duration-300 ease-out focus-within:shadow-[0_18px_54px_rgba(38,38,34,0.11),0_0_0_4px_rgba(38,38,34,0.04)] hover:shadow-[0_18px_54px_rgba(38,38,34,0.1),0_1px_2px_rgba(38,38,34,0.08)] *:data-[slot='input-group']:rounded-[22px]",
-        status === "streaming"
+        "bg-card rounded-2xl shadow-sm transition-shadow focus-within:ring-2 focus-within:ring-ring/25 *:data-[slot=input-group]:rounded-2xl *:data-[slot=input-group]:border-0 *:data-[slot=input-group]:shadow-none *:data-[slot=input-group]:ring-0",
+        running
           ? "streaming-border"
-          : "border border-[var(--manus-line)] focus-within:border-[var(--manus-line-strong)] hover:border-[var(--manus-line-strong)]",
+          : "border border-border focus-within:border-ring/45",
         className,
       )}
       disabled={disabled}
@@ -353,13 +376,6 @@ export function InputBox({
       onSubmit={handleSubmit}
       {...props}
     >
-      {extraHeader && (
-        <div className="absolute top-0 right-0 left-0 z-10">
-          <div className="absolute right-0 bottom-0 left-0 flex items-center justify-center">
-            {extraHeader}
-          </div>
-        </div>
-      )}
       <PromptInputAttachments>
         {(attachment) => <PromptInputAttachment data={attachment} />}
       </PromptInputAttachments>
@@ -383,10 +399,10 @@ export function InputBox({
           ))}
         </div>
       )}
-      <PromptInputBody className="absolute top-0 right-0 left-0 z-3">
-        <div className="relative w-full">
+      <PromptInputBody>
+        <div className="relative min-w-0 w-full">
           <PromptInputTextarea
-            className={cn("size-full")}
+            className="block w-full px-4"
             disabled={disabled}
             placeholder={t.inputBox.placeholder}
             autoFocus={autoFocus}
@@ -397,7 +413,7 @@ export function InputBox({
           {showSkillPicker && filteredSkills.length > 0 && (
             <div
               ref={skillPickerRef}
-              className="absolute bottom-full left-0 z-50 mb-2 w-72 rounded-xl border bg-white shadow-[0_18px_46px_rgba(38,38,34,0.12)]"
+              className="bg-popover absolute bottom-full left-0 z-50 mb-2 w-full max-w-72 rounded-xl border shadow-lg"
             >
               <div className="text-muted-foreground border-b px-3 py-2 text-xs font-medium">
                 选择技能（输入{" "}
@@ -445,7 +461,7 @@ export function InputBox({
           )}
         </div>
       </PromptInputBody>
-      <PromptInputFooter className="flex">
+      <PromptInputFooter className="flex-wrap">
         <PromptInputTools>
           <AddAttachmentsButton className="px-2!" />
           <PromptInputActionMenu>
@@ -619,14 +635,16 @@ export function InputBox({
             </PromptInputActionMenuContent>
           </PromptInputActionMenu>
         </PromptInputTools>
-        <PromptInputTools>
-          <TokenUsageIndicator tokenUsage={tokenUsage} />
+        <PromptInputTools className="ml-auto min-w-0 justify-end">
+          {tokenUsage && tokenUsage.inputTokens + tokenUsage.outputTokens > 0 && (
+            <TokenUsageIndicator tokenUsage={tokenUsage} />
+          )}
           <Tooltip content={swarmEnabled ? "Swarm Mode ON" : "Swarm Mode OFF"}>
             <PromptInputButton
               aria-label={swarmEnabled ? "Swarm Mode ON" : "Swarm Mode OFF"}
               aria-pressed={swarmEnabled}
               className={cn(
-                "min-w-9 gap-1 rounded-full px-2! transition-colors",
+                "min-w-9 shrink-0 gap-1 rounded-full px-2! transition-colors",
                 swarmEnabled
                   ? "border border-[#BCD7FF] bg-[#EAF3FF] text-[#1473E6] hover:bg-[#DDEBFF]"
                   : "text-muted-foreground hover:text-foreground",
@@ -650,9 +668,10 @@ export function InputBox({
           <ModelSelector>
             <ModelSelectorTrigger asChild>
               <PromptInputButton
+                className="min-w-0 max-w-28 sm:max-w-56"
                 title={modelsError ? t.inputBox.modelUnavailable : undefined}
               >
-                <ModelSelectorName className="text-sm font-normal">
+                <ModelSelectorName className="truncate text-sm font-normal">
                   {selectedModel?.display_name ??
                     selectedModel?.name ??
                     (modelsLoading
@@ -686,47 +705,47 @@ export function InputBox({
               </ModelSelectorList>
             </ModelSelectorContent>
           </ModelSelector>
-          {allowBusySubmit && status === "streaming" && (
+          {running && !primaryStops && (
             <PromptInputButton
               type="button"
-              aria-label={t.subagentWorkspace.mainStop}
-              title={t.subagentWorkspace.mainStop}
-              onClick={() => onStop?.()}
+              aria-label={stopLabel}
+              title={stopHint}
+              disabled={stopping}
+              onClick={onStop}
             >
               <SquareIcon className="size-4" />
             </PromptInputButton>
           )}
+          {showSteer && (
+            <PromptInputButton
+              ref={steerButton}
+              type="submit"
+              data-delivery="next_step"
+              disabled={!canSend}
+              aria-label={t.sessionInbox.nextStep}
+              title={t.sessionInbox.nextStep + " (Ctrl/⌘ + Enter)"}
+            >
+              <ArrowRightIcon className="size-4" />
+            </PromptInputButton>
+          )}
           <PromptInputSubmit
-            className="bg-muted text-muted-foreground hover:bg-primary hover:text-primary-foreground rounded-full"
-            disabled={disabled}
+            className="bg-muted text-muted-foreground hover:bg-primary hover:text-primary-foreground shrink-0 rounded-full"
+            disabled={primaryStops ? stopping : !canSend}
             variant="outline"
-            status={allowBusySubmit ? "ready" : status}
-            type={
-              status === "streaming" && !allowBusySubmit ? "button" : "submit"
-            }
-            aria-label={
-              status === "streaming" && !allowBusySubmit
-                ? t.subagentWorkspace.mainStop
-                : t.subagentWorkspace.mainSend
-            }
-            onClick={
-              status === "streaming" && !allowBusySubmit
-                ? () => onStop?.()
-                : undefined
-            }
+            status={primaryStops ? "streaming" : submitting ? "submitted" : "ready"}
+            type={primaryStops ? "button" : "submit"}
+            aria-busy={submitting}
+            aria-label={submitting ? t.subagentWorkspace.sending : primaryStops ? stopLabel : sendLabel}
+            title={primaryStops ? stopHint : running && !submitting ? sendLabel : undefined}
+            onClick={primaryStops ? onStop : undefined}
           />
         </PromptInputTools>
       </PromptInputFooter>
-      {isNewThread && searchParams.get("mode") !== "skill" && (
-        <div className="absolute right-0 -bottom-18 left-0 z-0 flex items-center justify-center">
-          <SuggestionList />
-        </div>
-      )}
     </PromptInput>
   );
 }
 
-function SuggestionList() {
+export function SuggestionList() {
   const { t } = useI18n();
   const { textInput } = usePromptInputController();
   const handleSuggestionClick = useCallback(
@@ -750,7 +769,7 @@ function SuggestionList() {
     [textInput],
   );
   return (
-    <Suggestions className="min-h-12 w-fit items-start gap-2.5">
+    <Suggestions className="justify-center gap-2">
       <ConfettiButton
         className="border-border/85 hover:text-foreground h-9 cursor-pointer rounded-full bg-white/78 px-4 text-[14px] leading-none font-medium text-[var(--manus-text-soft)] shadow-[0_1px_2px_rgba(38,38,34,0.04)] transition-all duration-200 hover:-translate-y-0.5 hover:border-[var(--manus-line-strong)] hover:bg-white hover:shadow-[0_8px_20px_rgba(38,38,34,0.08)] [&>svg]:size-4 [&>svg]:stroke-[1.8]"
         variant="outline"

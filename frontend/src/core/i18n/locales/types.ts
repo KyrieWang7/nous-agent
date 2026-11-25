@@ -51,21 +51,24 @@ export interface Translations {
   };
 
   questionReply: {
+    summary: string;
+    skipped: string;
+    closed: string;
     options: string;
     answer: string;
     skip: string;
     submit: string;
   };
   sessionInbox: {
+    queueSend: string;
+    queuedCount: string;
     fork: string;
     edit: string;
     save: string;
     steer: string;
     changed: string;
     title: string;
-    nextTurn: string;
     nextStep: string;
-    hint: string;
     unconfirmed: string;
     recover: string;
     withdraw: string;
@@ -240,6 +243,7 @@ export interface Translations {
     chats: string;
     demoChats: string;
     agents: string;
+    creative: string;
     search: string;
     library: string;
     projects: string;
@@ -349,11 +353,32 @@ export interface Translations {
     description: string;
     sections: {
       appearance: string;
+      models: string;
       memory: string;
       tools: string;
       skills: string;
       notification: string;
       about: string;
+    };
+    models: {
+      title: string;
+      add: string;
+      edit: string;
+      name: string;
+      displayName: string;
+      provider: string;
+      modelId: string;
+      baseUrl: string;
+      apiKey: string;
+      keepApiKey: string;
+      setDefault: string;
+      defaultBadge: string;
+      empty: string;
+      duplicate: string;
+      missing: string;
+      required: string;
+      saved: string;
+      failed: string;
     };
     memory: {
       title: string;

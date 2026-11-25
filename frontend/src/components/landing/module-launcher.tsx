@@ -11,14 +11,14 @@ const labels = {
     agent: "Agent 工作区",
     agentDescription: "发起对话和任务，使用技能与子 Agent 协作。",
     studio: "内容工作台",
-    studioDescription: "从选题、账号画像和内容制作，到发布与复盘。",
+    studioDescription: "用影策制作商品图、视频和分镜。",
   },
   "en-US": {
     title: "Choose a workspace",
     agent: "Agent workspace",
     agentDescription: "Start chats and tasks, use skills, and collaborate with subagents.",
     studio: "Content studio",
-    studioDescription: "Discover ideas, create content, publish, and review performance.",
+    studioDescription: "Create product images, videos, and storyboards with Yingce.",
   },
 };
 

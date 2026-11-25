@@ -1,33 +1,22 @@
 import { create } from "zustand";
 
-import type { User } from "./types";
+import type { Session } from "./types";
 
-interface AuthState {
-    token: string | null;
-    user: User | null;
-    isLoggedIn: boolean;
-    hydrated: boolean;
-
-    setAuth: (user: User, token?: string | null) => void;
-    logout: () => void;
+interface AuthState extends Session {
+  isLoggedIn: boolean;
+  hydrated: boolean;
+  setSession: (session: Session) => void;
+  logout: () => void;
 }
 
 export const useAuthStore = create<AuthState>()((set) => ({
-    token: null,
-    user: null,
-    isLoggedIn: true,
-    hydrated: true,
+  enabled: false,
+  user: null,
+  isLoggedIn: false,
+  hydrated: false,
 
-    setAuth: (_user: User, _token: string | null = null) =>
-        set({}),
+  setSession: (session) =>
+    set({ ...session, isLoggedIn: !session.enabled || Boolean(session.user), hydrated: true }),
 
-    logout: () =>
-        set({}),
+  logout: () => set({ user: null, isLoggedIn: false }),
 }));
-
-/**
- * Get the current auth token (non-reactive, for use outside React).
- */
-export function getAuthToken(): string | null {
-    return useAuthStore.getState().token;
-}

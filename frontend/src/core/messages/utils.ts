@@ -69,6 +69,7 @@ export function groupMessages<T>(
           type: "assistant:clarification",
           messages: [message],
         });
+        activeProcessingGroup = null;
       } else if (activeProcessingGroup) {
         activeProcessingGroup.messages.push(message);
       } else {

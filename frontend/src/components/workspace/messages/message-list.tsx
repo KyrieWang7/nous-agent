@@ -22,6 +22,7 @@ import type { ThreadStream } from "@/core/types/thread";
 import { cn } from "@/lib/utils";
 
 import { ArtifactFileList } from "../artifacts/artifact-file-list";
+import { ClarificationSummary } from "../question-reply";
 import { StreamingIndicator } from "../streaming-indicator";
 
 import { MarkdownContent } from "./markdown-content";
@@ -51,6 +52,15 @@ export function MessageList({
   if (thread.isThreadLoading) {
     return <MessageListSkeleton />;
   }
+  const clarificationQuestions = new Map<string, string>();
+  for (const message of messages) {
+    if (message.type !== "ai") continue;
+    for (const call of message.tool_calls ?? []) {
+      if (call.name === "ask_clarification" && call.id && typeof call.args?.question === "string") {
+        clarificationQuestions.set(call.id, call.args.question);
+      }
+    }
+  }
   return (
     <Conversation
       className={cn("flex size-full flex-col justify-center", className)}
@@ -67,13 +77,12 @@ export function MessageList({
             );
           } else if (group.type === "assistant:clarification") {
             const message = group.messages[0];
-            if (message && hasContent(message)) {
+            if (message?.type === "tool") {
               return (
-                <MarkdownContent
+                <ClarificationSummary
                   key={group.id}
-                  content={extractContentFromMessage(message)}
-                  isLoading={thread.isLoading}
-                  rehypePlugins={rehypePlugins}
+                  question={clarificationQuestions.get(message.tool_call_id)}
+                  result={extractTextFromMessage(message)}
                 />
               );
             }
