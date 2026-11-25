@@ -18,10 +18,10 @@ import {
 import { NousLogo } from "@/components/ui/nous-logo";
 
 const navLinks = [
-  { href: "/workspace", label: "Agent" },
-  { href: "#", label: "素材生成" },
-  { href: "/workspace/drama", label: "短剧生成" },
-  { href: "#", label: "关于" },
+  { href: "/workspace/chats/new", label: "Agent 工作区" },
+  { href: "/creative/", label: "内容工作台" },
+  { href: "#features", label: "功能介绍" },
+  { href: "#about", label: "关于" },
 ];
 
 export function Header() {
@@ -41,7 +41,7 @@ export function Header() {
     <header className="fixed top-0 right-0 left-0 z-50 flex h-16 items-center justify-center backdrop-blur-md bg-[#0a0a0a]/70 border-b border-white/5 transition-all">
       <div className="container-md mx-auto flex w-full items-center justify-between px-4 sm:px-6">
         <div className="flex items-center gap-8 md:gap-12">
-          <a href="/workspace" className="flex items-center gap-3 group">
+          <a href="/" aria-label="Nous 首页" className="flex items-center gap-3 group">
             <NousLogo className="size-8 md:size-10 text-primary transition-transform duration-300 group-hover:scale-105" />
             <span className="text-3xl md:text-4xl font-bold tracking-tight text-white/90 group-hover:text-white transition-colors">Nous</span>
           </a>

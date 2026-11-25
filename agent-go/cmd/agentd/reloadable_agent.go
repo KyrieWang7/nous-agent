@@ -15,6 +15,7 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/config"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/runtime/runmanager"
+	"github.com/KyrieWang7/nous-agent/platform-go/modelconfig"
 )
 
 type agentBuilder func(config.Config) (builtAgent, error)
@@ -241,6 +242,7 @@ func runtimeConfigFingerprint(configPath, extensionsPath string, catalogPaths []
 	return runtimeFingerprint(configPath, extensionsPath, catalogPaths, extraPaths, nil)
 }
 func runtimeFingerprint(configPath, extensionsPath string, catalogPaths, extraPaths []string, overrides map[string][]byte) ([sha256.Size]byte, error) {
+	extraPaths = append(append([]string(nil), extraPaths...), modelconfig.Path(extensionsPath))
 	hash := sha256.New()
 	for _, path := range append([]string{configPath, extensionsPath}, extraPaths...) {
 		if strings.TrimSpace(path) == "" {

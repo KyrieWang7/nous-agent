@@ -8,6 +8,7 @@ It does not import either Harness implementation.
 Implemented APIs include:
 
 - model catalog and model details
+- model connection settings, credentials, and default model selection
 - thread metadata CRUD
 - uploads and artifact delivery
 - PDF and Office-to-Markdown conversion
@@ -83,6 +84,61 @@ Configuration is supplied through environment variables:
 The root Compose service mounts the same config, Skills, extensions, and data
 volumes used by `agent-go`, while the two processes remain independently
 deployable.
+
+## Model configuration API
+
+`GET /api/models/config` reads model connection settings. `PUT /api/models/config`
+replaces the complete model list and selects its default. Adding a list entry
+creates a model; changing it updates the model; removing it deletes the model.
+At least one model must remain; the model names `default` and `config` are reserved by the runtime and API. Existing `/api/models` and `/api/models/{name}`
+queries continue to return the frontend catalog and reflect saved settings.
+
+```bash
+curl -X PUT http://127.0.0.1:7777/api/models/config \
+  -H 'Content-Type: application/json' \
+  --data-binary @model-settings.json
+```
+
+Example `model-settings.json` (replace the model and key with your provider values):
+
+```json
+{
+  "default_model": "my-model",
+  "models": [
+    {
+      "name": "my-model",
+      "display_name": "My model",
+      "provider": "openai-compatible",
+      "model": "YOUR_MODEL_ID",
+      "base_url": "https://YOUR_PROVIDER/v1",
+      "api_key": "YOUR_API_KEY",
+      "context_length": 128000,
+      "max_tokens": 8192
+    }
+  ]
+}
+```
+
+Supported providers are `openai-compatible`, `anthropic`, and `deepseek`.
+Model fields follow the Harness configuration, including thinking, vision,
+timeouts, provider options, and pricing. An omitted `default_model` selects the
+first model. An omitted `api_key` retains the credential of the existing model
+with the same name; an explicit empty string clears it. GET and PUT responses
+omit `api_key` and report `api_key_configured` instead. A redacted GET response
+can be edited and sent back to PUT without losing existing keys.
+
+Settings are atomically persisted to `models.json` beside
+`NOUS_EXTENSIONS_CONFIG_PATH`, with file permissions `0600`, in the existing
+shared configuration volume. Secrets are stored locally as plaintext; restrict
+access to this volume and the configuration API through your deployment's
+access controls. The repository YAML remains the initial configuration until
+settings are saved. These settings configure the Nous Agent; Manager maintains
+its own model configuration.
+
+Agent loads a new runtime generation before the next run; active runs retain
+their current generation. Saving validates configuration structure, not provider
+connectivity or the validity of a credential. `TUYOO_BASE_URL` and `TUYOO_API_KEY`,
+when explicitly configured, still take precedence for OpenAI-compatible models.
 
 ## Document conversion
 

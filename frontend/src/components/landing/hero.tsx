@@ -17,7 +17,7 @@ export function Hero({ className }: { className?: string }) {
         className,
       )}
     >
-      <div className="absolute inset-0 z-0 bg-black/40">
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-0 bg-black/40">
         <Galaxy
           mouseRepulsion={false}
           starSpeed={0.2}
@@ -35,8 +35,8 @@ export function Hero({ className }: { className?: string }) {
         maxOpacity={0.3}
         flickerChance={0.25}
       />
-      <div className="container-md relative z-10 mx-auto flex h-screen flex-col items-center justify-center">
-        <h1 className="flex items-center gap-2 text-4xl font-bold md:text-6xl">
+      <div className="container-md relative z-10 mx-auto flex min-h-svh flex-col items-center justify-center px-4 pt-24 pb-16">
+        <h1 className="flex flex-col items-center gap-2 text-center text-3xl font-bold sm:text-4xl lg:flex-row lg:text-6xl">
           <WordRotate
             words={[
               "Deep Research",
@@ -54,10 +54,10 @@ export function Hero({ className }: { className?: string }) {
               "Learn Anything",
             ]}
           />{" "}
-          <div>with Nous</div>
+          <span>with Nous</span>
         </h1>
         <p
-          className="mt-8 scale-105 text-center text-2xl text-shadow-sm"
+          className="mt-8 max-w-3xl text-center text-lg leading-relaxed text-shadow-sm sm:text-2xl"
           style={{ color: "rgb(184,184,192)" }}
         >
           An open-source SuperAgent harness that researches, codes, and creates.
@@ -68,7 +68,7 @@ export function Hero({ className }: { className?: string }) {
           <br />
           different levels of tasks that could take minutes to hours.
         </p>
-        <Link href="/workspace">
+        <Link href="/workspace/chats/new">
           <Button
             className="group relative mt-12 overflow-hidden rounded-full bg-white px-12 py-8 text-black transition-all duration-300 hover:scale-[1.02] hover:bg-zinc-100 hover:shadow-[0_0_40px_rgba(255,255,255,0.4)]"
             size="lg"
@@ -78,6 +78,9 @@ export function Hero({ className }: { className?: string }) {
               <ChevronRightIcon className="size-8 transition-transform group-hover:translate-x-2" />
             </span>
           </Button>
+        </Link>
+        <Link href="/creative/" className="mt-5 rounded-md px-3 py-2 text-base text-white/75 underline-offset-4 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-4">
+          进入内容工作台
         </Link>
       </div>
     </div>

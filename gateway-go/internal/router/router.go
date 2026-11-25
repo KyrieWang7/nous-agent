@@ -8,36 +8,39 @@ import (
 )
 
 type Endpoints struct {
-	Health         http.HandlerFunc
-	Models         http.HandlerFunc
-	Model          http.HandlerFunc
-	GetMCP         http.HandlerFunc
-	PutMCP         http.HandlerFunc
-	Skills         http.HandlerFunc
-	Skill          http.HandlerFunc
-	PutSkill       http.HandlerFunc
-	InstallSkill   http.HandlerFunc
-	Threads        http.HandlerFunc
-	CreateThread   http.HandlerFunc
-	UpdateThread   http.HandlerFunc
-	DeleteThread   http.HandlerFunc
-	Upload         http.HandlerFunc
-	Uploads        http.HandlerFunc
-	DeleteUpload   http.HandlerFunc
-	Artifact       http.HandlerFunc
-	WorkspaceFiles http.HandlerFunc
-	Memory         http.HandlerFunc
-	MemoryConfig   http.HandlerFunc
-	MemoryStatus   http.HandlerFunc
-	Teams          http.HandlerFunc
-	Members        http.HandlerFunc
-	SwarmStream    http.HandlerFunc
+	GetModelSettings, PutModelSettings http.HandlerFunc
+	Health                             http.HandlerFunc
+	Models                             http.HandlerFunc
+	Model                              http.HandlerFunc
+	GetMCP                             http.HandlerFunc
+	PutMCP                             http.HandlerFunc
+	Skills                             http.HandlerFunc
+	Skill                              http.HandlerFunc
+	PutSkill                           http.HandlerFunc
+	InstallSkill                       http.HandlerFunc
+	Threads                            http.HandlerFunc
+	CreateThread                       http.HandlerFunc
+	UpdateThread                       http.HandlerFunc
+	DeleteThread                       http.HandlerFunc
+	Upload                             http.HandlerFunc
+	Uploads                            http.HandlerFunc
+	DeleteUpload                       http.HandlerFunc
+	Artifact                           http.HandlerFunc
+	WorkspaceFiles                     http.HandlerFunc
+	Memory                             http.HandlerFunc
+	MemoryConfig                       http.HandlerFunc
+	MemoryStatus                       http.HandlerFunc
+	Teams                              http.HandlerFunc
+	Members                            http.HandlerFunc
+	SwarmStream                        http.HandlerFunc
 }
 
 func New(endpoints Endpoints, middleware ...gin.HandlerFunc) *gin.Engine {
 	engine := httpx.New(middleware...)
 	httpx.Handle(engine, "GET", "/health", endpoints.Health)
 	httpx.Handle(engine, "GET", "/api/models", endpoints.Models)
+	httpx.Handle(engine, "GET", "/api/models/config", endpoints.GetModelSettings)
+	httpx.Handle(engine, "PUT", "/api/models/config", endpoints.PutModelSettings)
 	httpx.Handle(engine, "GET", "/api/models/{name}", endpoints.Model)
 	httpx.Handle(engine, "GET", "/api/mcp/config", endpoints.GetMCP)
 	httpx.Handle(engine, "PUT", "/api/mcp/config", endpoints.PutMCP)

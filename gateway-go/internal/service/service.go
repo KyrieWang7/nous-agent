@@ -7,9 +7,12 @@ import (
 	"os"
 
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/model"
+	"github.com/KyrieWang7/nous-agent/platform-go/modelconfig"
 )
 
 type Catalog interface {
+	ModelSettings() (modelconfig.PublicSettings, error)
+	SaveModelSettings(modelconfig.Input) (modelconfig.PublicSettings, error)
 	Models() ([]model.Model, error)
 	Extensions() (model.Extensions, error)
 	SaveMCP(map[string]model.MCPServer) (model.Extensions, error)

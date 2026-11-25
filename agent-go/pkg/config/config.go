@@ -16,6 +16,7 @@ import (
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/hooks"
 	"github.com/KyrieWang7/nous-agent/agent-go/pkg/permission"
 	platformconfig "github.com/KyrieWang7/nous-agent/platform-go/config"
+	"github.com/KyrieWang7/nous-agent/platform-go/modelconfig"
 	"github.com/spf13/viper"
 )
 
@@ -56,43 +57,10 @@ type DeploymentConfig struct {
 type ServerConfig struct {
 	Address string `yaml:"address"`
 }
-type ModelConfig struct {
-	Name                    string               `yaml:"name"`
-	DisplayName             string               `yaml:"display_name"`
-	Description             string               `yaml:"description"`
-	Provider                string               `yaml:"provider"`
-	Model                   string               `yaml:"model"`
-	BaseURL                 string               `yaml:"base_url"`
-	APIKey                  string               `yaml:"api_key"`
-	MaxTokens               int                  `yaml:"max_tokens"`
-	Temperature             *float64             `yaml:"temperature"`
-	ContextLength           int                  `yaml:"context_length"`
-	Timeout                 int                  `yaml:"timeout"`
-	StreamIdleTimeout       int                  `yaml:"stream_idle_timeout"`
-	UseFiles                bool                 `yaml:"use_files"`
-	SupportsThinking        bool                 `yaml:"supports_thinking"`
-	SupportsReasoningEffort bool                 `yaml:"supports_reasoning_effort"`
-	SupportsVision          bool                 `yaml:"supports_vision"`
-	ExtraBody               map[string]any       `yaml:"extra_body"`
-	WhenThinkingEnabled     *ModelThinkingConfig `yaml:"when_thinking_enabled"`
-	Pricing                 ModelPricingConfig   `yaml:"pricing"`
-}
+type ModelConfig = modelconfig.Model
+type ModelThinkingConfig = modelconfig.Thinking
+type ModelPricingConfig = modelconfig.Pricing
 
-// ModelThinkingConfig contains provider options that only apply when a run
-// explicitly enables thinking. Keeping this separate prevents vendor-specific
-// fields from leaking into ordinary requests.
-type ModelThinkingConfig struct {
-	ExtraBody map[string]any `yaml:"extra_body"`
-}
-
-// ModelPricingConfig stores integer micro-currency rates per million tokens.
-// A zero-valued config keeps cost accounting disabled for that model while
-// token accounting remains active.
-type ModelPricingConfig struct {
-	InputPerMillionMicros       int64 `yaml:"input_per_million_micros"`
-	OutputPerMillionMicros      int64 `yaml:"output_per_million_micros"`
-	CachedInputPerMillionMicros int64 `yaml:"cached_input_per_million_micros"`
-}
 type SandboxConfig struct {
 	Enabled        bool              `yaml:"enabled"`
 	Provider       string            `yaml:"provider"`
@@ -265,6 +233,14 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 
+	if saved, present, err := modelconfig.Read(modelconfig.Path(os.Getenv("NOUS_EXTENSIONS_CONFIG_PATH"))); err != nil {
+		return Config{}, err
+	} else if present {
+		cfg.Models, cfg.DefaultModel = saved.Models, saved.DefaultModel
+		for i := range cfg.Models {
+			cfg.Models[i].APIKey = modelconfig.ResolveKey(cfg.Models[i].APIKey)
+		}
+	}
 	if err := applyExtensions(&cfg, os.Getenv("NOUS_EXTENSIONS_CONFIG_PATH")); err != nil {
 		return Config{}, err
 	}

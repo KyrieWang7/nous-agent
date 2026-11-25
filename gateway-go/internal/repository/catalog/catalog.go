@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	domain "github.com/KyrieWang7/nous-agent/gateway-go/internal/model"
+	"github.com/KyrieWang7/nous-agent/platform-go/modelconfig"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,15 +28,20 @@ func New(harnessPath, extensionsPath, skillsRoot string) *Catalog {
 }
 
 func (c *Catalog) Models() ([]domain.Model, error) {
-	raw, err := os.ReadFile(c.harnessPath)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	settings, err := modelconfig.Load(c.harnessPath, modelconfig.Path(c.extensionsPath))
 	if err != nil {
-		return nil, fmt.Errorf("reading harness config: %w", err)
+		return nil, err
 	}
-	var document struct {
-		Models []domain.Model `yaml:"models"`
-	}
-	if err := yaml.Unmarshal(raw, &document); err != nil {
-		return nil, fmt.Errorf("decoding harness config: %w", err)
+	var document struct{ Models []domain.Model }
+	for _, item := range settings.Models {
+		description := item.Description
+		var descriptionPtr *string
+		if description != "" {
+			descriptionPtr = &description
+		}
+		document.Models = append(document.Models, domain.Model{Name: item.Name, DisplayName: item.DisplayName, Description: descriptionPtr, SupportsThinking: item.SupportsThinking, SupportsReasoningEffort: item.SupportsReasoningEffort})
 	}
 	seen := make(map[string]struct{}, len(document.Models))
 	for i := range document.Models {

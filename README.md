@@ -134,6 +134,8 @@ make migrate
 make migrate-current
 ```
 
+模型连接也可通过 Gateway 的 `GET/PUT /api/models/config` 配置，支持模型地址、API Key 和默认模型；保存后在下一次 run 生效。[接口说明](gateway-go/README.md#model-configuration-api)。
+
 ## Manager 内容工作台
 
 Manager 是独立的 Go 服务和发布单元。正式入口由 Gin、Uber Fx、Viper、Zap 和 GORM/PostgreSQL 组成。选题由原生 Go 用例处理，其余 Easel Web 功能通过 Manager 内部兼容进程提供。Manager 的 PostgreSQL 保存选题，`manager_data` 卷保存 Easel 工件、配置、画像、会话和账号状态。模型和账号在 Manager 页面配置。

@@ -19,6 +19,7 @@ func New(app *service.Service) *Handler {
 }
 func (s *Handler) Endpoints() router.Endpoints {
 	return router.Endpoints{
+		GetModelSettings: s.getModelSettings, PutModelSettings: s.putModelSettings,
 		Health:         s.health,
 		Models:         s.models,
 		Model:          s.model,

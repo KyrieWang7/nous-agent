@@ -2,6 +2,7 @@ package service
 
 import (
 	"github.com/KyrieWang7/nous-agent/gateway-go/internal/model"
+	"github.com/KyrieWang7/nous-agent/platform-go/modelconfig"
 )
 
 func (s *Service) Models() ([]model.Model, error) { return s.catalog.Models() }
@@ -38,4 +39,11 @@ func (s *Service) Model(name string) (model.Model, error) {
 		}
 	}
 	return model.Model{}, model.ErrModelNotFound
+}
+
+func (s *Service) ModelSettings() (modelconfig.PublicSettings, error) {
+	return s.catalog.ModelSettings()
+}
+func (s *Service) SaveModelSettings(input modelconfig.Input) (modelconfig.PublicSettings, error) {
+	return s.catalog.SaveModelSettings(input)
 }
