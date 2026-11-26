@@ -11,11 +11,16 @@ const AUTH_VIEW_PATHS: Record<AuthView, string> = {
     recovery: "/forgot-password",
 };
 
-export const nousOrigin = appBasePath === "/creative" && typeof window !== "undefined" ? window.location.origin : import.meta.env.VITE_NOUS_ORIGIN?.trim();
+const creativeMount = "/creative";
+export const nousOrigin = appBasePath.endsWith(creativeMount) && typeof window !== "undefined" ? new URL(`${appBasePath.slice(0, -creativeMount.length)}/`, window.location.origin).href : import.meta.env.VITE_NOUS_ORIGIN?.trim();
 export const nousReturnPath = "/nous/return";
 
+export function nousURL(origin: string, path: string) {
+    return new URL(path, origin.endsWith("/") ? origin : `${origin}/`).href;
+}
+
 export function nousLogoURL(origin: string, theme: "light" | "dark") {
-    return new URL(theme === "dark" ? "/nous-night.png" : "/nous.png", origin).href;
+    return nousURL(origin, theme === "dark" ? "nous-night.png" : "nous.png");
 }
 
 const REFERRAL_CODE_STORAGE_KEY = "yingce:referral-code";

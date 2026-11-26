@@ -20,11 +20,13 @@ type WebUpstreams struct {
 	CreativeURL    string
 	CreativeWebURL string
 	PublicOrigin   string
+	BasePath       string
 }
 
 type CreativeWeb struct {
 	web          http.Handler
 	publicOrigin string
+	basePath     string
 	api          *url.URL
 	client       *http.Client
 }
@@ -35,10 +37,22 @@ func NewWebUpstreams(cfg WebUpstreams) (http.Handler, *CreativeWeb, error) {
 		return nil, nil, fmt.Errorf("frontend: %w", err)
 	}
 	var frontendHandler http.Handler
+	public, publicErr := upstream(cfg.PublicOrigin)
 	if frontend != nil {
 		frontendHandler = &httputil.ReverseProxy{Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(frontend)
 			req.SetXForwarded()
+			if cfg.BasePath != "" {
+				req.Out.URL.Path = cfg.BasePath + req.Out.URL.Path
+				if req.Out.URL.RawPath != "" {
+					req.Out.URL.RawPath = cfg.BasePath + req.Out.URL.RawPath
+				}
+				if public != nil {
+					req.Out.Host = public.Host
+					req.Out.Header.Set("X-Forwarded-Host", public.Host)
+					req.Out.Header.Set("X-Forwarded-Proto", public.Scheme)
+				}
+			}
 			cookies := req.Out.Cookies()
 			req.Out.Header.Del("Cookie")
 			for _, cookie := range cookies {
@@ -59,11 +73,11 @@ func NewWebUpstreams(cfg WebUpstreams) (http.Handler, *CreativeWeb, error) {
 	if err != nil || web == nil {
 		return nil, nil, errors.New("CREATIVE_WEB_URL must be an HTTP(S) origin")
 	}
-	public, err := upstream(cfg.PublicOrigin)
-	if err != nil || public == nil {
+	if publicErr != nil || public == nil {
 		return nil, nil, errors.New("PUBLIC_WEB_ORIGIN must be an HTTP(S) origin")
 	}
 	public.Path = ""
+	creativePublicPath := cfg.BasePath + CreativePrefix
 	creativeProxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(web)
@@ -73,6 +87,9 @@ func NewWebUpstreams(cfg WebUpstreams) (http.Handler, *CreativeWeb, error) {
 			req.Out.Header.Set("X-Forwarded-Proto", public.Scheme)
 		},
 		ModifyResponse: func(response *http.Response) error {
+			if cfg.BasePath != "" {
+				scopeSessionCookie(response.Header, cfg.BasePath)
+			}
 			if response.StatusCode < 300 || response.StatusCode >= 400 {
 				return nil
 			}
@@ -84,23 +101,42 @@ func NewWebUpstreams(cfg WebUpstreams) (http.Handler, *CreativeWeb, error) {
 				(!strings.EqualFold(location.Host, public.Host) || location.Scheme != public.Scheme) {
 				return nil
 			}
-			if location.Path != CreativePrefix && !strings.HasPrefix(location.Path, CreativePrefix+"/") {
-				if location.RawPath != "" {
-					location.RawPath = CreativePrefix + location.RawPath
-				}
-				location.Path = CreativePrefix + location.Path
-				response.Header.Set("Location", location.String())
+			if location.Path == creativePublicPath || strings.HasPrefix(location.Path, creativePublicPath+"/") {
+				return nil
 			}
+			prefix := creativePublicPath
+			if location.Path == CreativePrefix || strings.HasPrefix(location.Path, CreativePrefix+"/") {
+				prefix = cfg.BasePath
+			}
+			if location.RawPath != "" {
+				location.RawPath = prefix + location.RawPath
+			}
+			location.Path = prefix + location.Path
+			response.Header.Set("Location", location.String())
 			return nil
 		},
 	}
 	return frontendHandler, &CreativeWeb{
-		web: http.StripPrefix(CreativePrefix, creativeProxy), publicOrigin: public.String(), api: creative,
+		web: http.StripPrefix(CreativePrefix, creativeProxy), publicOrigin: public.String(), basePath: cfg.BasePath, api: creative,
 		client: &http.Client{
 			Timeout:       8 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
+}
+
+func scopeSessionCookie(header http.Header, basePath string) {
+	for index, value := range header.Values("Set-Cookie") {
+		cookie, err := http.ParseSetCookie(value)
+		if err == nil && cookie.Name == creativeSessionCookie {
+			cookie.Path = basePath
+			header["Set-Cookie"][index] = cookie.String()
+		}
+	}
+}
+
+func (c *CreativeWeb) PublicPath(path string) string {
+	return c.basePath + path
 }
 
 func upstream(raw string) (*url.URL, error) {
@@ -134,7 +170,7 @@ func (c *CreativeWeb) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (c *CreativeWeb) Login(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	query.Set("next", "/nous/return")
-	http.Redirect(w, r, CreativePrefix+r.URL.Path+"?"+query.Encode(), http.StatusSeeOther)
+	http.Redirect(w, r, c.PublicPath(CreativePrefix+r.URL.Path)+"?"+query.Encode(), http.StatusSeeOther)
 }
 
 func (c *CreativeWeb) Session(w http.ResponseWriter, r *http.Request) {
@@ -181,6 +217,9 @@ func (c *CreativeWeb) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, cookie := range response.Cookies() {
 		if cookie.Name == creativeSessionCookie {
+			if c.basePath != "" {
+				cookie.Path = c.basePath
+			}
 			http.SetCookie(w, cookie)
 		}
 	}
@@ -200,7 +239,7 @@ func (c *CreativeWeb) AuthorizeWorkspace(w http.ResponseWriter, r *http.Request,
 	}
 	if user == nil {
 		if !isAPI && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			http.Redirect(w, r, c.PublicPath("/login"), http.StatusSeeOther)
 		} else {
 			http.Error(w, "Sign in required", http.StatusUnauthorized)
 		}

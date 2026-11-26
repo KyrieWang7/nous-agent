@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { authFetch } from "../api/auth-fetch";
 
 /**
@@ -7,7 +8,7 @@ import { authFetch } from "../api/auth-fetch";
  * Short drama generation service API client
  */
 
-const DRAMA_API_BASE = "/drama-api";
+const DRAMA_API_BASE = webPath("/drama-api");
 
 // Types
 export interface DramaProject {

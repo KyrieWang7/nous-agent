@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import Link from "next/link";
 
 import { NousLogo } from "@/components/ui/nous-logo";
@@ -31,7 +32,7 @@ export function WorkspaceHeader({ className }: { className?: string }) {
             <Link href="/" className="flex items-center gap-2 group">
               <NousLogo className="size-7 text-foreground group-hover:opacity-80 transition-opacity" />
               <img
-                src="/name-transparent.png"
+                src={webPath("/name-transparent.png")}
                 alt="Nous"
                 className="h-4 w-auto max-w-[70px] object-contain transition-opacity group-hover:opacity-80"
               />

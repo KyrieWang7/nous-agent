@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { ArrowUpRight, Bot, PenLine, type LucideIcon } from "lucide-react";
 import { useI18n } from "@/core/i18n/hooks";
 
@@ -33,7 +34,7 @@ function ModuleLink({
 }) {
   return (
     <a
-      href={href}
+      href={webPath(href)}
       className="group flex min-h-48 flex-col items-start justify-between gap-8 rounded-2xl border border-current/15 bg-card p-5 transition-colors hover:bg-foreground/5 focus-visible:outline-2 focus-visible:outline-offset-4 sm:p-7"
       aria-label={title}
     >

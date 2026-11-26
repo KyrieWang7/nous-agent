@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { useEffect, useState } from "react";
 import { FileText, Download, Loader2, Image, Zap } from "lucide-react";
 import { toast } from "sonner";
@@ -65,7 +66,7 @@ export function ScriptManager({ projectId }: { projectId: number }) {
 
     try {
       // Call the generate API (simplified - actual implementation would use SSE)
-      const response = await fetch(`/drama-api/script/${projectId}/generate`, {
+      const response = await fetch(webPath(`/drama-api/script/${projectId}/generate`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

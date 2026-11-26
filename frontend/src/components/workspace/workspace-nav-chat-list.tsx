@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import {
   Bot,
   Search,
@@ -55,7 +56,7 @@ export function WorkspaceNavChatList() {
           </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton asChild>
-              <a href="/creative/">
+              <a href={webPath("/creative/")}>
                 <PenLine />
                 <span>{t.sidebar.creative}</span>
               </a>

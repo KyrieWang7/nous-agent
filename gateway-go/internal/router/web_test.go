@@ -146,3 +146,71 @@ func TestStandaloneWebHasNoSharedAuth(t *testing.T) {
 		}
 	}
 }
+
+func TestMountedWebRoutes(t *testing.T) {
+	const origin = "https://nous.example"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/login":
+			http.SetCookie(w, &http.Cookie{Name: "open_ai_canvas_session", Value: "admin", Path: "/", Secure: true})
+			http.SetCookie(w, &http.Cookie{Name: "__Host-yingce-oidc-state", Value: "state", Path: "/", Secure: true})
+		case "/api/auth/logout":
+			http.SetCookie(w, &http.Cookie{Name: "open_ai_canvas_session", Path: "/", MaxAge: -1, Secure: true})
+			fmt.Fprint(w, `{"code":0}`)
+		case "/oauth/callback":
+			http.Redirect(w, r, "/creative/login?code=one", http.StatusFound)
+		default:
+			fmt.Fprint(w, r.URL.RequestURI())
+		}
+	}))
+	defer upstream.Close()
+	web, creative, err := middleware.NewWebUpstreams(middleware.WebUpstreams{
+		FrontendURL: upstream.URL, CreativeURL: upstream.URL, CreativeWebURL: upstream.URL, PublicOrigin: origin, BasePath: "/nous",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := MountWeb("/nous", WithWeb(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, r.URL.Path)
+	}), web, creative))
+	for _, test := range []struct {
+		method, path   string
+		status         int
+		location, body string
+	}{
+		{"GET", "/nous?ref=abc", 308, "/nous/?ref=abc", ""},
+		{"GET", "/nous/", 200, "", "/nous/"},
+		{"GET", "/nous/_next/static/app.js", 200, "", "/nous/_next/static/app.js"},
+		{"GET", "/nous/creative", 303, "/nous/creative/", ""},
+		{"GET", "/nous/creative/assets/app.js", 200, "", "/assets/app.js"},
+		{"GET", "/nous/creative/oauth/callback", 302, "/nous/creative/login?code=one", ""},
+		{"GET", "/nous/login", 303, "/nous/creative/login?next=%2Fnous%2Freturn", ""},
+		{"GET", "/nous/workspace", 303, "/nous/login", ""},
+		{"GET", "/nous/api/auth/session", 200, "", `"user":null`},
+		{"POST", "/nous/creative/api/auth/login", 200, "", ""},
+		{"POST", "/nous/api/auth/logout", 204, "", ""},
+		{"GET", "/health", 200, "", "/health"},
+		{"GET", "/nous/health", 200, "", "/health"},
+		{"GET", "/login", 404, "", ""},
+		{"GET", "/nousexample/creative/", 404, "", ""},
+	} {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, origin+test.path, nil)
+			request.Header.Set("Origin", origin)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != test.status || recorder.Header().Get("Location") != test.location || !strings.Contains(recorder.Body.String(), test.body) {
+				t.Fatalf("HTTP %d Location %q body %q", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
+			}
+			if strings.HasSuffix(test.path, "/api/auth/login") || strings.HasSuffix(test.path, "/api/auth/logout") {
+				cookies := recorder.Result().Cookies()
+				if len(cookies) == 0 || cookies[0].Name != "open_ai_canvas_session" || cookies[0].Path != "/nous" || !cookies[0].Secure {
+					t.Fatalf("session cookie must be scoped to /nous: %v", cookies)
+				}
+				if len(cookies) > 1 && cookies[1].Path != "/" {
+					t.Fatalf("host cookie changed: %v", cookies[1])
+				}
+			}
+		})
+	}
+}

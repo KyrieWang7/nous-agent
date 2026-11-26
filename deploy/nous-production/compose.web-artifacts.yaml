@@ -1,0 +1,15 @@
+# Use with compose.yaml when the release bundles web artifacts and reuses its base images.
+services:
+  gateway-go:
+    volumes:
+      - ./web-artifacts/nous-gateway:/usr/local/bin/nous-gateway:ro
+
+  frontend:
+    volumes:
+      - ./web-artifacts/frontend-server.js:/app/server.js:ro
+      - ./web-artifacts/frontend-next:/app/.next
+
+  creative-web:
+    entrypoint: [nginx, -g, 'daemon off;']
+    volumes:
+      - ./web-artifacts/canvas-dist:/usr/share/nginx/html:ro

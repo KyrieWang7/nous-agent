@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { ChevronRightIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -27,7 +28,8 @@ export function Hero({ className }: { className?: string }) {
         />
       </div>
       <FlickeringGrid
-        className="absolute inset-0 z-0 mask-[url(/images/nous-line-art.svg)] mask-size-[120vw] mask-center mask-no-repeat md:mask-size-[90vh]"
+        className="absolute inset-0 z-0 mask-size-[120vw] mask-center mask-no-repeat md:mask-size-[90vh]"
+        style={{ maskImage: `url(${webPath("/images/nous-line-art.svg")})` }}
         squareSize={4}
         gridGap={4}
         color={"white"}
@@ -67,7 +69,7 @@ export function Hero({ className }: { className?: string }) {
           <br />
           different levels of tasks that could take minutes to hours.
         </p>
-        <a href="/workspace/chats/new">
+        <a href={webPath("/workspace/chats/new")}>
           <Button
             className="group relative mt-12 overflow-hidden rounded-full bg-white px-12 py-8 text-black transition-all duration-300 hover:scale-[1.02] hover:bg-zinc-100 hover:shadow-[0_0_40px_rgba(255,255,255,0.4)]"
             size="lg"
@@ -78,7 +80,7 @@ export function Hero({ className }: { className?: string }) {
             </span>
           </Button>
         </a>
-        <a href="/creative/" className="mt-5 rounded-md px-3 py-2 text-base text-white/75 underline-offset-4 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-4">
+        <a href={webPath("/creative/")} className="mt-5 rounded-md px-3 py-2 text-base text-white/75 underline-offset-4 hover:text-white hover:underline focus-visible:outline-2 focus-visible:outline-offset-4">
           进入内容工作台
         </a>
       </div>

@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import {
   ChevronRight,
   ListFilter,
@@ -112,7 +113,7 @@ export function RecentChatList() {
         window.location.hostname === "127.0.0.1";
       // On localhost: use Vercel URL; On production: use current origin
       const baseUrl = isLocalhost ? VERCEL_URL : window.location.origin;
-      const shareUrl = `${baseUrl}/workspace/chats/${threadId}`;
+      const shareUrl = `${baseUrl}${webPath(`/workspace/chats/${threadId}`)}`;
       try {
         await navigator.clipboard.writeText(shareUrl);
         toast.success(t.clipboard.linkCopied);

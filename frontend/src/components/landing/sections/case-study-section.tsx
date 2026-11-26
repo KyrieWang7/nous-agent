@@ -1,3 +1,4 @@
+import { webPath } from "@/core/config";
 import Link from "next/link";
 
 import { Card } from "@/components/ui/card";
@@ -62,7 +63,7 @@ export function CaseStudySection({ className }: { className?: string }) {
               <div
                 className="absolute inset-0 z-0 bg-cover bg-center bg-no-repeat transition-all duration-300 group-hover/card:scale-110 group-hover/card:brightness-90"
                 style={{
-                  backgroundImage: `url(/images/${caseStudy.threadId}.jpg)`,
+                  backgroundImage: `url(${webPath(`/images/${caseStudy.threadId}.jpg`)})`,
                 }}
               ></div>
               <div

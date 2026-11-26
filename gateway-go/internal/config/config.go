@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,7 +25,10 @@ type Config struct {
 	CreativeURL      string                   `yaml:"creative_api_url"`
 	CreativeWebURL   string                   `yaml:"creative_web_url"`
 	PublicOrigin     string                   `yaml:"public_origin"`
+	WebBasePath      string                   `yaml:"web_base_path"`
 }
+
+var webBasePathPattern = regexp.MustCompile(`^(/[A-Za-z0-9_-]+)+$`)
 
 func Load() (Config, error) {
 	cfg := Config{RateLimit: platformconfig.RateLimit{Requests: 60, Window: time.Minute}, Address: ":7777", HarnessConfig: "/etc/nous-agent/config.yaml", ExtensionsConfig: "/etc/nous-agent/extensions.json", SkillsRoot: "/opt/nous/skills", WorkspaceRoot: "/data/workspaces", CORSOrigins: []string{"*"}}
@@ -32,6 +36,7 @@ func Load() (Config, error) {
 		"redis_url": "REDIS_URL", "rate_limit.enabled": "HTTP_RATE_LIMIT_ENABLED", "rate_limit.requests": "HTTP_RATE_LIMIT_REQUESTS", "rate_limit.window": "HTTP_RATE_LIMIT_WINDOW",
 		"address": "GATEWAY_ADDR", "database_url": "DATABASE_URL", "harness_config": "NOUS_HARNESS_CONFIG_PATH", "extensions_config": "NOUS_EXTENSIONS_CONFIG_PATH", "skills_root": "NOUS_SKILLS_ROOT", "workspace_root": "NOUS_WORKSPACE_ROOT", "cors_origins": "CORS_ORIGINS",
 		"frontend_url": "FRONTEND_BASE_URL", "creative_api_url": "CREATIVE_API_URL", "creative_web_url": "CREATIVE_WEB_URL", "public_origin": "PUBLIC_WEB_ORIGIN",
+		"web_base_path": "NOUS_WEB_BASE_PATH",
 	})
 	if err != nil {
 		return Config{}, err
@@ -50,6 +55,10 @@ func Load() (Config, error) {
 	cfg.CreativeURL = platformconfig.Env(v, "creative_api_url", cfg.CreativeURL)
 	cfg.CreativeWebURL = platformconfig.Env(v, "creative_web_url", cfg.CreativeWebURL)
 	cfg.PublicOrigin = platformconfig.Env(v, "public_origin", cfg.PublicOrigin)
+	cfg.WebBasePath = platformconfig.Env(v, "web_base_path", cfg.WebBasePath)
+	if cfg.WebBasePath != "" && !webBasePathPattern.MatchString(cfg.WebBasePath) {
+		return Config{}, errors.New("NOUS_WEB_BASE_PATH must be a path prefix without a trailing slash")
+	}
 	if value := os.Getenv("CORS_ORIGINS"); strings.TrimSpace(value) != "" {
 		cfg.CORSOrigins = split(v.GetString("cors_origins"))
 	}

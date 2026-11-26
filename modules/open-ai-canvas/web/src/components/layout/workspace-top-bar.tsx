@@ -15,7 +15,7 @@ import { useUserStore } from "@/stores/use-user-store";
 import { useAppearanceStore } from "@/stores/use-appearance-store";
 import { useWalletBalance } from "@/hooks/use-wallet-balance";
 import { useSpaceCreditOverview } from "@/hooks/use-space-credit-overview";
-import { nousOrigin } from "@/lib/auth-entry";
+import { nousOrigin, nousURL } from "@/lib/auth-entry";
 import { openWorkspaceWallet } from "@/lib/workspace-wallet";
 import { workspacePageTitleKey } from "@/lib/workspace-page-title";
 import { teamCredits, teamIdFromPath } from "@/lib/team-query-keys";
@@ -97,7 +97,7 @@ export function WorkspaceTopBar({ sidebarOpen, onToggleSidebar }: { sidebarOpen:
                 )}
                 <div className="app-workspace-topbar-utilities">
                     {nousOrigin && user?.role === "admin" ? (
-                        <a href={new URL("/workspace/", nousOrigin).href} className="px-2 text-xs font-medium text-foreground/65 hover:text-foreground">
+                        <a href={nousURL(nousOrigin, "workspace/")} className="px-2 text-xs font-medium text-foreground/65 hover:text-foreground">
                             Agent
                         </a>
                     ) : null}

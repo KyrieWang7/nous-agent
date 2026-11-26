@@ -1,5 +1,6 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { useState } from "react";
 import { LayoutDashboard, LogOut } from "lucide-react";
 
@@ -35,7 +36,7 @@ export function Header() {
     try {
       await logoutRequest();
       logout();
-      window.location.assign("/");
+      window.location.assign(webPath("/"));
     } catch {
       setLogoutError(true);
     }
@@ -45,7 +46,7 @@ export function Header() {
     <header className="fixed top-0 right-0 left-0 z-50 flex h-16 items-center justify-center backdrop-blur-md bg-[#0a0a0a]/70 border-b border-white/5 transition-all">
       <div className="container-md mx-auto flex w-full items-center justify-between px-4 sm:px-6">
         <div className="flex items-center gap-8 md:gap-12">
-          <a href="/" aria-label="Nous 首页" className="flex items-center gap-3 group">
+          <a href={webPath("/")} aria-label="Nous 首页" className="flex items-center gap-3 group">
             <NousLogo className="size-8 md:size-10 text-primary transition-transform duration-300 group-hover:scale-105" />
             <span className="text-3xl md:text-4xl font-bold tracking-tight text-white/90 group-hover:text-white transition-colors">Nous</span>
           </a>
@@ -54,7 +55,7 @@ export function Header() {
             {navLinks.map((link) => (
               <a
                 key={link.label}
-                href={link.href}
+                href={webPath(link.href)}
                 className="text-base md:text-lg font-medium tracking-wide text-white/60 hover:text-white transition-colors duration-200 hover:text-shadow-sm"
               >
                 {link.label}
@@ -95,7 +96,7 @@ export function Header() {
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator className="bg-white/10 mx-1" />
                 <DropdownMenuItem asChild className="cursor-pointer rounded-xl focus:bg-white/10 focus:text-white px-2.5 py-2 mt-1">
-                  <a href={user.role === "admin" ? "/workspace" : "/creative/"} className="flex items-center gap-3">
+                  <a href={webPath(user.role === "admin" ? "/workspace" : "/creative/")} className="flex items-center gap-3">
                     <LayoutDashboard className="size-4 opacity-70" />
                     <span>前往工作台</span>
                   </a>
@@ -116,7 +117,7 @@ export function Header() {
             </DropdownMenu>
           ) : (
             <>
-              <a href="/login">
+              <a href={webPath("/login")}>
                 <Button
                   variant="ghost"
                   className="text-white/70 hover:text-white hover:bg-white/10 hidden sm:inline-flex font-medium text-base tracking-wide rounded-full px-6 py-5"
@@ -124,7 +125,7 @@ export function Header() {
                   登录
                 </Button>
               </a>
-              <a href="/register">
+              <a href={webPath("/register")}>
                 <Button
                   className="bg-white text-black hover:bg-gray-200 font-semibold text-base tracking-wide rounded-full px-6 py-5 shadow-lg shadow-white/10 transition-all hover:shadow-white/20 active:scale-95"
                 >

@@ -20,7 +20,7 @@ func WithWeb(api, frontendProxy http.Handler, creative *middleware.CreativeWeb) 
 			} else if creative == nil {
 				http.Error(w, "Creative workbench is not configured", http.StatusServiceUnavailable)
 			} else {
-				target := middleware.CreativePrefix + "/"
+				target := creative.PublicPath(middleware.CreativePrefix + "/")
 				if r.URL.RawQuery != "" {
 					target += "?" + r.URL.RawQuery
 				}
@@ -67,5 +67,29 @@ func WithWeb(api, frontendProxy http.Handler, creative *middleware.CreativeWeb) 
 			return
 		}
 		api.ServeHTTP(w, r)
+	})
+}
+
+// MountWeb keeps the gateway's internal routing at the root while exposing a public prefix.
+func MountWeb(basePath string, handler http.Handler) http.Handler {
+	if basePath == "" {
+		return handler
+	}
+	mounted := http.StripPrefix(basePath, handler)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/health":
+			handler.ServeHTTP(w, r)
+		case r.URL.Path == basePath:
+			target := basePath + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusPermanentRedirect)
+		case strings.HasPrefix(r.URL.Path, basePath+"/"):
+			mounted.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
 	})
 }

@@ -64,13 +64,13 @@ func main() {
 	handler := server.New(service.Options{Catalog: catalog.New(cfg.HarnessConfig, cfg.ExtensionsConfig, cfg.SkillsRoot), Files: files.New(cfg.WorkspaceRoot, cfg.SkillsRoot), Repository: database, Swarm: database}, cfg.CORSOrigins, middleware...)
 	frontend, creative, err := gatewaymiddleware.NewWebUpstreams(gatewaymiddleware.WebUpstreams{
 		FrontendURL: cfg.FrontendURL, CreativeURL: cfg.CreativeURL,
-		CreativeWebURL: cfg.CreativeWebURL, PublicOrigin: cfg.PublicOrigin,
+		CreativeWebURL: cfg.CreativeWebURL, PublicOrigin: cfg.PublicOrigin, BasePath: cfg.WebBasePath,
 	})
 	if err != nil {
 		slog.Error("configuring gateway routes", "error", err)
 		os.Exit(1)
 	}
-	handler = router.WithWeb(handler, frontend, creative)
+	handler = router.MountWeb(cfg.WebBasePath, router.WithWeb(handler, frontend, creative))
 	httpServer := server.HTTP(cfg.Address, handler)
 	go func() {
 		slog.Info("Go Gateway listening", "address", cfg.Address)

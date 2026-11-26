@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src/agent-go
+COPY agent-go/go.mod agent-go/go.sum ./
+COPY platform-go /src/platform-go
+RUN go mod download
+COPY agent-go/ .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -tags=docker -ldflags="-s -w" -o /out/sandboxd ./cmd/sandboxd
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates docker-cli wget
+COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
+EXPOSE 7780
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
+    CMD wget -qO /dev/null http://127.0.0.1:7780/ok || exit 1
+ENTRYPOINT ["/usr/local/bin/sandboxd"]

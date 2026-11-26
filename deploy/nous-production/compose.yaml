@@ -1,0 +1,139 @@
+name: nous-production
+
+x-restart: &restart
+  restart: unless-stopped
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: '3'
+
+x-agent-storage: &agent-storage
+  DATABASE_URL: ${NOUS_DATABASE_URL:?Set NOUS_DATABASE_URL}
+  REDIS_URL: ${NOUS_REDIS_URL:?Set NOUS_REDIS_URL}
+
+services:
+  sandboxd:
+    <<: *restart
+    image: nous-prod-sandboxd:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    environment:
+      SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:?Set SANDBOX_CONTROLLER_TOKEN}
+      SANDBOX_BASE_DIR: /var/lib/nous-sandbox
+      SANDBOX_HOST_BASE_DIR: ${SANDBOX_HOST_BASE_DIR:?Set SANDBOX_HOST_BASE_DIR}
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-alpine:3.20}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SANDBOX_HOST_BASE_DIR}:/var/lib/nous-sandbox
+
+  agent-go:
+    <<: *restart
+    image: nous-prod-agent:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    environment:
+      <<: *agent-storage
+      NOUS_AGENT_ADDR: ':7776'
+      NOUS_EXTENSIONS_CONFIG_PATH: /app/extensions/extensions.json
+      NOUS_SKILLS_PATH: /opt/nous/skills
+      SANDBOX_CONTROLLER_TOKEN: ${SANDBOX_CONTROLLER_TOKEN:?Set SANDBOX_CONTROLLER_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+    volumes:
+      - agent_data:/app/.nous-agent
+      - gateway_config:/app/extensions:ro
+      - custom_skills:/opt/nous/skills/custom:ro
+      - ./skills/public:/opt/nous/skills/public:ro
+    networks: [default, shared-data, shared-redis]
+    depends_on:
+      sandboxd:
+        condition: service_healthy
+
+  gateway-go:
+    <<: *restart
+    image: nous-prod-gateway:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    group_add: ['65532']
+    ports:
+      - 127.0.0.1:${NOUS_GATEWAY_PORT:-7777}:7777
+    environment:
+      <<: *agent-storage
+      NOUS_HARNESS_CONFIG_PATH: /etc/nous-agent/config.yaml
+      NOUS_EXTENSIONS_CONFIG_PATH: /config/extensions.json
+      NOUS_SKILLS_ROOT: /opt/nous/skills
+      NOUS_WORKSPACE_ROOT: /data/workspaces
+      CORS_ORIGINS: ${PUBLIC_WEB_ORIGIN:?Set PUBLIC_WEB_ORIGIN}
+      PUBLIC_WEB_ORIGIN: ${PUBLIC_WEB_ORIGIN:?Set PUBLIC_WEB_ORIGIN}
+      NOUS_WEB_BASE_PATH: ${NOUS_WEB_BASE_PATH:-}
+      FRONTEND_BASE_URL: http://frontend:7775
+      CREATIVE_API_URL: http://creative-backend:8080
+      CREATIVE_WEB_URL: http://creative-web:3000
+    volumes:
+      - ./harness.yaml:/etc/nous-agent/config.yaml:ro
+      - ./skills/public:/opt/nous/skills/public:ro
+      - custom_skills:/opt/nous/skills/custom
+      - gateway_config:/config
+      - agent_data:/data
+      - ${SANDBOX_HOST_BASE_DIR}:/data/workspaces
+    networks: [default, shared-data, shared-redis]
+    depends_on:
+      agent-go:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      creative-web:
+        condition: service_healthy
+
+  frontend:
+    <<: *restart
+    image: nous-prod-frontend:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    environment:
+      HARNESS_BASE_URL: http://agent-go:7776
+      NOUS_WEB_BASE_PATH: ${NOUS_WEB_BASE_PATH:-}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:7775'+(process.env.NOUS_WEB_BASE_PATH||'')+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  creative-backend:
+    <<: *restart
+    image: nous-prod-creative-backend:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    environment:
+      CANVAS_BACKEND_ADDR: ':8080'
+      CANVAS_BACKEND_DATA_DIR: /data
+      CANVAS_DATABASE_DRIVER: postgres
+      DATABASE_URL: ${CREATIVE_DATABASE_URL:?Set CREATIVE_DATABASE_URL}
+      REDIS_URL: ${CREATIVE_REDIS_URL:?Set CREATIVE_REDIS_URL}
+      CANVAS_CORS_ORIGINS: ${PUBLIC_WEB_ORIGIN:?Set PUBLIC_WEB_ORIGIN}
+      CANVAS_PUBLIC_BASE_URL: ${PUBLIC_WEB_ORIGIN:?Set PUBLIC_WEB_ORIGIN}${NOUS_WEB_BASE_PATH:-}/creative
+      CANVAS_REGISTRATION_ENABLED: ${CREATIVE_REGISTRATION_ENABLED:-false}
+    volumes:
+      - creative_data:/data
+    networks:
+      default:
+        aliases: [backend]
+      shared-data: {}
+      shared-redis: {}
+
+  creative-web:
+    <<: *restart
+    image: nous-prod-creative-web:${NOUS_RELEASE:?Set NOUS_RELEASE}
+    volumes:
+      - creative_web_data:/usr/share/nginx/html
+    depends_on:
+      creative-backend:
+        condition: service_healthy
+
+volumes:
+  agent_data:
+  custom_skills:
+  gateway_config:
+  creative_data:
+  creative_web_data:
+
+networks:
+  shared-data:
+    external: true
+    name: ${NOUS_PG_NETWORK:-shared_data}
+  shared-redis:
+    external: true
+    name: ${NOUS_REDIS_NETWORK:-shared_redis-private}

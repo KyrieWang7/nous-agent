@@ -1,3 +1,4 @@
+import { webPath } from "@/core/config";
 import "@/styles/globals.css";
 import "katex/dist/katex.min.css";
 
@@ -13,8 +14,8 @@ export const metadata: Metadata = {
   description:
     "An open-source AI agent platform powered by Nous Agent Runtime.",
   icons: {
-    icon: "/icon.png?v=nous-logo-1",
-    apple: "/icon.png?v=nous-logo-1",
+    icon: webPath("/icon.png?v=nous-logo-1"),
+    apple: webPath("/icon.png?v=nous-logo-1"),
   },
 };
 

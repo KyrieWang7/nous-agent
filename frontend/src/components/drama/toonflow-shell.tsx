@@ -1,14 +1,15 @@
 "use client";
 
+import { webPath } from "@/core/config";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { useAuthHydrated, useAuthStore } from "@/core/auth";
 
-const TOONFLOW_SHELL_PATH = "/toonflow/index.html";
+const TOONFLOW_SHELL_PATH = webPath("/toonflow/index.html");
 const TOONFLOW_BRIDGE_TOKEN = "Bearer nous-auth-bridge";
 const DRAMA_WS_BASE_URL = process.env.NEXT_PUBLIC_DRAMA_WS_BASE_URL;
-const DRAMA_HTTP_BASE_PATH = "/drama-api";
+const DRAMA_HTTP_BASE_PATH = webPath("/drama-api");
 
 function buildDefaultWsBaseUrl() {
     if (typeof window === "undefined") {
@@ -25,7 +26,7 @@ function buildDefaultWsBaseUrl() {
         return `${wsProtocol}//127.0.0.1:8003/api/drama`;
     }
 
-    return `${wsProtocol}//${host}/api/drama`;
+    return `${wsProtocol}//${host}${webPath("/api/drama")}`;
 }
 
 function buildToonflowUrl() {
